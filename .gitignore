@@ -1,0 +1,26 @@
+# ---- Secrets (DO NOT COMMIT) ----
+cloudlab_env.sh
+*.env.local
+.env
+
+# ---- Trace data / generated outputs ----
+traces/
+GenoMAS_traces/
+phase6_out/
+summarize_pi/
+
+# ---- Private notes ----
+0513.md
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- OS / editor cruft ----
+.DS_Store
+*.swp
+.idea/
+.vscode/

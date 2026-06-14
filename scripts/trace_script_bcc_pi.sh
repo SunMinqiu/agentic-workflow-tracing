@@ -7,8 +7,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config.env}"
-ANALYSIS_DIR="${ANALYSIS_DIR:-$SCRIPT_DIR}"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TOOL_DIR="$ROOT_DIR/src"
+CFG_DIR="$ROOT_DIR/config"
+CONFIG_FILE="${CONFIG_FILE:-$CFG_DIR/config.env}"
+ANALYSIS_DIR="${ANALYSIS_DIR:-$TOOL_DIR}"
 PI_ANALYZE_ARGS="${PI_ANALYZE_ARGS:-}"
 CALLER_BASE_OUT="${BASE_OUT:-}"
 AGENT_PYTHON="${AGENT_PYTHON:-/mnt/lus_fs/software/views/piostack/bin/python3}"
@@ -51,23 +54,23 @@ if ! pi --version >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/analyze_codebase_pi.py" ]; then
-    echo "Error: analyze_codebase_pi.py not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/analyze_codebase_pi.py" ]; then
+    echo "Error: analyze_codebase_pi.py not found in $TOOL_DIR" >&2
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/tool_call_logger.ts" ]; then
-    echo "Error: tool_call_logger.ts not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/tool_call_logger.ts" ]; then
+    echo "Error: tool_call_logger.ts not found in $TOOL_DIR" >&2
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/bcc_tracer.py" ] || [ ! -f "$SCRIPT_DIR/parse_ebpf.py" ]; then
-    echo "Error: bcc tracer/parser scripts not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/bcc_tracer.py" ] || [ ! -f "$TOOL_DIR/parse_ebpf.py" ]; then
+    echo "Error: bcc tracer/parser scripts not found in $TOOL_DIR" >&2
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/summarize_pi_events.py" ]; then
-    echo "Error: summarize_pi_events.py not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/summarize_pi_events.py" ]; then
+    echo "Error: summarize_pi_events.py not found in $TOOL_DIR" >&2
     exit 1
 fi
 
@@ -76,7 +79,7 @@ if [ ! -f "$ANALYSIS_DIR/visualize_strace.py" ]; then
     exit 1
 fi
 
-BASE_OUT="${BASE_OUT:-$SCRIPT_DIR/traces/$(date +%Y%m%d_%H%M%S)}"
+BASE_OUT="${BASE_OUT:-$ROOT_DIR/traces/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$BASE_OUT"
 
 echo "=== CloudLab Lustre Agent FS Tracer (BCC + Pi) ==="
@@ -121,7 +124,7 @@ for repo in "$CASES_DIR"/*/; do
 
     set +e
     # Start the agent paused so no tool activity runs before probes are active.
-    "$AGENT_PYTHON" "$SCRIPT_DIR/analyze_codebase_pi.py" "$repo" "$OUT" $PI_ANALYZE_ARGS \
+    "$AGENT_PYTHON" "$TOOL_DIR/analyze_codebase_pi.py" "$repo" "$OUT" $PI_ANALYZE_ARGS \
         >"$OUT/pi.out" 2>"$OUT/pi.err" &
     AGENT_PID=$!
     kill -STOP "$AGENT_PID" >/dev/null 2>&1 || true
@@ -131,7 +134,7 @@ for repo in "$CASES_DIR"/*/; do
     mkfifo "$READY_FIFO"
 
     # Start tracer and wait for explicit readiness before continuing agent.
-    "$AGENT_PYTHON" "$SCRIPT_DIR/bcc_tracer.py" \
+    "$AGENT_PYTHON" "$TOOL_DIR/bcc_tracer.py" \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         --ready-fd 3 \
@@ -175,14 +178,14 @@ for repo_out in "$BASE_OUT"/*/; do
 
     echo "Processing: $REPO_NAME"
     echo "  Parsing eBPF logs..."
-    "$POST_PYTHON" "$SCRIPT_DIR/parse_ebpf.py" \
+    "$POST_PYTHON" "$TOOL_DIR/parse_ebpf.py" \
         "$repo_out" \
         2>&1 | sed 's/^/    /'
 
     if [ -f "$repo_out/parsed.json" ]; then
         if [ -f "$repo_out/pi_events.jsonl" ] && [ -f "$repo_out/tool_calls.log" ]; then
             echo "  Summarizing pi events..."
-            "$POST_PYTHON" "$SCRIPT_DIR/summarize_pi_events.py" "$repo_out" 2>&1 | sed 's/^/    /'
+            "$POST_PYTHON" "$TOOL_DIR/summarize_pi_events.py" "$repo_out" 2>&1 | sed 's/^/    /'
         else
             echo "  Skipping pi summary (pi_events.jsonl or tool_calls.log missing)"
         fi

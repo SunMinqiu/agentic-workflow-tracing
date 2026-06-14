@@ -7,7 +7,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config.env}"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TOOL_DIR="$ROOT_DIR/src"
+CFG_DIR="$ROOT_DIR/config"
+CONFIG_FILE="${CONFIG_FILE:-$CFG_DIR/config.env}"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "Error: config file not found: $CONFIG_FILE" >&2

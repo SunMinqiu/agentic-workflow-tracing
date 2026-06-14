@@ -15,8 +15,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config_scilink.env}"
-ANALYSIS_DIR="${ANALYSIS_DIR:-$SCRIPT_DIR}"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TOOL_DIR="$ROOT_DIR/src"
+CFG_DIR="$ROOT_DIR/config"
+CONFIG_FILE="${CONFIG_FILE:-$CFG_DIR/config_scilink.env}"
+ANALYSIS_DIR="${ANALYSIS_DIR:-$TOOL_DIR}"
 CALLER_BASE_OUT="${BASE_OUT:-}"
 # TRACER_PYTHON / AGENT_PYTHON / POST_PYTHON come from config_scilink.env
 # (sourced below).  Two interpreters are required because BCC bindings are
@@ -27,13 +30,13 @@ CALLER_BASE_OUT="${BASE_OUT:-}"
 # absolute paths so HOME=/root under sudo doesn't break python resolution.
 # We INTENTIONALLY do NOT source the sibling .env (that's owned by the
 # SRAgent harness and would override AGENT_PYTHON to the wrong venv).
-if [ -f "$SCRIPT_DIR/.env.scilink" ]; then
+if [ -f "$ROOT_DIR/.env.scilink" ]; then
     set -a
     # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/.env.scilink"
+    source "$ROOT_DIR/.env.scilink"
     set +a
 else
-    echo "Warning: $SCRIPT_DIR/.env.scilink not found." >&2
+    echo "Warning: $ROOT_DIR/.env.scilink not found." >&2
     echo "         Re-run deploy_scilink_to_client.sh on your laptop to generate it." >&2
 fi
 
@@ -85,28 +88,28 @@ if ! "$AGENT_PYTHON" -c "import scilink, litellm" >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/analyze_codebase_scilink.py" ]; then
-    echo "Error: analyze_codebase_scilink.py not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/analyze_codebase_scilink.py" ]; then
+    echo "Error: analyze_codebase_scilink.py not found in $TOOL_DIR" >&2
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/litellm_tool_logger.py" ]; then
-    echo "Error: litellm_tool_logger.py not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/litellm_tool_logger.py" ]; then
+    echo "Error: litellm_tool_logger.py not found in $TOOL_DIR" >&2
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/bcc_tracer.py" ] || [ ! -f "$SCRIPT_DIR/parse_ebpf.py" ]; then
-    echo "Error: bcc tracer/parser scripts not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/bcc_tracer.py" ] || [ ! -f "$TOOL_DIR/parse_ebpf.py" ]; then
+    echo "Error: bcc tracer/parser scripts not found in $TOOL_DIR" >&2
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/summarize_pi_events.py" ]; then
-    echo "Error: summarize_pi_events.py not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/summarize_pi_events.py" ]; then
+    echo "Error: summarize_pi_events.py not found in $TOOL_DIR" >&2
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/compute_parallelism.py" ]; then
-    echo "Error: compute_parallelism.py not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/compute_parallelism.py" ]; then
+    echo "Error: compute_parallelism.py not found in $TOOL_DIR" >&2
     exit 1
 fi
 
@@ -120,7 +123,7 @@ if [ "${#WORKLOADS[@]}" -eq 0 ]; then
     exit 1
 fi
 
-BASE_OUT="${BASE_OUT:-$SCRIPT_DIR/traces/$(date +%Y%m%d_%H%M%S)}"
+BASE_OUT="${BASE_OUT:-$ROOT_DIR/traces/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$BASE_OUT"
 BASE_OUT="$(cd "$BASE_OUT" && pwd)"
 WORK_DIR="$(mkdir -p "$WORK_DIR" && cd "$WORK_DIR" && pwd)"
@@ -223,7 +226,7 @@ for entry in "${WORKLOADS[@]}"; do
 
     # Run SciLink under the litellm-based logger.  --prompt feeds the REPL
     # via stdin; --mode autonomous (inside SRARGS) silences follow-ups.
-    "$AGENT_PYTHON" "$SCRIPT_DIR/analyze_codebase_scilink.py" \
+    "$AGENT_PYTHON" "$TOOL_DIR/analyze_codebase_scilink.py" \
         "$WORK" "$OUT" "$SUBCMD" \
         --prompt "$PROMPT" "${PRE_FLAG[@]}" \
         -- "${SRARGS_ARRAY[@]}" \
@@ -242,7 +245,7 @@ for entry in "${WORKLOADS[@]}"; do
         NET_ARG="--no-include-net"
     fi
 
-    "$TRACER_PYTHON" "$SCRIPT_DIR/bcc_tracer.py" \
+    "$TRACER_PYTHON" "$TOOL_DIR/bcc_tracer.py" \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         $NET_ARG \
@@ -294,7 +297,7 @@ for ws_out in "$BASE_OUT"/*/; do
     failed_step=""
 
     echo "  Parsing eBPF logs..."
-    "$POST_PYTHON" "$SCRIPT_DIR/parse_ebpf.py" \
+    "$POST_PYTHON" "$TOOL_DIR/parse_ebpf.py" \
         "$ws_out" \
         > "$ws_out/parse.log" 2>&1
     PARSE_RC=$?
@@ -304,14 +307,14 @@ for ws_out in "$BASE_OUT"/*/; do
     if [ -f "$ws_out/parsed.json" ]; then
         if [ -f "$ws_out/pi_events.jsonl" ] && [ -f "$ws_out/tool_calls.log" ]; then
             echo "  Summarizing pi-compat events..."
-            "$POST_PYTHON" "$SCRIPT_DIR/summarize_pi_events.py" "$ws_out" \
+            "$POST_PYTHON" "$TOOL_DIR/summarize_pi_events.py" "$ws_out" \
                 > "$ws_out/summarize.log" 2>&1
             SUM_RC=$?
             sed 's/^/    /' "$ws_out/summarize.log" || true
             [ $SUM_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}summarize"
 
             echo "  Computing DAG + parallelism metrics..."
-            "$POST_PYTHON" "$SCRIPT_DIR/compute_parallelism.py" "$ws_out" \
+            "$POST_PYTHON" "$TOOL_DIR/compute_parallelism.py" "$ws_out" \
                 > "$ws_out/parallelism.log" 2>&1
             PAR_RC=$?
             sed 's/^/    /' "$ws_out/parallelism.log" || true

@@ -14,8 +14,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config_sragent.env}"
-ANALYSIS_DIR="${ANALYSIS_DIR:-$SCRIPT_DIR}"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TOOL_DIR="$ROOT_DIR/src"
+CFG_DIR="$ROOT_DIR/config"
+CONFIG_FILE="${CONFIG_FILE:-$CFG_DIR/config_sragent.env}"
+ANALYSIS_DIR="${ANALYSIS_DIR:-$TOOL_DIR}"
 CALLER_BASE_OUT="${BASE_OUT:-}"
 # TRACER_PYTHON / AGENT_PYTHON / POST_PYTHON are populated by config_sragent.env
 # (sourced below).  Two interpreters are required because BCC bindings are
@@ -23,10 +26,10 @@ CALLER_BASE_OUT="${BASE_OUT:-}"
 
 # Source .env if present so API keys survive `sudo -E` (deploy_sragent_to_client.sh
 # writes it).  set -a auto-exports everything sourced.
-if [ -f "$SCRIPT_DIR/.env" ]; then
+if [ -f "$ROOT_DIR/.env" ]; then
     set -a
     # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/.env"
+    source "$ROOT_DIR/.env"
     set +a
 fi
 
@@ -78,23 +81,23 @@ if ! "$AGENT_PYTHON" -c "import SRAgent" >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/analyze_codebase_sragent.py" ]; then
-    echo "Error: analyze_codebase_sragent.py not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/analyze_codebase_sragent.py" ]; then
+    echo "Error: analyze_codebase_sragent.py not found in $TOOL_DIR" >&2
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/langchain_tool_logger.py" ]; then
-    echo "Error: langchain_tool_logger.py not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/langchain_tool_logger.py" ]; then
+    echo "Error: langchain_tool_logger.py not found in $TOOL_DIR" >&2
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/bcc_tracer.py" ] || [ ! -f "$SCRIPT_DIR/parse_ebpf.py" ]; then
-    echo "Error: bcc tracer/parser scripts not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/bcc_tracer.py" ] || [ ! -f "$TOOL_DIR/parse_ebpf.py" ]; then
+    echo "Error: bcc tracer/parser scripts not found in $TOOL_DIR" >&2
     exit 1
 fi
 
-if [ ! -f "$SCRIPT_DIR/summarize_pi_events.py" ]; then
-    echo "Error: summarize_pi_events.py not found in $SCRIPT_DIR" >&2
+if [ ! -f "$TOOL_DIR/summarize_pi_events.py" ]; then
+    echo "Error: summarize_pi_events.py not found in $TOOL_DIR" >&2
     exit 1
 fi
 
@@ -108,7 +111,7 @@ if [ "${#WORKLOADS[@]}" -eq 0 ]; then
     exit 1
 fi
 
-BASE_OUT="${BASE_OUT:-$SCRIPT_DIR/traces/$(date +%Y%m%d_%H%M%S)}"
+BASE_OUT="${BASE_OUT:-$ROOT_DIR/traces/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$BASE_OUT"
 
 echo "=== SRAgent FS+Net Tracer (BCC) ==="
@@ -196,7 +199,7 @@ for entry in "${WORKLOADS[@]}"; do
     fi
 
     # Start the agent paused so no tool activity runs before probes are active.
-    "$AGENT_PYTHON" "$SCRIPT_DIR/analyze_codebase_sragent.py" \
+    "$AGENT_PYTHON" "$TOOL_DIR/analyze_codebase_sragent.py" \
         "$WORK" "$OUT" "$SUBCMD" "${PRE_FLAG[@]}" -- "${SRARGS_ARRAY[@]}" \
         > "$OUT/sragent.log" 2>&1 &
     # `&>` style merge: stdout (Rich banner / final results) and stderr (agent
@@ -218,7 +221,7 @@ for entry in "${WORKLOADS[@]}"; do
 
     # Start tracer with TRACER_PYTHON (system py3 with python3-bcc bindings),
     # wait for explicit readiness before continuing agent.
-    "$TRACER_PYTHON" "$SCRIPT_DIR/bcc_tracer.py" \
+    "$TRACER_PYTHON" "$TOOL_DIR/bcc_tracer.py" \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         $NET_ARG \
@@ -271,7 +274,7 @@ for ws_out in "$BASE_OUT"/*/; do
     failed_step=""
 
     echo "  Parsing eBPF logs..."
-    "$POST_PYTHON" "$SCRIPT_DIR/parse_ebpf.py" \
+    "$POST_PYTHON" "$TOOL_DIR/parse_ebpf.py" \
         "$ws_out" \
         > "$ws_out/parse.log" 2>&1
     PARSE_RC=$?
@@ -281,7 +284,7 @@ for ws_out in "$BASE_OUT"/*/; do
     if [ -f "$ws_out/parsed.json" ]; then
         if [ -f "$ws_out/pi_events.jsonl" ] && [ -f "$ws_out/tool_calls.log" ]; then
             echo "  Summarizing pi-compat events..."
-            "$POST_PYTHON" "$SCRIPT_DIR/summarize_pi_events.py" "$ws_out" \
+            "$POST_PYTHON" "$TOOL_DIR/summarize_pi_events.py" "$ws_out" \
                 > "$ws_out/summarize.log" 2>&1
             SUM_RC=$?
             sed 's/^/    /' "$ws_out/summarize.log" || true

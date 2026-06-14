@@ -27,6 +27,21 @@ a different way of intercepting tool calls.
 All four loggers emit a common `tool_calls.log` format so the shared parsing,
 visualization, and analysis layers work unchanged across targets.
 
+## Repository layout
+
+```
+.
+├── src/        Python modules + the pi extension (tool_call_logger.ts)
+├── scripts/    orchestration (trace_script_bcc_*.sh), deploy_*, setup_lustre*
+├── config/     config*.env templates (non-secret)
+├── docs/       design docs
+└── fixtures/   small sample inputs
+```
+
+The shell scripts in `scripts/` locate the code and configs relative to
+themselves (`../src`, `../config`), so the layout works as long as the folders
+stay siblings. Trace outputs default to `traces/` at the repo root.
+
 ## Pipeline
 
 ```
@@ -64,13 +79,13 @@ bcc_tracer.py ───────► ebpf_events.log
 
 ## Design docs
 
-- [`CONTROLLER_TRACING_PLAN.md`](CONTROLLER_TRACING_PLAN.md) — controller-level
-  tracing for the SciLink hyperspectral pipeline (capturing the steps hidden
-  inside `Run_analysis`).
-- [`PHASE3_DAG_AND_PARALLELISM.md`](PHASE3_DAG_AND_PARALLELISM.md) — DAG
+- [`docs/CONTROLLER_TRACING_PLAN.md`](docs/CONTROLLER_TRACING_PLAN.md) —
+  controller-level tracing for the SciLink hyperspectral pipeline (capturing the
+  steps hidden inside `Run_analysis`).
+- [`docs/PHASE3_DAG_AND_PARALLELISM.md`](docs/PHASE3_DAG_AND_PARALLELISM.md) — DAG
   construction and parallelism methodology behind `compute_parallelism.py`.
-- [`STORAGE_PLACEMENT.md`](STORAGE_PLACEMENT.md) — storage placement standard and
-  the metrics computed by `lineage_analyzer.py`.
+- [`docs/STORAGE_PLACEMENT.md`](docs/STORAGE_PLACEMENT.md) — storage placement
+  standard and the metrics computed by `lineage_analyzer.py`.
 
 ## Setup
 
@@ -90,11 +105,11 @@ External dependencies (install per target, as needed):
 
 ## Usage (pi target example)
 
-1. Edit **`config.env`** (paths, model, repo subset) — it is a trimmed template,
-   not a copy of any private environment file.
+1. Edit **`config/config.env`** (paths, model, repo subset) — it is a trimmed
+   template, not a copy of any private environment file.
 2. Run the orchestration script:
    ```bash
-   ./trace_script_bcc_pi.sh
+   ./scripts/trace_script_bcc_pi.sh
    ```
 3. Inspect per-repo outputs under the configured trace output directory.
 4. Open `visualizations/index.html` in each trace result directory.
@@ -113,4 +128,4 @@ Other targets follow the same shape via their `trace_script_bcc_<target>.sh`.
 Trace data and generated outputs (`traces/`, `GenoMAS_traces/`, `phase6_out/`,
 `summarize_pi/`) and any file containing real credentials (`cloudlab_env.sh`) are
 intentionally git-ignored. Provide your own API keys via environment variables;
-`config.env` is a non-secret template.
+the files under `config/` are non-secret templates.

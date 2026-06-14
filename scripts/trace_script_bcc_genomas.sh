@@ -17,8 +17,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config_genomas.env}"
-ANALYSIS_DIR="${ANALYSIS_DIR:-$SCRIPT_DIR}"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TOOL_DIR="$ROOT_DIR/src"
+CFG_DIR="$ROOT_DIR/config"
+CONFIG_FILE="${CONFIG_FILE:-$CFG_DIR/config_genomas.env}"
+ANALYSIS_DIR="${ANALYSIS_DIR:-$TOOL_DIR}"
 CALLER_BASE_OUT="${BASE_OUT:-}"
 
 # Source .env.genomas so API keys + AGENT_PYTHON (absolute, sudo-safe)
@@ -26,13 +29,13 @@ CALLER_BASE_OUT="${BASE_OUT:-}"
 # hard-coded absolute paths so HOME=/root under sudo doesn't break python
 # resolution.  We INTENTIONALLY do NOT source the sibling .env or
 # .env.scilink files (those belong to other harnesses).
-if [ -f "$SCRIPT_DIR/.env.genomas" ]; then
+if [ -f "$ROOT_DIR/.env.genomas" ]; then
     set -a
     # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/.env.genomas"
+    source "$ROOT_DIR/.env.genomas"
     set +a
 else
-    echo "Warning: $SCRIPT_DIR/.env.genomas not found." >&2
+    echo "Warning: $ROOT_DIR/.env.genomas not found." >&2
     echo "         Re-run deploy_genomas_to_client.sh on your laptop to generate it." >&2
 fi
 
@@ -76,7 +79,7 @@ fi
 
 for f in analyze_codebase_genomas.py genomas_tool_logger.py bcc_tracer.py \
          parse_ebpf.py summarize_pi_events.py compute_parallelism.py; do
-    [ -f "$SCRIPT_DIR/$f" ] || { echo "Error: $f not found in $SCRIPT_DIR" >&2; exit 1; }
+    [ -f "$TOOL_DIR/$f" ] || { echo "Error: $f not found in $TOOL_DIR" >&2; exit 1; }
 done
 [ -f "$ANALYSIS_DIR/visualize_strace.py" ] || {
     echo "Error: visualize_strace.py not found in $ANALYSIS_DIR" >&2; exit 1;
@@ -166,7 +169,7 @@ for entry in "${WORKLOADS[@]}"; do
 
     # --version embeds NAME so GenoMAS's output/log_<version>.txt is unique
     # per cell (otherwise checkpoint-resume across cells would corrupt data).
-    "$AGENT_PYTHON" "$SCRIPT_DIR/analyze_codebase_genomas.py" \
+    "$AGENT_PYTHON" "$TOOL_DIR/analyze_codebase_genomas.py" \
         "$WORK" "$OUT" \
         --data-root "$DATA_DIR" \
         --model "$GENOMAS_MODEL" \
@@ -192,7 +195,7 @@ for entry in "${WORKLOADS[@]}"; do
         NET_ARG="--no-include-net"
     fi
 
-    "$TRACER_PYTHON" "$SCRIPT_DIR/bcc_tracer.py" \
+    "$TRACER_PYTHON" "$TOOL_DIR/bcc_tracer.py" \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         $NET_ARG \
@@ -247,19 +250,19 @@ for ws_out in "$BASE_OUT"/*/; do
     set +e
     failed_step=""
 
-    "$POST_PYTHON" "$SCRIPT_DIR/parse_ebpf.py" "$ws_out" \
+    "$POST_PYTHON" "$TOOL_DIR/parse_ebpf.py" "$ws_out" \
         > "$ws_out/parse.log" 2>&1
     PARSE_RC=$?
     [ $PARSE_RC -ne 0 ] && failed_step="parse_ebpf"
     sed 's/^/    /' "$ws_out/parse.log" | tail -5 || true
 
     if [ -f "$ws_out/parsed.json" ] && [ -f "$ws_out/pi_events.jsonl" ]; then
-        "$POST_PYTHON" "$SCRIPT_DIR/summarize_pi_events.py" "$ws_out" \
+        "$POST_PYTHON" "$TOOL_DIR/summarize_pi_events.py" "$ws_out" \
             > "$ws_out/summarize.log" 2>&1
         SUM_RC=$?
         [ $SUM_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}summarize"
 
-        "$POST_PYTHON" "$SCRIPT_DIR/compute_parallelism.py" "$ws_out" \
+        "$POST_PYTHON" "$TOOL_DIR/compute_parallelism.py" "$ws_out" \
             > "$ws_out/parallelism.log" 2>&1
         PAR_RC=$?
         [ $PAR_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}parallelism"

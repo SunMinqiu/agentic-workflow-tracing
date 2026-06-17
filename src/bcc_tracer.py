@@ -74,6 +74,12 @@ static __always_inline int is_traced_syscall(u64 id) {
         case __NR_write:
         case __NR_pread64:
         case __NR_pwrite64:
+        case __NR_readv:
+        case __NR_writev:
+        case __NR_preadv:
+        case __NR_pwritev:
+        case __NR_preadv2:
+        case __NR_pwritev2:
         case __NR_newfstatat:
         case __NR_fstat:
         case __NR_access:
@@ -84,6 +90,9 @@ static __always_inline int is_traced_syscall(u64 id) {
         case __NR_renameat2:
         case __NR_truncate:
         case __NR_ftruncate:
+        case __NR_fsync:
+        case __NR_fdatasync:
+        case __NR_sync_file_range:
         case __NR_chdir:
         case __NR_fchdir:
         case __NR_getcwd:
@@ -330,14 +339,21 @@ SYSCALL_ID_TO_NAME = {
     316: "renameat2",
     322: "execveat",
     326: "copy_file_range",
-    328: "preadv2",
-    329: "pwritev2",
     76: "truncate",
     77: "ftruncate",
     17: "pread64",
     18: "pwrite64",
+    19: "readv",
+    20: "writev",
     21: "access",
     5: "fstat",
+    74: "fsync",
+    75: "fdatasync",
+    277: "sync_file_range",
+    295: "preadv",
+    296: "pwritev",
+    327: "preadv2",
+    328: "pwritev2",
     # Network syscalls (x86_64). Captured when --include-net is enabled
     # so HTTP-heavy agents (e.g. SRAgent) don't show up as a giant time gap.
     41: "socket",

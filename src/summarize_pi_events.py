@@ -33,6 +33,18 @@ class ToolCallLogEntry:
     input_params: dict[str, Any]
 
 
+@dataclass
+class LlmSegment:
+    start_ms: float
+    end_ms: float
+    run_id: str | None = None
+    parent_subagent_id: str | None = None
+
+    @property
+    def duration_ms(self) -> float:
+        return max(0.0, self.end_ms - self.start_ms)
+
+
 def parse_time(time_str: str) -> datetime:
     parts = time_str.split(".")
     time_part = parts[0]
@@ -130,6 +142,9 @@ def analyze_events(path: Path) -> dict[str, Any]:
     # Per-subagent LLM usage buckets keyed by parent_subagent_run_id.
     # None bucket holds top-level (non-subagent) LLM usage.
     llm_usage_by_parent: dict[str | None, dict[str, int]] = {}
+    llm_segments: list[LlmSegment] = []
+    llm_starts_by_id: dict[str, dict[str, Any]] = {}
+    llm_start_stack: list[dict[str, Any]] = []
 
     with path.open("r", encoding="utf-8") as f:
         for line_num, raw in enumerate(f, 1):
@@ -156,9 +171,49 @@ def analyze_events(path: Path) -> dict[str, Any]:
                     ts = msg.get("timestamp")
                     if isinstance(ts, (int, float)) and first_assistant_ts is None:
                         first_assistant_ts = ts
+                    if isinstance(ts, (int, float)):
+                        run_id = event.get("run_id")
+                        parent_subagent = (
+                            event.get("parent_run_id")
+                            or event.get("parent_subagent_run_id")
+                        )
+                        start = {
+                            "start_ms": float(ts),
+                            "run_id": run_id if isinstance(run_id, str) else None,
+                            "parent_subagent_id": (
+                                parent_subagent if isinstance(parent_subagent, str) else None
+                            ),
+                        }
+                        if isinstance(run_id, str):
+                            llm_starts_by_id[run_id] = start
+                        else:
+                            llm_start_stack.append(start)
 
             elif event_type == "message_end":
                 if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    ts = msg.get("timestamp")
+                    run_id = event.get("run_id")
+                    start = None
+                    if isinstance(run_id, str) and run_id in llm_starts_by_id:
+                        start = llm_starts_by_id.pop(run_id)
+                    elif llm_start_stack:
+                        start = llm_start_stack.pop()
+                    if start is not None and isinstance(ts, (int, float)):
+                        parent_subagent = (
+                            event.get("parent_run_id")
+                            or event.get("parent_subagent_run_id")
+                            or start.get("parent_subagent_id")
+                        )
+                        llm_segments.append(
+                            LlmSegment(
+                                start_ms=float(start["start_ms"]),
+                                end_ms=float(ts),
+                                run_id=run_id if isinstance(run_id, str) else start.get("run_id"),
+                                parent_subagent_id=(
+                                    parent_subagent if isinstance(parent_subagent, str) else None
+                                ),
+                            )
+                        )
                     usage = msg.get("usage", {})
                     if isinstance(usage, dict):
                         usage_input += int(usage.get("input", 0) or 0)
@@ -215,7 +270,75 @@ def analyze_events(path: Path) -> dict[str, Any]:
         "output_tokens_by_tool_id": output_tokens_by_tool_id,
         "parent_subagent_by_tool_id": parent_subagent_by_tool_id,
         "llm_usage_by_parent": llm_usage_by_parent,
+        "llm_segments": llm_segments,
     }
+
+
+def _datetime_to_ms(dt: datetime) -> float:
+    return dt.timestamp() * 1000.0
+
+
+def _replace_date(dt: datetime, anchor_ms: float) -> datetime:
+    anchor = datetime.fromtimestamp(anchor_ms / 1000.0)
+    return dt.replace(year=anchor.year, month=anchor.month, day=anchor.day)
+
+
+def _interval_union_ms(intervals: list[tuple[float, float]]) -> float:
+    merged = sorted((s, e) for s, e in intervals if e > s)
+    if not merged:
+        return 0.0
+    total = 0.0
+    cur_s, cur_e = merged[0]
+    for s, e in merged[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+    total += cur_e - cur_s
+    return total
+
+
+def _tool_intervals_ms(
+    tool_calls: list[ToolCallLogEntry],
+    llm_segments: list[LlmSegment],
+) -> list[tuple[float, float]]:
+    if not tool_calls:
+        return []
+    calls = tool_calls
+    if llm_segments:
+        anchor_ms = min(seg.start_ms for seg in llm_segments)
+        calls = [
+            ToolCallLogEntry(
+                tool_id=tc.tool_id,
+                tool_name=tc.tool_name,
+                start_time=_replace_date(tc.start_time, anchor_ms),
+                end_time=_replace_date(tc.end_time, anchor_ms),
+                duration_ms=tc.duration_ms,
+                input_params=tc.input_params,
+            )
+            for tc in tool_calls
+        ]
+        first_llm_dt = datetime.fromtimestamp(anchor_ms / 1000.0)
+        first_tool_dt = min(tc.start_time for tc in calls)
+        gap_s = (first_tool_dt - first_llm_dt).total_seconds()
+        if abs(gap_s) >= 1800:
+            # Same timezone skew heuristic used by the visualizers.
+            from datetime import timedelta
+
+            shift_s = round(gap_s / 900) * 900
+            calls = [
+                ToolCallLogEntry(
+                    tool_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    start_time=tc.start_time - timedelta(seconds=shift_s),
+                    end_time=tc.end_time - timedelta(seconds=shift_s),
+                    duration_ms=tc.duration_ms,
+                    input_params=tc.input_params,
+                )
+                for tc in calls
+            ]
+    return [(_datetime_to_ms(tc.start_time), _datetime_to_ms(tc.end_time)) for tc in calls]
 
 
 def build_summary(trace_dir: Path) -> dict[str, Any]:
@@ -255,7 +378,12 @@ def build_summary(trace_dir: Path) -> dict[str, Any]:
         end = max(tc.end_time for tc in all_calls)
         overall_execution_time_ms = max(0.0, (end - start).total_seconds() * 1000.0)
 
-    llm_total_time_ms = max(0.0, overall_execution_time_ms - total_tool_time_ms)
+    llm_segments: list[LlmSegment] = event_stats["llm_segments"]
+    llm_total_time_ms = sum(seg.duration_ms for seg in llm_segments)
+    llm_intervals = [(seg.start_ms, seg.end_ms) for seg in llm_segments]
+    tool_intervals = _tool_intervals_ms(tool_calls + subagent_calls, llm_segments)
+    measured_union_ms = _interval_union_ms(llm_intervals + tool_intervals)
+    unaccounted_time_ms = max(0.0, overall_execution_time_ms - measured_union_ms)
     tool_time_pct = (total_tool_time_ms / overall_execution_time_ms * 100.0) if overall_execution_time_ms else 0.0
 
     per_tool_call: list[dict[str, Any]] = []
@@ -307,6 +435,8 @@ def build_summary(trace_dir: Path) -> dict[str, Any]:
             "llm_completion_metrics": {
                 "total_llm_time_ms": round(llm_total_time_ms, 3),
                 "llm_time_pct": round(llm_time_pct, 3),
+                "total_llm_calls": len(llm_segments),
+                "time_source": "message_start/message_end",
                 "total_reasoning_generation_time_ms": None,
                 "total_output_generation_time_ms": None,
                 "total_input_tokens": event_stats["usage_input"],
@@ -317,8 +447,19 @@ def build_summary(trace_dir: Path) -> dict[str, Any]:
                 "reasoning_time_pct_of_overall": None,
                 "output_time_pct_of_overall": None,
                 "notes": [
+                    "LLM time is measured from pi_events message_start/message_end, not residual overall minus tool time.",
                     "Reasoning/output split metrics are unavailable in current pi_events format.",
                     "Output token counts include both reasoning and visible output for this provider.",
+                ],
+            },
+            "unaccounted_metrics": {
+                "unaccounted_time_ms": round(unaccounted_time_ms, 3),
+                "unaccounted_pct_of_overall": (
+                    round(unaccounted_time_ms / overall_execution_time_ms * 100.0, 3)
+                    if overall_execution_time_ms else 0.0
+                ),
+                "notes": [
+                    "Unaccounted is wall-clock residual after measured LLM/tool/subagent intervals are unioned.",
                 ],
             },
             "subagent_metrics": subagent_metrics,
@@ -432,6 +573,12 @@ def print_summary(summary: dict[str, Any]) -> None:
     print(f"  total output tokens: {llm['total_output_tokens']}")
     print(f"  total cache read tokens: {llm['total_cache_read_tokens']}")
     print(f"  total tokens: {llm['total_tokens']}")
+    unaccounted = metrics.get("unaccounted_metrics") or {}
+    if unaccounted:
+        print("")
+        print("Unaccounted metrics:")
+        print(f"  unaccounted time: {unaccounted['unaccounted_time_ms']:.3f} ms")
+        print(f"  pct of overall time: {unaccounted['unaccounted_pct_of_overall']:.3f}%")
 
     sub = metrics.get("subagent_metrics") or {}
     if sub.get("total_subagent_calls", 0) > 0:

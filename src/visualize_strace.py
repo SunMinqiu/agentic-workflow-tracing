@@ -114,6 +114,27 @@ SYSCALL_CATEGORY_COLORS = {
     "other":    "#AAB7B8",   # Cool gray
 }
 
+# Distinct hues so adjacent segments are easy to tell apart. LLM=green,
+# File-IO=blue, CPU=yellow, Process-mgmt=dark slate, Orchestration=orange.
+# (Previously File-IO was teal #48C9B0, nearly identical to LLM green.)
+RESOURCE_COLORS = {
+    "LLM": "#2ECC71",
+    "Tool File-IO": "#3498DB",
+    "Tool CPU compute": "#F1C40F",
+    "Tool Wait": "#AEB6BF",
+    "File-IO": "#3498DB",
+    "CPU compute": "#F1C40F",
+    "Wait": "#AEB6BF",
+    "Process-mgmt": "#34495E",
+    "Orch File-IO": "#5DADE2",
+    "Orch CPU compute": "#E67E22",
+    "Orch Wait": "#CACFD2",
+    "Unaccounted": "#7F8C8D",
+    "Parallel": "#9b59b6",
+    "Idle": "#E5E7E9",
+    "Orchestration": "#E67E22",
+}
+
 # LLM segment color (used in agent_timeline semantic lane).  Saturated
 # accent that is distinct from tool warm + subagent purple + syscall cool.
 LLM_COLOR = "#2ECC71"  # Green — readable on white, no overlap with above.
@@ -137,7 +158,7 @@ SYSCALL_CATEGORIES = {
     },
     "data": {
         "read", "write", "pread64", "pwrite64",
-        "readv", "writev", "preadv", "pwritev",
+        "readv", "writev", "preadv", "pwritev", "preadv2", "pwritev2",
     },
     "control": {
         "open", "openat", "close",
@@ -151,7 +172,7 @@ SYSCALL_CATEGORIES = {
         "unlink", "unlinkat",
         "rename", "renameat", "renameat2",
         "chmod", "fchmod", "chown", "fchown",
-        "truncate", "ftruncate", "fsync",
+        "truncate", "ftruncate", "fsync", "fdatasync", "sync_file_range",
     },
     "process": {
         "clone", "clone3", "fork", "vfork",
@@ -173,6 +194,21 @@ SYSCALL_CATEGORIES = {
     },
 }
 
+SYSCALL_CATEGORY_TO_RESOURCE = {
+    "metadata": "File-IO",
+    "data": "File-IO",
+    "control": "File-IO",
+    "modify": "File-IO",
+    "blocking": "Wait",
+    "process": "Process-mgmt",
+}
+
+# Reverse lookup syscall -> category, built once for vectorized classification
+# (pandas .map) instead of a per-row classify_syscall() call over millions of rows.
+_SYSCALL_TO_CATEGORY = {
+    sc: cat for cat, scs in SYSCALL_CATEGORIES.items() for sc in scs
+}
+
 
 def classify_syscall(syscall: str) -> str:
     """Classify a syscall into a category."""
@@ -180,6 +216,30 @@ def classify_syscall(syscall: str) -> str:
         if syscall in syscalls:
             return category
     return "other"
+
+
+def resource_for_syscall(syscall: str) -> str | None:
+    """Map a syscall name to the resource taxonomy used by time accounting.
+
+    Network is out of scope (None). Blocking maps to "Wait" so it is both shown
+    as its own segment AND subtracted from the CPU-compute residual (keeping CPU
+    honest). The sum pie bounds Wait per tool so it can't overcount.
+    """
+    category = classify_syscall(syscall)
+    if category == "network":
+        return None
+    return SYSCALL_CATEGORY_TO_RESOURCE.get(category)
+
+
+def _is_code_exec_tool(tool_name: str) -> bool:
+    return tool_name in {
+        "Bash",
+        "CodeExec",
+        "ScriptExec",
+        "SubprocessExec",
+        "PythonExec",
+        "ShellExec",
+    }
 
 
 # =============================================================================
@@ -197,43 +257,63 @@ class StraceData:
     duration_seconds: float
 
 
+# Process-lifetime cache: parsed.json is large (millions of fs_entries) and a
+# full visualization run loads it from several entry points (strace charts +
+# each agent chart via _load_agent_timeline_data). Parsing + pd.to_datetime on
+# millions of rows several times dominates runtime. Cache the immutable result
+# by resolved path so it is parsed exactly once per run. Every mutating consumer
+# already does .copy() before touching the DataFrames, so sharing is safe.
+_PARSED_JSON_CACHE: dict[str, StraceData] = {}
+
+
 def load_parsed_json(filepath: Path) -> StraceData:
-    """Load parsed.json and convert to pandas DataFrames."""
+    """Load parsed.json and convert to pandas DataFrames (cached per path)."""
+    cache_key = str(Path(filepath).resolve())
+    cached = _PARSED_JSON_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     with open(filepath) as f:
         data = json.load(f)
-    
+
     # Convert tool calls to DataFrame
     tool_calls = data["tool_calls"]
     tc_df = pd.DataFrame(tool_calls)
     tc_df["start_time"] = pd.to_datetime(tc_df["start_time"], format="ISO8601")
     tc_df["end_time"] = pd.to_datetime(tc_df["end_time"], format="ISO8601")
     tc_df["duration_ms"] = (tc_df["end_time"] - tc_df["start_time"]).dt.total_seconds() * 1000
-    
+
     # Convert fs entries to DataFrame
     fs_entries = data["fs_entries"]
     fs_df = pd.DataFrame(fs_entries)
     fs_df["timestamp"] = pd.to_datetime(fs_df["timestamp"], format="ISO8601")
-    
+
     # Map syscall -> operation for consistency with original visualize_traces.py conventions
     if "syscall" in fs_df.columns:
         fs_df["operation"] = fs_df["syscall"]
-    
-    # Calculate time bounds
-    all_times = list(tc_df["start_time"]) + list(tc_df["end_time"]) + list(fs_df["timestamp"])
-    start_time = min(all_times)
-    end_time = max(all_times)
+
+    # Calculate time bounds. Vectorized min/max over the datetime columns avoids
+    # materializing a multi-million-element Python list (the old `list(...) +
+    # list(...)`), which was a large, pointless allocation on big traces.
+    min_candidates = [tc_df["start_time"].min(), tc_df["end_time"].min()]
+    max_candidates = [tc_df["start_time"].max(), tc_df["end_time"].max()]
+    if len(fs_df) and "timestamp" in fs_df.columns:
+        min_candidates.append(fs_df["timestamp"].min())
+        max_candidates.append(fs_df["timestamp"].max())
+    start_time = min(t for t in min_candidates if pd.notna(t))
+    end_time = max(t for t in max_candidates if pd.notna(t))
     duration = (end_time - start_time).total_seconds()
-    
+
     # Add relative time columns (seconds from start)
     tc_df["start_rel"] = (tc_df["start_time"] - start_time).dt.total_seconds()
     tc_df["end_rel"] = (tc_df["end_time"] - start_time).dt.total_seconds()
     fs_df["time_rel"] = (fs_df["timestamp"] - start_time).dt.total_seconds()
-    
+
     # Sort tool calls by start time so the timeline y-axis is chronological.
     # The raw log is in completion order which misrepresents concurrent calls.
     tc_df = tc_df.sort_values("start_time").reset_index(drop=True)
-    
-    return StraceData(
+
+    result = StraceData(
         tool_calls_df=tc_df,
         fs_entries_df=fs_df,
         summary=data["summary"],
@@ -241,6 +321,8 @@ def load_parsed_json(filepath: Path) -> StraceData:
         end_time=end_time,
         duration_seconds=duration,
     )
+    _PARSED_JSON_CACHE[cache_key] = result
+    return result
 
 
 # =============================================================================
@@ -688,35 +770,33 @@ def create_timeline_plotly(data: StraceData, output_path: Path) -> None:
             legendgroup=row["tool_name"],
         ))
     
-    # Add fs operations as scatter points
-    # Sample if too many points
-    fs_sample = fs_df if len(fs_df) < 5000 else fs_df.sample(5000)
-    
-    # Color by syscall category (uses global SYSCALL_CATEGORY_COLORS).
-    fs_sample = fs_sample.copy()
-    fs_sample["category"] = fs_sample["operation"].apply(classify_syscall)
-    fs_sample["color"] = fs_sample["category"].map(SYSCALL_CATEGORY_COLORS)
-    
-    fig.add_trace(go.Scatter(
-        x=fs_sample["time_rel"],
-        y=np.random.uniform(-0.8, len(tc_df) - 0.2, len(fs_sample)),
-        mode='markers',
-        marker=dict(
-            size=3,
-            color=fs_sample["color"],
-            opacity=0.5,
-        ),
-        hovertemplate=(
-            "<b>%{customdata[0]}</b><br>"
-            "PID: %{customdata[1]}<br>"
-            "Path: %{customdata[2]}<br>"
-            "Time: %{x:.3f}s<br>"
-            "<extra></extra>"
-        ),
-        customdata=fs_sample[["operation", "pid", "path"]].values,
-        name="FS Operations",
-        showlegend=True,
-    ))
+    # Add FS operations as a category-colored point cloud. Instead of randomly
+    # sampling 5000 of millions of points (lossy, non-deterministic), rasterize
+    # event TIMES to a sub-pixel grid and emit one marker per occupied
+    # (category, time-bucket): full coverage, deterministic, bounded count.
+    # Sub-pixel density and per-point hover are dropped (invisible / meaningless
+    # at this density).
+    span = data.duration_seconds
+    if len(fs_df) > 0 and span > 0:
+        bucket = span / _RASTER_PX
+        cat_series = fs_df["operation"].map(_SYSCALL_TO_CATEGORY).fillna("other")
+        bidx = (fs_df["time_rel"].to_numpy() / bucket).astype("int64")
+        xs: list[float] = []
+        colors: list[str] = []
+        for cat in cat_series.unique():
+            occ = np.unique(bidx[(cat_series == cat).to_numpy()])
+            xs.extend((occ * bucket).tolist())
+            colors.extend([SYSCALL_CATEGORY_COLORS.get(cat, "#95a5a6")] * len(occ))
+        if xs:
+            fig.add_trace(go.Scatter(
+                x=xs,
+                y=np.random.uniform(-0.8, len(tc_df) - 0.2, len(xs)),
+                mode='markers',
+                marker=dict(size=3, color=colors, opacity=0.5),
+                hovertemplate="time: %{x:.3f}s<extra></extra>",
+                name="FS Operations",
+                showlegend=True,
+            ))
     
     fig.update_layout(
         title="Tool Calls and FS Operations Timeline (strace)",
@@ -753,18 +833,29 @@ def create_timeline_matplotlib(data: StraceData, output_path: Path) -> None:
             label = f"{row['tool_name']} ({cmd_short})"
         ax.text(row["start_rel"], idx, f" {label}", va='center', fontsize=8)
     
-    # Plot fs operations as scatter (sampled).  Colors come from the global
-    # SYSCALL_CATEGORY_COLORS (cool palette) — DIFFERENT hex codes than the
-    # tool bars (warm palette), so legends can't be confused.
-    fs_sample = fs_df if len(fs_df) < 2000 else fs_df.sample(2000)
-    fs_categories = fs_sample["operation"].apply(classify_syscall)
-    colors = fs_categories.map(SYSCALL_CATEGORY_COLORS)
-
-    ax.scatter(
-        fs_sample["time_rel"],
-        np.random.uniform(-0.5, len(tc_df) - 0.5, len(fs_sample)),
-        c=colors, s=2, alpha=0.3
-    )
+    # Plot FS operations as a category-colored point cloud, rasterized to a
+    # sub-pixel time grid (one marker per occupied (category, bucket)) instead
+    # of a random sample — full coverage, deterministic, bounded. Colors come
+    # from SYSCALL_CATEGORY_COLORS (cool palette), distinct from the tool bars.
+    cat_series = fs_df["operation"].map(_SYSCALL_TO_CATEGORY).fillna("other") \
+        if len(fs_df) else pd.Series(dtype=object)
+    cats_in_data: list[str] = sorted(set(cat_series.unique())) if len(cat_series) else []
+    span = data.duration_seconds
+    if len(fs_df) > 0 and span > 0:
+        bucket = span / _RASTER_PX
+        bidx = (fs_df["time_rel"].to_numpy() / bucket).astype("int64")
+        xs: list[float] = []
+        colors_list: list[str] = []
+        for cat in cats_in_data:
+            occ = np.unique(bidx[(cat_series == cat).to_numpy()])
+            xs.extend((occ * bucket).tolist())
+            colors_list.extend([SYSCALL_CATEGORY_COLORS.get(cat, "#AAB7B8")] * len(occ))
+        if xs:
+            ax.scatter(
+                xs,
+                np.random.uniform(-0.5, len(tc_df) - 0.5, len(xs)),
+                c=colors_list, s=2, alpha=0.3,
+            )
 
     # Legend: TWO blocks — tool bars (from tc_df, using actual per-tool colors
     # including auto-assigned ones) AND syscall categories that actually
@@ -775,7 +866,6 @@ def create_timeline_matplotlib(data: StraceData, output_path: Path) -> None:
         mpatches.Patch(color=color_for_tool(t), label=f"tool: {t}")
         for t in tool_names_in_data
     ]
-    cats_in_data = sorted(set(fs_categories.unique()))
     cat_patches = [
         mpatches.Patch(color=SYSCALL_CATEGORY_COLORS.get(c, "#AAB7B8"), label=f"syscall: {c}")
         for c in cats_in_data
@@ -1155,11 +1245,31 @@ def create_tool_syscalls_plotly(
     Long syscalls are immediately visible as long bars.
     """
     tc_df = data.tool_calls_df
-    fs_df = data.fs_entries_df.copy()
-    
+    fs_df = data.fs_entries_df
+
     if len(tc_df) == 0:
         return
-    
+
+    # Sort fs entries by timestamp ONCE so each tool's time window can be sliced
+    # with searchsorted (O(log n)) instead of a full-DataFrame boolean mask per
+    # tool (the old code scanned all millions of rows ~3× per tool). Selected
+    # rows are identical; only the cost changes.
+    fs_sorted = fs_df.sort_values("timestamp", kind="stable").reset_index(drop=True)
+    _ts_sorted = fs_sorted["timestamp"].to_numpy()
+
+    # Pre-aggregate matched syscall time per tool once (was a full scan per tool).
+    if len(fs_sorted) and "matched_tool_call" in fs_sorted.columns:
+        _matched_ms_by_tool = (
+            fs_sorted.groupby("matched_tool_call")["duration"].sum() * 1000.0
+        )
+    else:
+        _matched_ms_by_tool = pd.Series(dtype=float)
+
+    def _window_slice(tool_start, tool_end) -> pd.DataFrame:
+        lo = np.searchsorted(_ts_sorted, np.datetime64(tool_start), side="left")
+        hi = np.searchsorted(_ts_sorted, np.datetime64(tool_end), side="right")
+        return fs_sorted.iloc[lo:hi]
+
     total_tool_calls = len(tc_df)
     tc_df = _select_top_tool_calls(tc_df, max_tool_calls)
     capped = total_tool_calls > len(tc_df)
@@ -1182,12 +1292,10 @@ def create_tool_syscalls_plotly(
         tool_end = row["end_time"]
         
         # Count syscalls in time window
-        mask = (fs_df["timestamp"] >= tool_start) & (fs_df["timestamp"] <= tool_end)
-        tool_syscalls = fs_df[mask]
+        tool_syscalls = _window_slice(tool_start, tool_end)
         n_syscalls = len(tool_syscalls)
-        
-        matched = fs_df[fs_df["matched_tool_call"] == tool_id]
-        total_syscall_ms = matched["duration"].sum() * 1000 if len(matched) > 0 else 0
+
+        total_syscall_ms = float(_matched_ms_by_tool.get(tool_id, 0.0))
         
         label = _get_tool_label(row, max_len=40)
         if label.startswith("Bash: "):
@@ -1220,9 +1328,8 @@ def create_tool_syscalls_plotly(
         tool_start = tc_row["start_time"]
         tool_end = tc_row["end_time"]
         
-        # Filter fs entries to this tool's time window
-        mask = (fs_df["timestamp"] >= tool_start) & (fs_df["timestamp"] <= tool_end)
-        tool_fs = fs_df[mask].copy()
+        # Filter fs entries to this tool's time window (searchsorted slice)
+        tool_fs = _window_slice(tool_start, tool_end).copy()
         
         if len(tool_fs) == 0:
             continue
@@ -1231,8 +1338,8 @@ def create_tool_syscalls_plotly(
         tool_fs["time_rel_ms"] = (tool_fs["timestamp"] - tool_start).dt.total_seconds() * 1000
         tool_fs["duration_ms"] = tool_fs["duration"] * 1000  # Convert to ms
         
-        # Classify syscalls and determine match status
-        tool_fs["category"] = tool_fs["operation"].apply(classify_syscall)
+        # Classify syscalls and determine match status (vectorized map)
+        tool_fs["category"] = tool_fs["operation"].map(_SYSCALL_TO_CATEGORY).fillna("other")
         tool_fs["is_matched"] = tool_fs["matched_tool_call"] == tool_id
         
         # Store FULL stats before sampling (for summary display)
@@ -1398,10 +1505,19 @@ def create_tool_syscall_durations_plotly(
 ) -> None:
     """Create per-tool violin plots of syscall duration distributions."""
     tc_df = data.tool_calls_df
-    fs_df = data.fs_entries_df.copy()
+    fs_df = data.fs_entries_df
 
     if len(tc_df) == 0:
         return
+
+    # Sort once + searchsorted per tool instead of a full-DataFrame mask per tool.
+    fs_sorted = fs_df.sort_values("timestamp", kind="stable").reset_index(drop=True)
+    _ts_sorted = fs_sorted["timestamp"].to_numpy()
+
+    def _window_slice(tool_start, tool_end) -> pd.DataFrame:
+        lo = np.searchsorted(_ts_sorted, np.datetime64(tool_start), side="left")
+        hi = np.searchsorted(_ts_sorted, np.datetime64(tool_end), side="right")
+        return fs_sorted.iloc[lo:hi]
 
     total_tool_calls = len(tc_df)
     tc_df = _select_top_tool_calls(tc_df, max_tool_calls)
@@ -1422,8 +1538,7 @@ def create_tool_syscall_durations_plotly(
         tool_start = row["start_time"]
         tool_end = row["end_time"]
 
-        mask = (fs_df["timestamp"] >= tool_start) & (fs_df["timestamp"] <= tool_end)
-        tool_syscalls = fs_df[mask]
+        tool_syscalls = _window_slice(tool_start, tool_end)
         n_syscalls = len(tool_syscalls)
 
         per_type_counts = tool_syscalls["operation"].value_counts()
@@ -1460,8 +1575,7 @@ def create_tool_syscall_durations_plotly(
         tool_start = tc_row["start_time"]
         tool_end = tc_row["end_time"]
 
-        mask = (fs_df["timestamp"] >= tool_start) & (fs_df["timestamp"] <= tool_end)
-        tool_fs = fs_df[mask].copy()
+        tool_fs = _window_slice(tool_start, tool_end).copy()
         if len(tool_fs) == 0:
             continue
 
@@ -1586,6 +1700,43 @@ PHASE_COLORS = {
 # Visualization: Phase Breakdown
 # =============================================================================
 
+def _exclusive_role_wall_tiles(
+    role_intervals: dict[str, list[tuple[float, float]]],
+    e2e_s: float,
+) -> dict[str, float]:
+    """Tile wall clock into role-exclusive, Parallel, and Idle slices."""
+    points = {0.0, max(0.0, e2e_s)}
+    merged_by_role = {
+        role: _merge_intervals(intervals)
+        for role, intervals in role_intervals.items()
+        if intervals
+    }
+    for intervals in merged_by_role.values():
+        for s, e in intervals:
+            points.add(max(0.0, min(e2e_s, s)))
+            points.add(max(0.0, min(e2e_s, e)))
+
+    out = {role: 0.0 for role in merged_by_role}
+    out["Parallel"] = 0.0
+    out["Idle"] = 0.0
+    ordered = sorted(points)
+    for s, e in zip(ordered, ordered[1:]):
+        if e <= s:
+            continue
+        mid = (s + e) / 2.0
+        active = [
+            role for role, intervals in merged_by_role.items()
+            if any(a <= mid < b for a, b in intervals)
+        ]
+        duration = e - s
+        if len(active) == 0:
+            out["Idle"] += duration
+        elif len(active) == 1:
+            out[active[0]] += duration
+        else:
+            out["Parallel"] += duration
+    return {label: value for label, value in out.items() if value > 0 or label == "Idle"}
+
 def _phase_breakdown_stats(trace_dir: Path) -> dict:
     """
     Compute the stats annotated alongside the pie chart:
@@ -1620,22 +1771,39 @@ def _phase_breakdown_stats(trace_dir: Path) -> dict:
                          e2e exactly
       - n_llm / n_tool:  interval counts
     """
+    default_sum_labels = [
+        "LLM", "Tool File-IO", "Tool CPU compute", "Tool Wait",
+        "Process-mgmt", "Orch File-IO", "Orch CPU compute", "Orch Wait",
+        "Unaccounted",
+    ]
+    default_stats = {
+        "e2e_s": 0.0,
+        "llm_sum_s": 0.0, "tool_sum_s": 0.0, "phase_span_s": 0.0,
+        "llm_union_s": 0.0, "tool_union_s": 0.0,
+        "subagent_union_s": 0.0, "measured_union_s": 0.0,
+        "unaccounted_s": 0.0, "concurrency_factor": 1.0,
+        "speedup": 1.0, "wall_both_s": 0.0, "wall_llm_only_s": 0.0,
+        "wall_tool_only_s": 0.0, "wall_idle_s": 0.0,
+        "n_llm": 0, "n_tool": 0,
+        "sum_labels": default_sum_labels,
+        "sum_values": [0.0] * len(default_sum_labels),
+        "wall_labels": ["Idle"],
+        "wall_values": [0.0],
+        "role_intervals": {},
+    }
     bundle = _load_agent_timeline_data(trace_dir)
     if bundle is None:
-        return {
-            "e2e_s": 0.0,
-            "llm_sum_s": 0.0, "tool_sum_s": 0.0, "phase_span_s": 0.0,
-            "llm_union_s": 0.0, "tool_union_s": 0.0,
-            "subagent_union_s": 0.0, "measured_union_s": 0.0,
-            "unaccounted_s": 0.0, "concurrency_factor": 1.0,
-            "speedup": 1.0, "wall_both_s": 0.0, "wall_llm_only_s": 0.0,
-            "wall_tool_only_s": 0.0, "wall_idle_s": 0.0,
-            "n_llm": 0, "n_tool": 0,
-        }
+        return default_stats
     e2e = bundle["total_span_s"]
     llm_iv = [(s["start_rel"], s["end_rel"]) for s in bundle["llm_segments"]]
     tool_iv = [(s, e) for s, e, _, _ in bundle["tool_intervals"]]
     sub_iv = [(s, e) for s, e, _, _ in bundle["subagent_intervals"]]
+    sum_by_label = {label: 0.0 for label in default_sum_labels}
+    role_intervals: dict[str, list[tuple[float, float]]] = {
+        "LLM": llm_iv[:],
+        "Tool": [],
+        "Orchestration": [],
+    }
 
     # Hierarchy-correct LLM/tool sums: use compute_parallelism's self-intervals
     # so nested calls (Run_analysis ⊃ RunPreprocessing ⊃ ScriptExec) are not
@@ -1653,6 +1821,20 @@ def _phase_breakdown_stats(trace_dir: Path) -> dict:
 
         llm_sum_ms = 0.0
         tool_sum_ms = 0.0
+        t0_ms = bundle["t0"].timestamp() * 1000.0
+        tool_summaries = {}
+        strace = bundle.get("strace_data")
+        if strace is not None:
+            tool_summaries = (strace.summary or {}).get("tool_summaries") or {}
+            # Some parsed.json files keep tool_summaries at the top level;
+            # load_parsed_json stores only summary, so read directly when needed.
+            parsed_path = trace_dir / "parsed.json"
+            if not tool_summaries and parsed_path.exists():
+                try:
+                    parsed_payload = json.loads(parsed_path.read_text(encoding="utf-8"))
+                    tool_summaries = parsed_payload.get("tool_summaries") or {}
+                except (OSError, json.JSONDecodeError):
+                    tool_summaries = {}
         for rid, ivs in self_iv_by_id.items():
             ev = events.get(rid)
             if ev is None:
@@ -1660,32 +1842,91 @@ def _phase_breakdown_stats(trace_dir: Path) -> dict:
             self_ms = sum(max(0.0, e - s) for s, e in ivs)
             if ev.kind == "llm":
                 llm_sum_ms += self_ms
+                sum_by_label["LLM"] += self_ms / 1000.0
             elif ev.kind == "tool":
                 tool_sum_ms += self_ms
+                rel_ivs = [
+                    ((s - t0_ms) / 1000.0, (e - t0_ms) / 1000.0)
+                    for s, e in ivs if e > s
+                ]
+                has_children = bool(children.get(rid))
+                is_orch = has_children and not _is_code_exec_tool(ev.name)
+                if is_orch:
+                    role_intervals["Orchestration"].extend(rel_ivs)
+                else:
+                    role_intervals["Tool"].extend(rel_ivs)
+
+                summary = tool_summaries.get(rid) or {}
+                rb = summary.get("resource_breakdown") or {}
+                if not rb:
+                    if is_orch:
+                        sum_by_label["Orch CPU compute"] += self_ms / 1000.0
+                    elif _is_code_exec_tool(ev.name):
+                        sum_by_label["Tool CPU compute"] += self_ms / 1000.0
+                    else:
+                        sum_by_label["Unaccounted"] += self_ms / 1000.0
+                    continue
+                # Partition this tool's SELF-TIME (bounded, deduped) into
+                # File-IO / Wait / Process-mgmt / other / CPU. Raw syscall latency
+                # sums can exceed self-time under multithreading (many threads
+                # blocked on futex at once); if so, scale the measured buckets down
+                # to fit self-time so Wait can't overcount (the old 94% bug). CPU is
+                # whatever self-time is left after the measured syscall buckets.
+                self_s = self_ms / 1000.0
+                file_s = float(rb.get("file_io_ms", 0.0) or 0.0) / 1000.0
+                wait_s = float(rb.get("wait_ms", 0.0) or 0.0) / 1000.0
+                proc_s = float(rb.get("process_mgmt_ms", 0.0) or 0.0) / 1000.0
+                other_s = (
+                    float(rb.get("other_syscall_ms", 0.0) or 0.0)
+                    + float(rb.get("network_ms", 0.0) or 0.0)
+                ) / 1000.0
+                busy_s = file_s + wait_s + proc_s + other_s
+                if busy_s > self_s and busy_s > 0:
+                    f = self_s / busy_s
+                    file_s *= f; wait_s *= f; proc_s *= f; other_s *= f
+                    cpu_s = 0.0
+                else:
+                    cpu_s = self_s - busy_s
+                if is_orch:
+                    sum_by_label["Orch File-IO"] += file_s
+                    sum_by_label["Orch Wait"] += wait_s
+                    sum_by_label["Process-mgmt"] += proc_s
+                    sum_by_label["Orch CPU compute"] += cpu_s
+                    sum_by_label["Unaccounted"] += other_s
+                else:
+                    sum_by_label["Tool File-IO"] += file_s
+                    sum_by_label["Tool Wait"] += wait_s
+                    sum_by_label["Process-mgmt"] += proc_s
+                    sum_by_label["Tool CPU compute"] += cpu_s
+                    sum_by_label["Unaccounted"] += other_s
         llm_sum = llm_sum_ms / 1000.0
         tool_sum = tool_sum_ms / 1000.0
     except (FileNotFoundError, ImportError):
         llm_sum = sum(max(0.0, e - s) for s, e in llm_iv)
         tool_sum = sum(max(0.0, e - s) for s, e in tool_iv)
-
-    phase_span = llm_sum + tool_sum
+        sum_by_label["LLM"] = llm_sum
+        sum_by_label["Unaccounted"] = tool_sum
+        role_intervals["Tool"] = tool_iv[:]
 
     llm_u = _time_union_seconds(llm_iv)
     tool_u = _time_union_seconds(tool_iv)
     sub_u = _time_union_seconds(sub_iv)
     meas_u = _time_union_seconds(llm_iv + tool_iv + sub_iv)
+    unaccounted_s = max(0.0, e2e - meas_u)
+    sum_by_label["Unaccounted"] += unaccounted_s
+    phase_span = sum(sum_by_label.values())
 
-    # Wall-clock decomposition into 4 tiles: LLM only / tool only / both /
-    # idle.  `both` is the sweep-line intersection (any LLM active AND any
-    # tool active) — for parallel traces this is mostly cross-worker overlap;
-    # for serial controller-style traces it is LLM nested inside tools.
-    from compute_parallelism import intersection_active
-    wall_both = intersection_active(llm_iv, tool_iv)
-    wall_llm_only = max(0.0, llm_u - wall_both)
-    wall_tool_only = max(0.0, tool_u - wall_both)
-    wall_idle = max(0.0, e2e - _time_union_seconds(llm_iv + tool_iv))
+    # Wall-clock decomposition into n+1 tiles: one exclusive slice per role,
+    # one aggregate Parallel slice for >=2 active roles/lanes, plus Idle.
+    wall_by_label = _exclusive_role_wall_tiles(role_intervals, e2e)
+    wall_both = wall_by_label.get("Parallel", 0.0)
+    wall_llm_only = wall_by_label.get("LLM", 0.0)
+    wall_tool_only = wall_by_label.get("Tool", 0.0)
+    wall_idle = wall_by_label.get("Idle", 0.0)
 
     speedup = (phase_span / e2e) if e2e > 0 else 1.0
+    sum_labels = [label for label in default_sum_labels if sum_by_label.get(label, 0.0) > 0 or label == "Unaccounted"]
+    wall_labels = [label for label in ["LLM", "Tool", "Orchestration", "Parallel", "Idle"] if label in wall_by_label]
     return {
         "e2e_s": e2e,
         "llm_sum_s": llm_sum,
@@ -1695,7 +1936,7 @@ def _phase_breakdown_stats(trace_dir: Path) -> dict:
         "tool_union_s": tool_u,
         "subagent_union_s": sub_u,
         "measured_union_s": meas_u,
-        "unaccounted_s": max(0.0, e2e - meas_u),
+        "unaccounted_s": unaccounted_s,
         "concurrency_factor": speedup,
         "speedup": speedup,
         "wall_both_s": wall_both,
@@ -1704,6 +1945,11 @@ def _phase_breakdown_stats(trace_dir: Path) -> dict:
         "wall_idle_s": wall_idle,
         "n_llm": len(llm_iv),
         "n_tool": len(tool_iv),
+        "sum_labels": sum_labels,
+        "sum_values": [sum_by_label[label] for label in sum_labels],
+        "wall_labels": wall_labels,
+        "wall_values": [wall_by_label[label] for label in wall_labels],
+        "role_intervals": role_intervals,
     }
 
 
@@ -1718,23 +1964,16 @@ def _fmt_stats_line(stats: dict) -> str:
     )
 
 
-# (labels, colors) for the wall-clock decomposition pie.  Idle is ALWAYS
-# drawn — a 0% Idle slice on a busy trace is itself information.
-WALL_PIE_SLICES = [
-    ("LLM only", "#e74c3c"),
-    ("Tool only", "#3498db"),
-    ("LLM + Tool", "#9b59b6"),
-    ("Idle", "#bdc3c7"),
-]
-
-
-def _wall_pie_values(stats: dict) -> list[float]:
-    return [
-        stats["wall_llm_only_s"],
-        stats["wall_tool_only_s"],
-        stats["wall_both_s"],
-        stats["wall_idle_s"],
-    ]
+def _colors_for_labels(labels: list[str]) -> list[str]:
+    fallback = "#95A5A6"
+    label_colors = {
+        "LLM": RESOURCE_COLORS["LLM"],
+        "Tool": "#3498db",
+        "Orchestration": RESOURCE_COLORS["Orchestration"],
+        "Parallel": RESOURCE_COLORS["Parallel"],
+        "Idle": RESOURCE_COLORS["Idle"],
+    }
+    return [RESOURCE_COLORS.get(label, label_colors.get(label, fallback)) for label in labels]
 
 
 def create_phase_breakdown_plotly(trace_dir: Path, output_path: Path) -> None:
@@ -1743,7 +1982,7 @@ def create_phase_breakdown_plotly(trace_dir: Path, output_path: Path) -> None:
 
     Left  (sum view):  phase span = LLM self-time sum + tool self-time sum.
                        Answers "what KIND of work fills the busy time".
-    Right (wall view): e2e tiled into LLM-only / tool-only / both / idle.
+    Right (wall view): e2e tiled into role-exclusive slices / parallel / idle.
                        Answers "how much of the wall clock is parallel".
     Below: speedup = phase span / e2e (1.0x serial, ~Nx for N busy workers).
     """
@@ -1753,14 +1992,23 @@ def create_phase_breakdown_plotly(trace_dir: Path, output_path: Path) -> None:
         return
 
     fig = go.Figure()
-    # Pie 1 — sum view.
+    sum_labels = stats["sum_labels"]
+    sum_values = stats["sum_values"]
+    wall_labels = stats["wall_labels"]
+    wall_values = stats["wall_values"]
+
+    # Pie 1 — sum view. textposition='inside' + textinfo='percent' keeps labels
+    # ON the wedges (auto-hidden when a slice is too small), so tiny slices no
+    # longer collide as external labels. Full label/value is in the hover.
     fig.add_trace(
         go.Pie(
-            labels=["LLM", "Tool (non-LLM)"],
-            values=[stats["llm_sum_s"], stats["tool_sum_s"]],
-            marker_colors=[PHASE_COLORS["model_completion"], PHASE_COLORS["tool_execution"]],
+            labels=sum_labels,
+            values=sum_values,
+            marker_colors=_colors_for_labels(sum_labels),
             hole=0.45,
-            textinfo='label+percent',
+            textinfo='percent',
+            textposition='inside',
+            insidetextorientation='horizontal',
             hovertemplate="<b>%{label}</b><br>%{value:.2f}s (%{percent})<extra></extra>",
             domain=dict(x=[0.02, 0.46], y=[0.16, 0.92]),
             sort=False,
@@ -1771,11 +2019,13 @@ def create_phase_breakdown_plotly(trace_dir: Path, output_path: Path) -> None:
     # legend + hover), per design.
     fig.add_trace(
         go.Pie(
-            labels=[name for name, _ in WALL_PIE_SLICES],
-            values=_wall_pie_values(stats),
-            marker_colors=[color for _, color in WALL_PIE_SLICES],
+            labels=wall_labels,
+            values=wall_values,
+            marker_colors=_colors_for_labels(wall_labels),
             hole=0.45,
-            textinfo='label+percent',
+            textinfo='percent',
+            textposition='inside',
+            insidetextorientation='horizontal',
             hovertemplate="<b>%{label}</b><br>%{value:.2f}s (%{percent})<extra></extra>",
             domain=dict(x=[0.54, 0.98], y=[0.16, 0.92]),
             sort=False,
@@ -1834,7 +2084,8 @@ def create_phase_breakdown_plotly(trace_dir: Path, output_path: Path) -> None:
         ),
         height=620,
         width=1200,
-        showlegend=False,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.08, xanchor="center", x=0.5),
         margin=dict(l=20, r=20, t=70, b=40),
         paper_bgcolor="white",
     )
@@ -1853,12 +2104,25 @@ def create_phase_breakdown_matplotlib(trace_dir: Path, output_path: Path) -> Non
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6.5))
 
-    # Pie 1 — sum view.
-    sum_sizes = [stats["llm_sum_s"], stats["tool_sum_s"]]
-    sum_colors = [PHASE_COLORS["model_completion"], PHASE_COLORS["tool_execution"]]
+    # Pie 1 — sum view.  Labels go into a legend (with seconds + %) instead of
+    # inline pie labels, which otherwise collide badly when several slices are
+    # tiny (0.x%). autopct only annotates slices large enough to read.
+    sum_labels = stats["sum_labels"]
+    sum_sizes = stats["sum_values"]
+    sum_colors = _colors_for_labels(sum_labels)
+    phase_span = stats["phase_span_s"]
+    sum_legend = [
+        f"{name} — {v:.1f}s ({(v / phase_span * 100.0) if phase_span > 0 else 0.0:.1f}%)"
+        for name, v in zip(sum_labels, sum_sizes)
+    ]
     ax1.pie(
-        sum_sizes, labels=["LLM", "Tool (non-LLM)"], colors=sum_colors,
-        autopct='%1.1f%%', startangle=90, wedgeprops=dict(width=0.6),
+        sum_sizes, colors=sum_colors, startangle=90,
+        autopct=lambda p: f"{p:.0f}%" if p >= 4.0 else "",
+        wedgeprops=dict(width=0.6),
+    )
+    ax1.legend(
+        sum_legend, loc="center right", bbox_to_anchor=(-0.05, 0.5),
+        fontsize=8, frameon=False,
     )
     ax1.set_title("Sum view — total busy time by kind", fontsize=11)
     ax1.text(
@@ -1868,12 +2132,13 @@ def create_phase_breakdown_matplotlib(trace_dir: Path, output_path: Path) -> Non
 
     # Pie 2 — wall view.  All four slices always present; labels go into a
     # legend (with absolute seconds) so a 0% Idle slice stays visible.
-    wall_vals = _wall_pie_values(stats)
-    wall_colors = [color for _, color in WALL_PIE_SLICES]
+    wall_labels = stats["wall_labels"]
+    wall_vals = stats["wall_values"]
+    wall_colors = _colors_for_labels(wall_labels)
     e2e = stats["e2e_s"]
     legend_labels = [
         f"{name} — {v:.1f}s ({(v / e2e * 100.0) if e2e > 0 else 0.0:.1f}%)"
-        for (name, _), v in zip(WALL_PIE_SLICES, wall_vals)
+        for name, v in zip(wall_labels, wall_vals)
     ]
     ax2.pie(
         wall_vals, colors=wall_colors, startangle=90,
@@ -1911,7 +2176,7 @@ def create_phase_breakdown_matplotlib(trace_dir: Path, output_path: Path) -> Non
         f"(phase span {stats['phase_span_s']:.1f}s / e2e {stats['e2e_s']:.1f}s)",
         fontsize=13,
     )
-    plt.tight_layout(rect=[0, 0.15, 1, 0.95])
+    plt.tight_layout(rect=[0.14, 0.15, 1, 0.95])
     plt.savefig(output_path, dpi=150)
     plt.close()
 
@@ -1933,21 +2198,82 @@ def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, 
     return merged
 
 
+# Horizontal resolution (in "pixels") the dense-timeline rasterizer quantizes
+# to. The agent-concurrency chart is ~1400px wide; anything finer than one pixel
+# is not visible. Using 2000 keeps quantization strictly sub-pixel at any trace
+# length, so the rendered image is identical while the bar count is bounded.
+_RASTER_PX = 2000
+
+
+def _rasterize_intervals(
+    intervals: list[tuple[float, float]],
+    span_s: float,
+    px: int = _RASTER_PX,
+) -> list[tuple[float, float]]:
+    """Quantize intervals to a sub-pixel time grid, then merge adjacent cells.
+
+    A busy trace produces hundreds of thousands of one-syscall intervals whose
+    sub-pixel gaps (futex between two reads, etc.) block plain union-merge, so
+    the bar count stays huge and the chart is both unrenderable and a solid
+    smear. Snapping each interval to a grid of ``px`` buckets and merging
+    consecutive occupied buckets bounds the output to O(px) bars per resource
+    while staying visually identical: every collapsed feature is narrower than
+    one on-screen pixel. Falls back to an exact union when the span is unknown.
+    """
+    if span_s <= 0 or not intervals:
+        return _merge_intervals(intervals)
+    bucket = span_s / px
+    occupied: set[int] = set()
+    for s, e in intervals:
+        if e <= s:
+            continue
+        i0 = int(s // bucket)
+        i1 = int(e // bucket)
+        for i in range(i0, i1 + 1):
+            occupied.add(i)
+    runs: list[list[int]] = []
+    for i in sorted(occupied):
+        if runs and i == runs[-1][1] + 1:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    return [(r[0] * bucket, (r[1] + 1) * bucket) for r in runs]
+
+
+def _subtract_many(
+    base: list[tuple[float, float]],
+    blockers: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Subtract blocker intervals from a list of base intervals."""
+    remaining = base[:]
+    for bs, be in _merge_intervals(blockers):
+        next_remaining: list[tuple[float, float]] = []
+        for s, e in remaining:
+            if be <= s or bs >= e:
+                next_remaining.append((s, e))
+                continue
+            if s < bs:
+                next_remaining.append((s, max(s, bs)))
+            if be < e:
+                next_remaining.append((min(e, be), e))
+        remaining = next_remaining
+    return [(s, e) for s, e in remaining if e > s]
+
+
 def _agent_concurrency_data(trace_dir: Path) -> dict | None:
     """
     Per-agent lane data for the agent concurrency chart.
 
     Lane = one agent (genomas_role; traces without roles collapse to a single
-    "agent" lane).  Lane base = union(that agent's LLM ∪ tool intervals);
-    hatch overlay = union(that agent's tool intervals).  Rendering rule is
-    "hatch wins": hatched = code executing (an LLM call may run concurrently
-    inside the same agent), solid = LLM only, blank = agent idle.
+    "agent" lane).  Bars are resource segments: LLM windows, syscall-latency
+    resources, and residual CPU/orchestration self-time.  Blank space is
+    explicit lane idle.
 
     Returns dict with:
-      lanes: [{role, label, base, tool, busy_s, pct}]  (sorted by first start)
+      lanes: [{role, label, segments, busy, busy_s, pct}]  (sorted by first start)
       wall_s, t0_s, max_concurrent, parallel_s, parallel_pct
     """
-    from compute_parallelism import load_events
+    from compute_parallelism import build_children, compute_self_intervals, load_events
 
     try:
         events = load_events(trace_dir)
@@ -1960,37 +2286,148 @@ def _agent_concurrency_data(trace_dir: Path) -> dict | None:
     t0 = min(ev.start_ms for ev in events.values())
     wall_ms = max(ev.end_ms for ev in events.values()) - t0
 
-    by_role: dict[str, dict[str, list[tuple[float, float]]]] = {}
-    for ev in events.values():
-        role = ev.role or "agent"
-        slot = by_role.setdefault(role, {"all": [], "tool": []})
-        iv = ((ev.start_ms - t0) / 1000.0, (ev.end_ms - t0) / 1000.0)
-        slot["all"].append(iv)
-        if ev.kind == "tool":
-            slot["tool"].append(iv)
+    children = build_children(events)
+    self_iv_by_id = compute_self_intervals(events, children)
+    event_role = {rid: (ev.role or "agent") for rid, ev in events.items()}
+    event_name = {rid: ev.name for rid, ev in events.items()}
+    segments_by_role: dict[str, list[dict]] = {}
+    syscall_blockers_by_tool: dict[str, list[tuple[float, float]]] = {}
+
+    def add_segment(role: str, resource: str, s: float, e: float, label: str = "") -> None:
+        if e <= s:
+            return
+        segments_by_role.setdefault(role, []).append({
+            "resource": resource,
+            "start": max(0.0, s),
+            "end": max(0.0, e),
+            "label": label,
+        })
+
+    for rid, ev in events.items():
+        if ev.kind == "llm":
+            add_segment(
+                event_role[rid],
+                "LLM",
+                (ev.start_ms - t0) / 1000.0,
+                (ev.end_ms - t0) / 1000.0,
+                ev.name,
+            )
+
+    parsed_json = trace_dir / "parsed.json"
+    if parsed_json.exists():
+        # Reuse the cached, vectorized-parse DataFrame instead of re-reading the
+        # (potentially multi-million-row) parsed.json and calling pd.to_datetime
+        # per entry — both were major costs on big traces.
+        fs_df = load_parsed_json(parsed_json).fs_entries_df
+        t0_dt = datetime.fromtimestamp(t0 / 1000.0)
+        if len(fs_df) and "timestamp" in fs_df.columns:
+            df = fs_df[["matched_tool_call", "syscall", "timestamp", "duration"]].copy()
+            df = df[df["matched_tool_call"].isin(event_role.keys())]
+            df["resource"] = df["syscall"].astype(str).map(resource_for_syscall)
+            df = df[df["resource"].notna()]
+        else:
+            df = None
+
+        if df is not None and len(df):
+            # Align every timestamp's DATE onto t0_dt's date (keep HMS) —
+            # vectorized equivalent of the old per-row replace(year/month/day).
+            t0_ts = pd.Timestamp(t0_dt)
+            t0_midnight = pd.Timestamp(t0_dt.date())
+            ts = df["timestamp"]
+            aligned = t0_midnight + (ts - ts.dt.normalize())
+
+            # TZ-mismatch shift detection (same threshold / 15-min quantum).
+            shift_s = 0
+            gap_s = (aligned.min() - t0_ts).total_seconds()
+            if abs(gap_s) >= 1800:
+                shift_s = round(gap_s / 900) * 900
+
+            end_rel = (aligned - t0_ts).dt.total_seconds() - shift_s
+            duration_s = pd.to_numeric(df["duration"], errors="coerce").fillna(0.0)
+            start_rel = end_rel - duration_s
+            keep = (end_rel >= -1.0) & (start_rel <= (wall_ms / 1000.0) + 1.0)
+
+            for tid, resource, syscall, s, e in zip(
+                df["matched_tool_call"][keep],
+                df["resource"][keep],
+                df["syscall"][keep].astype(str),
+                start_rel[keep],
+                end_rel[keep],
+            ):
+                label = "Process-mgmt" if resource == "Process-mgmt" else resource
+                add_segment(event_role[tid], label, float(s), float(e), syscall)
+                syscall_blockers_by_tool.setdefault(tid, []).append((float(s), float(e)))
+
+    for rid, ev in events.items():
+        if ev.kind != "tool":
+            continue
+        rel_self = [
+            ((s - t0) / 1000.0, (e - t0) / 1000.0)
+            for s, e in self_iv_by_id.get(rid, [])
+            if e > s
+        ]
+        if not rel_self:
+            continue
+        gaps = _subtract_many(rel_self, syscall_blockers_by_tool.get(rid, []))
+        if _is_code_exec_tool(event_name.get(rid, "")):
+            resource = "CPU compute"
+        elif children.get(rid):
+            resource = "Orchestration"
+        else:
+            continue
+        for s, e in gaps:
+            add_segment(event_role[rid], resource, s, e, event_name.get(rid, "tool"))
+
+    # Collapse the one-bar-per-syscall segments into a bounded number of bars per
+    # (role, resource) via sub-pixel rasterization. A busy trace has hundreds of
+    # thousands of syscalls; one plotly bar each is unrenderable (minutes to
+    # build, multi-hundred-MB HTML) and a solid smear on screen. Plain union
+    # leaves the count huge because sub-pixel gaps (futex between reads) block
+    # merging. Rasterizing to a sub-pixel grid bounds the bar count while keeping
+    # the rendered image identical; only per-syscall hover detail is lost, which
+    # is meaningless at this density. Idle gaps wider than a pixel are preserved.
+    # busy / concurrency are computed from the EXACT (un-rasterized) segments so
+    # the reported numbers are unaffected; rasterization only collapses the
+    # DISPLAY bars.
+    display_segments_by_role: dict[str, list[dict]] = {}
+    for role in list(segments_by_role.keys()):
+        by_resource: dict[str, list[tuple[float, float]]] = {}
+        for seg in segments_by_role[role]:
+            by_resource.setdefault(seg["resource"], []).append(
+                (seg["start"], seg["end"])
+            )
+        merged_segments: list[dict] = []
+        for resource, intervals in by_resource.items():
+            for s, e in _rasterize_intervals(intervals, wall_ms / 1000.0):
+                merged_segments.append({
+                    "resource": resource,
+                    "start": s,
+                    "end": e,
+                    "label": resource,
+                })
+        display_segments_by_role[role] = merged_segments
 
     lanes = []
-    for role, slot in by_role.items():
-        base = _merge_intervals(slot["all"])
-        busy_s = sum(e - s for s, e in base)
+    for role, segments in segments_by_role.items():
+        busy = _merge_intervals([(seg["start"], seg["end"]) for seg in segments])
+        busy_s = sum(e - s for s, e in busy)
+        display_segments = display_segments_by_role.get(role, [])
         lanes.append({
             "role": role,
-            "base": base,
-            "tool": _merge_intervals(slot["tool"]),
+            "segments": sorted(display_segments, key=lambda seg: (seg["start"], seg["end"])),
+            "busy": busy,
             "busy_s": busy_s,
         })
-    lanes.sort(key=lambda lane: lane["base"][0][0] if lane["base"] else 0.0)
+    lanes.sort(key=lambda lane: lane["busy"][0][0] if lane["busy"] else 0.0)
 
     wall_s = wall_ms / 1000.0
     for lane in lanes:
-        pct = (lane["busy_s"] / wall_s * 100.0) if wall_s > 0 else 0.0
-        lane["pct"] = pct
-        lane["label"] = f"{lane['role']} ({pct:.0f}%)"
+        lane["label"] = lane["role"]
 
     # Sweep over per-agent unions: max simultaneous agents + time at >=2.
     points: list[tuple[float, int]] = []
     for lane in lanes:
-        for s, e in lane["base"]:
+        for s, e in lane["busy"]:
             points.append((s, 1))
             points.append((e, -1))
     points.sort()
@@ -2022,7 +2459,7 @@ AGENT_LANE_COLORS = [
 
 
 def create_agent_concurrency_matplotlib(trace_dir: Path, output_path: Path) -> None:
-    """Agent activity timeline — one lane per agent, hatch = code execution."""
+    """Agent activity timeline — one lane per agent, colored by resource."""
     data = _agent_concurrency_data(trace_dir)
     if data is None or not data["lanes"]:
         print(f"  agent_concurrency: no data found in {trace_dir}", file=sys.stderr)
@@ -2033,17 +2470,16 @@ def create_agent_concurrency_matplotlib(trace_dir: Path, output_path: Path) -> N
     fig, ax = plt.subplots(figsize=(14, max(2.6, 0.85 * n + 1.6)))
 
     for i, lane in enumerate(lanes):
-        color = AGENT_LANE_COLORS[i % len(AGENT_LANE_COLORS)]
         y = n - 1 - i  # first-active agent on top
-        ax.broken_barh(
-            [(s, e - s) for s, e in lane["base"]],
-            (y - 0.36, 0.72), facecolors=color, edgecolors="none",
-        )
-        ax.broken_barh(
-            [(s, e - s) for s, e in lane["tool"]],
-            (y - 0.36, 0.72), facecolors=color, edgecolors="black",
-            linewidth=0.4, hatch="///",
-        )
+        for seg in lane["segments"]:
+            color = RESOURCE_COLORS.get(seg["resource"], "#95A5A6")
+            ax.broken_barh(
+                [(seg["start"], seg["end"] - seg["start"])],
+                (y - 0.36, 0.72),
+                facecolors=color,
+                edgecolors="white",
+                linewidth=0.3,
+            )
 
     ax.set_yticks([n - 1 - i for i in range(n)])
     ax.set_yticklabels([lane["label"] for lane in lanes], fontsize=10)
@@ -2059,12 +2495,11 @@ def create_agent_concurrency_matplotlib(trace_dir: Path, output_path: Path) -> N
     )
 
     legend_handles = [
-        mpatches.Patch(facecolor="#aaaaaa", label="agent active — LLM only"),
-        mpatches.Patch(facecolor="#aaaaaa", edgecolor="black",
-                       hatch="///", label="code execution"),
+        mpatches.Patch(facecolor=RESOURCE_COLORS.get(label, "#95A5A6"), label=label)
+        for label in ["LLM", "File-IO", "CPU compute", "Wait", "Process-mgmt", "Orchestration"]
     ]
     fig.legend(handles=legend_handles, loc="lower center",
-               ncol=2, frameon=False, fontsize=9)
+               ncol=3, frameon=False, fontsize=9)
 
     fig.suptitle("Agent activity timeline", fontsize=13)
     plt.tight_layout(rect=[0, 0.10, 1, 0.97])
@@ -2082,34 +2517,34 @@ def create_agent_concurrency_plotly(trace_dir: Path, output_path: Path) -> None:
     lanes = data["lanes"]
     n = len(lanes)
     fig = go.Figure()
-    for i, lane in enumerate(lanes):
-        color = AGENT_LANE_COLORS[i % len(AGENT_LANE_COLORS)]
+    shown_resources: set[str] = set()
+    for _i, lane in enumerate(lanes):
         y = lane["label"]
-        fig.add_trace(go.Bar(
-            y=[y] * len(lane["base"]),
-            x=[e - s for s, e in lane["base"]],
-            base=[s for s, _ in lane["base"]],
-            orientation="h",
-            marker=dict(color=color, line=dict(width=0)),
-            hovertemplate=(f"<b>{lane['role']}</b> active<br>"
-                           "%{base:.1f}s → %{x:.1f}s<extra></extra>"),
-            customdata=[[e] for _, e in lane["base"]],
-            showlegend=False,
-        ))
-        fig.add_trace(go.Bar(
-            y=[y] * len(lane["tool"]),
-            x=[e - s for s, e in lane["tool"]],
-            base=[s for s, _ in lane["tool"]],
-            orientation="h",
-            marker=dict(
-                color=color,
-                line=dict(width=0.5, color="black"),
-                pattern=dict(shape="/", fgcolor="black", solidity=0.25),
-            ),
-            hovertemplate=(f"<b>{lane['role']}</b> code execution<br>"
-                           "%{base:.1f}s → end<extra></extra>"),
-            showlegend=False,
-        ))
+        for seg in lane["segments"]:
+            resource = seg["resource"]
+            showlegend = resource not in shown_resources
+            shown_resources.add(resource)
+            fig.add_trace(go.Bar(
+                y=[y],
+                x=[seg["end"] - seg["start"]],
+                base=[seg["start"]],
+                orientation="h",
+                marker=dict(
+                    color=RESOURCE_COLORS.get(resource, "#95A5A6"),
+                    line=dict(width=0.3, color="white"),
+                ),
+                name=resource,
+                legendgroup=resource,
+                showlegend=showlegend,
+                customdata=[[seg["end"], seg.get("label", "")]],
+                hovertemplate=(
+                    f"<b>{lane['role']}</b><br>"
+                    f"{resource}<br>"
+                    "start: %{base:.3f}s<br>"
+                    "end: %{customdata[0]:.3f}s<br>"
+                    "detail: %{customdata[1]}<extra></extra>"
+                ),
+            ))
 
     fig.update_layout(
         title=(
@@ -2325,7 +2760,24 @@ def _datetime_from_ms(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000.0)
 
 
+# Bundle cache: phase_breakdown, agent_timeline and agent_concurrency all call
+# _load_agent_timeline_data(trace_dir) with the same argument and consume the
+# result read-only. Without caching, each recomputes the full alignment AND
+# reloads/​copies the millions of fs_entries. Cache the bundle per trace_dir so
+# the work (including the big DataFrame date-shift copy) happens once per run.
+_AGENT_TIMELINE_BUNDLE_CACHE: dict[str, dict | None] = {}
+
+
 def _load_agent_timeline_data(trace_dir: Path) -> dict | None:
+    cache_key = str(Path(trace_dir).resolve())
+    if cache_key in _AGENT_TIMELINE_BUNDLE_CACHE:
+        return _AGENT_TIMELINE_BUNDLE_CACHE[cache_key]
+    bundle = _load_agent_timeline_data_uncached(trace_dir)
+    _AGENT_TIMELINE_BUNDLE_CACHE[cache_key] = bundle
+    return bundle
+
+
+def _load_agent_timeline_data_uncached(trace_dir: Path) -> dict | None:
     """
     Load and align LLM segments, tool calls, subagent calls, and FS entries
     onto a single t=0 origin. Returns None if nothing is plottable.
@@ -2888,79 +3340,47 @@ def create_agent_timeline_plotly(trace_dir: Path, output_path: Path) -> None:
                 ),
             ), row=2, col=1)
 
-    # --- Lane 3: FS syscall hybrid render (bars for ≥SYS_BAR_MIN_S, dots for <) ---
+    # --- Lane 3: FS syscall coverage per category (sub-pixel rasterized) ---
+    # Each category's syscall intervals [time_rel, time_rel+duration] are
+    # rasterized to a bounded set of coverage bars (full data, visually faithful)
+    # rather than randomly subsampling to a few thousand individual marks. This
+    # keeps the lane fast and honest even at millions of syscalls; sub-pixel
+    # detail (incl. the old <0.1s dots) is collapsed because it cannot be drawn.
     strace = bundle["strace_data"]
     if strace is not None and len(strace.fs_entries_df) > 0:
-        fs_df = strace.fs_entries_df.copy()
-        if "duration" in fs_df.columns:
-            fs_df["duration_s"] = fs_df["duration"].astype(float)
-        else:
-            fs_df["duration_s"] = 0.0
-        fs_df["category"] = fs_df["operation"].apply(classify_syscall)
-
-        # Subsample to keep the chart responsive.
-        if len(fs_df) > 8000:
-            fs_df = fs_df.sample(8000, random_state=0)
-
+        fs_df = strace.fs_entries_df
+        span_s = bundle["total_span_s"]
+        # Vectorized classification over the whole column (no per-row .apply).
+        cat_series = fs_df["operation"].map(_SYSCALL_TO_CATEGORY).fillna("other")
+        dur = pd.to_numeric(fs_df.get("duration", 0.0), errors="coerce").fillna(0.0)
+        start = fs_df["time_rel"].astype(float)
+        end = start + dur
         for cat in syscall_rows:
-            cat_rows = fs_df[fs_df["category"] == cat]
-            if len(cat_rows) == 0:
+            mask = (cat_series == cat).to_numpy()
+            if not mask.any():
                 continue
             color = SYSCALL_CATEGORY_COLORS.get(cat, SYSCALL_CATEGORY_COLORS["other"])
-
-            long_rows = cat_rows[cat_rows["duration_s"] >= SYS_BAR_MIN_S]
-            short_rows = cat_rows[cat_rows["duration_s"] < SYS_BAR_MIN_S]
-
-            # ≥0.1s → real-width bars; duration tooltip uses customdata (no
-            # more `%{x}` returning end position).
-            if len(long_rows) > 0:
-                fig.add_trace(go.Bar(
-                    x=long_rows["duration_s"].tolist(),
-                    y=[cat] * len(long_rows),
-                    base=long_rows["time_rel"].tolist(),
-                    orientation="h",
-                    marker_color=color,
-                    marker_line_width=0,
-                    opacity=0.7,
-                    name=f"sys: {cat} (long)",
-                    legendgroup=f"sys:{cat}",
-                    showlegend=True,
-                    customdata=list(zip(
-                        long_rows["operation"].astype(str).tolist(),
-                        long_rows["duration_s"].astype(float).tolist(),
-                        long_rows["time_rel"].astype(float).tolist(),
-                    )),
-                    hovertemplate=(
-                        "<b>%{customdata[0]}</b> ("+cat+")<br>"
-                        "start: %{customdata[2]:.3f}s<br>"
-                        "duration: %{customdata[1]:.6f}s<br>"
-                        "<extra></extra>"
-                    ),
-                ), row=3, col=1)
-
-            # <0.1s → scatter dots so the position is honest and we don't
-            # falsely inflate widths to 0.0005s minimums.
-            if len(short_rows) > 0:
-                fig.add_trace(go.Scatter(
-                    x=short_rows["time_rel"].tolist(),
-                    y=[cat] * len(short_rows),
-                    mode="markers",
-                    marker=dict(color=color, size=4, opacity=0.45,
-                                line=dict(width=0)),
-                    name=f"sys: {cat} (short)",
-                    legendgroup=f"sys:{cat}",
-                    showlegend=(len(long_rows) == 0),
-                    customdata=list(zip(
-                        short_rows["operation"].astype(str).tolist(),
-                        short_rows["duration_s"].astype(float).tolist(),
-                    )),
-                    hovertemplate=(
-                        "<b>%{customdata[0]}</b> ("+cat+")<br>"
-                        "time: %{x:.3f}s<br>"
-                        "duration: %{customdata[1]:.6f}s<br>"
-                        "<extra></extra>"
-                    ),
-                ), row=3, col=1)
+            intervals = list(zip(start[mask].tolist(), end[mask].tolist()))
+            runs = _rasterize_intervals(intervals, span_s)
+            if not runs:
+                continue
+            fig.add_trace(go.Bar(
+                x=[e - s for s, e in runs],
+                y=[cat] * len(runs),
+                base=[s for s, e in runs],
+                orientation="h",
+                marker_color=color,
+                marker_line_width=0,
+                opacity=0.7,
+                name=f"sys: {cat}",
+                legendgroup=f"sys:{cat}",
+                showlegend=True,
+                hovertemplate=(
+                    "<b>" + cat + "</b><br>"
+                    "start: %{base:.3f}s<br>"
+                    "<extra></extra>"
+                ),
+            ), row=3, col=1)
 
     # --- Layout polish ----------------------------------------------------
     title_extra = ""
@@ -3072,43 +3492,37 @@ def create_agent_timeline_matplotlib(trace_dir: Path, output_path: Path) -> None
     ax_tool.set_title("Tool — real tools", fontsize=10, loc="left")
     ax_tool.grid(axis="x", alpha=0.2)
 
-    # Lane 3: FS hybrid — long syscalls as bars, short as dots.
+    # Lane 3: FS syscall coverage per category (sub-pixel rasterized) — full
+    # data, visually faithful, bounded bar count (matches the plotly twin).
     strace = bundle["strace_data"]
     if strace is not None and len(strace.fs_entries_df) > 0:
-        fs_df = strace.fs_entries_df.copy()
-        if "duration" in fs_df.columns:
-            fs_df["duration_s"] = fs_df["duration"].astype(float)
-        else:
-            fs_df["duration_s"] = 0.0
-        fs_df["category"] = fs_df["operation"].apply(classify_syscall)
-        if len(fs_df) > 8000:
-            fs_df = fs_df.sample(8000, random_state=0)
+        fs_df = strace.fs_entries_df
+        span_s = bundle["total_span_s"]
+        cat_series = fs_df["operation"].map(_SYSCALL_TO_CATEGORY).fillna("other")
+        dur = pd.to_numeric(fs_df.get("duration", 0.0), errors="coerce").fillna(0.0)
+        start = fs_df["time_rel"].astype(float)
+        end = start + dur
         for cat_idx, cat in enumerate(syscall_rows):
-            sub = fs_df[fs_df["category"] == cat]
-            if len(sub) == 0:
+            mask = (cat_series == cat).to_numpy()
+            if not mask.any():
                 continue
             color = SYSCALL_CATEGORY_COLORS.get(cat, SYSCALL_CATEGORY_COLORS["other"])
-            long_rows = sub[sub["duration_s"] >= SYS_BAR_MIN_S]
-            short_rows = sub[sub["duration_s"] < SYS_BAR_MIN_S]
-            if len(long_rows) > 0:
-                ax_sys.barh(
-                    y=[cat_idx] * len(long_rows),
-                    width=long_rows["duration_s"].tolist(),
-                    left=long_rows["time_rel"].tolist(),
-                    color=color, alpha=0.7, height=0.7, edgecolor="none",
-                )
-            if len(short_rows) > 0:
-                ax_sys.scatter(
-                    short_rows["time_rel"].tolist(),
-                    [cat_idx] * len(short_rows),
-                    c=color, s=3, alpha=0.45, linewidths=0,
-                )
+            runs = _rasterize_intervals(
+                list(zip(start[mask].tolist(), end[mask].tolist())), span_s)
+            if not runs:
+                continue
+            ax_sys.barh(
+                y=[cat_idx] * len(runs),
+                width=[e - s for s, e in runs],
+                left=[s for s, e in runs],
+                color=color, alpha=0.7, height=0.7, edgecolor="none",
+            )
     ax_sys.set_yticks(range(len(syscall_rows)))
     ax_sys.set_yticklabels(syscall_rows, fontsize=8)
     ax_sys.set_ylim(-0.6, len(syscall_rows) - 0.4)
     ax_sys.invert_yaxis()
     ax_sys.set_title(
-        f"System — FS syscalls (bars ≥{int(SYS_BAR_MIN_S*1000)}ms, dots <)",
+        "System — FS syscalls (per-category coverage)",
         fontsize=10, loc="left",
     )
     ax_sys.set_xlabel("time (s)")
@@ -3281,16 +3695,16 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         "tool_syscall_durations": "Per-tool violin plots showing duration distribution of each syscall type",
         "phase_breakdown": (
             "Two donuts over the same trace. Sum view (left): total busy time "
-            "split LLM vs tool, each interval minus its nested children, so an "
-            "LLM call inside a CodeExec is credited to LLM once; center = phase "
-            "span. Wall view (right): the e2e wall clock tiled into LLM-only / "
-            "tool-only / LLM+tool / idle. Headline: speedup = phase span / e2e."
+            "split into LLM, tool resources, process management, orchestration, "
+            "and unaccounted residual. Wall view (right): e2e wall clock tiled "
+            "into role-exclusive slices, aggregate parallel time, and idle. "
+            "Headline: speedup = phase span / e2e."
         ),
         "agent_timeline": "Semantic / tool / system three-lane Gantt: LLM + subagents on top, real tools in the middle, FS syscalls (by category) on the bottom",
         "agent_concurrency": (
-            "One lane per agent's busy time; hatched spans = code execution "
-            "inside that agent (solid = LLM only). Vertical overlap between "
-            "lanes = agents running in parallel."
+            "One lane per agent with resource-colored segments: LLM, File-IO, "
+            "CPU compute, Wait, Process-mgmt, and Orchestration. Blank lane space "
+            "is idle; vertical overlap between lanes = agents in parallel."
         ),
     }
     
@@ -3350,13 +3764,45 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
             </div>
 """
     
+    # Storage / lineage figures (produced by lineage_analyzer.py into
+    # ../lineage/). PNG-only; show a preview card + link when present.
+    lineage_dir = trace_dir / "lineage"
+    lineage_figs = [
+        ("fig1_size_distribution.png", "File Size Distribution",
+         "Per-syscall I/O request size and per-file artifact size by category."),
+        ("fig2_reader_fanout.png", "Reader Fan-out",
+         "Distinct CodeExec calls that read each artifact (caching candidates)."),
+        ("fig3_staleness_cdf.png", "Write→First-Read Staleness",
+         "Gap from first write to first read, per artifact."),
+        ("fig4_lifecycle.png", "Artifact Lifecycle",
+         "Per-artifact reclaimable window over time."),
+        ("fig5_artifact_lifecycle.png", "Top Artifact Lifecycles",
+         "Write/read events for the most-touched artifacts."),
+    ]
+    for fname, title, desc in lineage_figs:
+        if not (lineage_dir / fname).exists():
+            continue
+        rel = f"../lineage/{fname}"
+        html_content += f"""
+            <div class="card">
+                <img src='{rel}' alt='{title}'>
+                <div class="card-body">
+                    <h3>{title}</h3>
+                    <p style="color: #888; font-size: 0.85rem; margin-bottom: 0.75rem;">{desc}</p>
+                    <div class="links">
+                        <a href='{rel}' class='png'>Static PNG</a>
+                    </div>
+                </div>
+            </div>
+"""
+
     html_content += """
         </div>
     </div>
 </body>
 </html>
 """
-    
+
     (output_dir / "index.html").write_text(html_content)
 
 
@@ -3367,8 +3813,8 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
 # Visualizations that use StraceData (from parsed.json)
 STRACE_VISUALIZATIONS = {
     "timeline": (create_timeline_plotly, create_timeline_matplotlib),
-    "process_timeline": (create_process_timeline_plotly, create_process_timeline_matplotlib),
-    "io_rate": (create_io_rate_plotly, create_io_rate_matplotlib),
+    # process_timeline and io_rate intentionally disabled (not wanted). The
+    # create_* functions are kept in case they're re-enabled later.
     "tool_syscalls": (create_tool_syscalls_plotly, None),
     "tool_syscall_durations": (create_tool_syscall_durations_plotly, None),
 }

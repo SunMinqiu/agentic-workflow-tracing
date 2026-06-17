@@ -33,6 +33,92 @@ TOOL_CALL_PATTERN = re.compile(
 )
 
 
+SYSCALL_CATEGORIES = {
+    "metadata": {
+        "stat", "fstat", "lstat", "statx", "fstatat64", "newfstatat",
+        "access", "faccessat",
+        "getdents64", "getdents",
+        "readlink", "readlinkat",
+    },
+    "data": {
+        "read", "write", "pread64", "pwrite64",
+        "readv", "writev", "preadv", "pwritev", "preadv2", "pwritev2",
+    },
+    "control": {
+        "open", "openat", "close",
+        "lseek", "fcntl", "ioctl",
+        "chdir", "fchdir", "getcwd",
+        "mmap", "munmap",
+        "dup", "dup2", "dup3",
+    },
+    "modify": {
+        "mkdir", "mkdirat", "rmdir",
+        "unlink", "unlinkat",
+        "rename", "renameat", "renameat2",
+        "chmod", "fchmod", "chown", "fchown",
+        "truncate", "ftruncate", "fsync", "fdatasync", "sync_file_range",
+    },
+    "process": {
+        "clone", "clone3", "fork", "vfork",
+        "execve",
+        "wait4", "waitpid", "waitid",
+    },
+    "blocking": {
+        "select", "pselect6", "poll", "ppoll",
+        "epoll_wait", "epoll_pwait",
+        "futex",
+        "nanosleep", "clock_nanosleep",
+    },
+    "network": {
+        "recvfrom", "sendto",
+        "accept", "accept4", "connect",
+        "socket", "bind", "listen",
+        "recv", "send",
+        "recvmsg", "sendmsg", "recvmmsg", "sendmmsg",
+    },
+}
+
+SYSCALL_CATEGORY_TO_RESOURCE = {
+    "metadata": "file_io",
+    "data": "file_io",
+    "control": "file_io",
+    "modify": "file_io",
+    "blocking": "wait",
+    "process": "process_mgmt",
+}
+
+RESOURCE_KEYS = ("file_io", "wait", "process_mgmt", "network", "other")
+
+CODE_EXEC_TOOL_NAMES = {
+    "Bash",
+    "CodeExec",
+    "ScriptExec",
+    "SubprocessExec",
+    "PythonExec",
+    "ShellExec",
+}
+
+PURE_IO_TOOL_NAMES = {"Read", "Write", "Edit", "Glob", "Grep"}
+
+
+def classify_syscall(syscall: str) -> str:
+    for category, syscalls in SYSCALL_CATEGORIES.items():
+        if syscall in syscalls:
+            return category
+    return "other"
+
+
+def resource_bucket_for_syscall(syscall: str) -> str:
+    category = classify_syscall(syscall)
+    if category == "network":
+        return "network"
+    return SYSCALL_CATEGORY_TO_RESOURCE.get(category, "other")
+
+
+def is_code_exec_tool(tool_name: str) -> bool:
+    return tool_name in CODE_EXEC_TOOL_NAMES
+
+
 @dataclass
 class ToolCall:
     start_time: datetime
@@ -69,6 +155,7 @@ class FsEntry:
     errno: str | None = None
     errno_desc: str | None = None
     open_flags: str | None = None
+    resource_bucket: str | None = None
 
     def to_dict(self) -> dict:
         out = {
@@ -81,6 +168,7 @@ class FsEntry:
             "path": self.path,
             "bytes_transferred": self.bytes_transferred,
             "matched_tool_call": self.matched_tool_call,
+            "resource_bucket": self.resource_bucket,
         }
         if self.errno is not None:
             out["errno"] = self.errno
@@ -102,6 +190,9 @@ class ToolSummary:
     syscall_count: int
     by_syscall: dict[str, dict]
     time_gap_ms: float
+    resource_breakdown: dict[str, float] = field(default_factory=dict)
+    cpu_compute_ms: float = 0.0
+    unaccounted_ms: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -112,6 +203,12 @@ class ToolSummary:
             "syscall_count": self.syscall_count,
             "by_syscall": self.by_syscall,
             "time_gap_ms": round(self.time_gap_ms, 3),
+            "resource_breakdown": {
+                key: (round(float(value), 3) if isinstance(value, (int, float)) else value)
+                for key, value in self.resource_breakdown.items()
+            },
+            "cpu_compute_ms": round(self.cpu_compute_ms, 3),
+            "unaccounted_ms": round(self.unaccounted_ms, 3),
         }
 
 
@@ -359,6 +456,50 @@ def get_active_tool_calls(ts: datetime, tool_calls: list[ToolCall]) -> list[Tool
     return [tc for tc in tool_calls if tc.contains(ts)]
 
 
+class ActiveToolIndex:
+    """Sweep-line index of currently-active tool calls.
+
+    Replaces the O(events × tool_calls) per-event scan (get_active_tool_calls /
+    _single_active_tool_id) with an amortized O(events + tool_calls) sweep.
+
+    REQUIREMENT: ``advance_to(ts)`` must be called with non-decreasing ``ts``
+    (events are sorted by ts_ns in parse_events, so both build_state_tables and
+    the main loop iterate them in order). ``active()`` then returns exactly the
+    tools tc where ``tc.start_time <= ts <= tc.end_time`` — identical semantics
+    to ``get_active_tool_calls``, just without rescanning every tool each call.
+    """
+
+    def __init__(self, tool_calls: list[ToolCall]) -> None:
+        self._by_start = sorted(tool_calls, key=lambda tc: tc.start_time)
+        self._by_end = sorted(tool_calls, key=lambda tc: tc.end_time)
+        self._si = 0
+        self._ei = 0
+        self._active: dict[str, ToolCall] = {}
+
+    def advance_to(self, ts: datetime) -> None:
+        by_start = self._by_start
+        n = len(by_start)
+        while self._si < n and by_start[self._si].start_time <= ts:
+            tc = by_start[self._si]
+            self._active[tc.tool_id] = tc
+            self._si += 1
+        by_end = self._by_end
+        m = len(by_end)
+        # end < ts → no longer active (inclusive end: still active at ts == end).
+        while self._ei < m and by_end[self._ei].end_time < ts:
+            tc = by_end[self._ei]
+            self._active.pop(tc.tool_id, None)
+            self._ei += 1
+
+    def active(self) -> list[ToolCall]:
+        return list(self._active.values())
+
+    def single_active_id(self) -> str | None:
+        if len(self._active) == 1:
+            return next(iter(self._active.values())).tool_id
+        return None
+
+
 def get_tool_window(tool_calls: list[ToolCall]) -> tuple[datetime | None, datetime | None]:
     if not tool_calls:
         return None, None
@@ -477,11 +618,13 @@ def build_state_tables(events: list[dict], tool_calls: list[ToolCall]) -> tuple[
     """
     fd_table = FDTable()
     proc_tree = ProcessTree()
+    index = ActiveToolIndex(tool_calls)
 
     for event in events:
         etype = event.get("type")
         ts = ns_to_datetime(int(event["ts_ns"]))
-        tool_id = _single_active_tool_id(ts, tool_calls)
+        index.advance_to(ts)
+        tool_id = index.single_active_id()
 
         if etype == "fork":
             parent = int(event.get("pid", -1))
@@ -539,7 +682,7 @@ def build_state_tables(events: list[dict], tool_calls: list[ToolCall]) -> tuple[
 
 def match_event_to_tool(
     entry: FsEntry,
-    tool_calls: list[ToolCall],
+    active_tools: list[ToolCall],
     fd_tool_id: str | None,
     proc_tree: ProcessTree,
 ) -> str | None:
@@ -547,8 +690,7 @@ def match_event_to_tool(
     if fd_tool_id:
         return fd_tool_id
 
-    # Signal 2: timestamp window.
-    active_tools = get_active_tool_calls(entry.timestamp, tool_calls)
+    # Signal 2: timestamp window (active_tools precomputed by the sweep index).
     if not active_tools:
         # Signal 4: process ancestry.
         root_tool = proc_tree.get_root_tool(entry.pid)
@@ -615,6 +757,7 @@ def make_fs_entry(event: dict) -> FsEntry:
     # so HTTP-heavy agents have non-zero throughput in tool_summaries.
     _BYTE_RETURNING_SYSCALLS = {
         "read", "write", "pread64", "pwrite64",
+        "readv", "writev", "preadv", "pwritev", "preadv2", "pwritev2",
         "sendto", "recvfrom", "sendmsg", "recvmsg",
         "sendmmsg", "recvmmsg",
     }
@@ -622,7 +765,12 @@ def make_fs_entry(event: dict) -> FsEntry:
         bytes_xfer = ret
 
     fd = None
-    if syscall in {"read", "write", "close", "fstat", "pread64", "pwrite64", "ftruncate"}:
+    if syscall in {
+        "read", "write", "readv", "writev",
+        "pread64", "pwrite64", "preadv", "pwritev", "preadv2", "pwritev2",
+        "close", "fstat", "fsync", "fdatasync",
+        "ftruncate", "sync_file_range",
+    }:
         fd = arg0
 
     path = event.get("path")
@@ -652,6 +800,7 @@ def make_fs_entry(event: dict) -> FsEntry:
         errno=errno,
         errno_desc=errno_desc,
         open_flags=open_flags,
+        resource_bucket=resource_bucket_for_syscall(syscall),
     )
 
 
@@ -680,19 +829,51 @@ def make_lifecycle_entry(event: dict) -> FsEntry:
 
 def compute_tool_summaries(entries: list[FsEntry], tool_calls: list[ToolCall]) -> dict[str, ToolSummary]:
     summaries: dict[str, ToolSummary] = {}
+    # Group entries by their matched tool once (O(entries)) instead of
+    # rescanning the full entries list per tool call (O(tool_calls × entries)).
+    entries_by_tool: dict[str, list[FsEntry]] = {}
+    for e in entries:
+        if e.matched_tool_call:
+            entries_by_tool.setdefault(e.matched_tool_call, []).append(e)
     for tc in tool_calls:
         wall_ms = (tc.end_time - tc.start_time).total_seconds() * 1000
-        selected = [e for e in entries if e.matched_tool_call == tc.tool_id]
+        selected = entries_by_tool.get(tc.tool_id, [])
         by_syscall: dict[str, dict] = {}
+        resource_breakdown = {key: 0.0 for key in RESOURCE_KEYS}
         total_ms = 0.0
         for e in selected:
             by_syscall.setdefault(e.syscall, {"count": 0, "total_ms": 0.0, "total_bytes": 0})
             by_syscall[e.syscall]["count"] += 1
             by_syscall[e.syscall]["total_ms"] += e.duration * 1000
             by_syscall[e.syscall]["total_bytes"] += e.bytes_transferred
-            total_ms += e.duration * 1000
+            duration_ms = e.duration * 1000
+            bucket = e.resource_bucket or resource_bucket_for_syscall(e.syscall)
+            if bucket not in resource_breakdown:
+                bucket = "other"
+            resource_breakdown[bucket] += duration_ms
+            total_ms += duration_ms
         for agg in by_syscall.values():
             agg["total_ms"] = round(agg["total_ms"], 3)
+        measured_ms = (
+            resource_breakdown["file_io"]
+            + resource_breakdown["wait"]
+            + resource_breakdown["process_mgmt"]
+            + resource_breakdown["other"]
+            + resource_breakdown["network"]
+        )
+        residual_ms = max(0.0, wall_ms - measured_ms)
+        cpu_compute_ms = residual_ms if is_code_exec_tool(tc.tool_name) else 0.0
+        unaccounted_ms = 0.0 if is_code_exec_tool(tc.tool_name) else residual_ms
+        out_breakdown = {
+            "file_io_ms": resource_breakdown["file_io"],
+            "wait_ms": resource_breakdown["wait"],
+            "process_mgmt_ms": resource_breakdown["process_mgmt"],
+            "network_ms": resource_breakdown["network"],
+            "other_syscall_ms": resource_breakdown["other"],
+            "cpu_compute_ms": cpu_compute_ms,
+            "unaccounted_ms": unaccounted_ms,
+            "cpu_source": "residual_estimate" if is_code_exec_tool(tc.tool_name) else "not_applicable",
+        }
         summaries[tc.tool_id] = ToolSummary(
             tool_id=tc.tool_id,
             tool_name=tc.tool_name,
@@ -701,8 +882,33 @@ def compute_tool_summaries(entries: list[FsEntry], tool_calls: list[ToolCall]) -
             syscall_count=len(selected),
             by_syscall=by_syscall,
             time_gap_ms=wall_ms - total_ms,
+            resource_breakdown=out_breakdown,
+            cpu_compute_ms=cpu_compute_ms,
+            unaccounted_ms=unaccounted_ms,
         )
     return summaries
+
+
+def compute_resource_summary(entries: list[FsEntry]) -> dict[str, dict[str, float]]:
+    """Aggregate syscall latency by resource bucket and broad role."""
+    roles = {
+        "tool": {key: 0.0 for key in RESOURCE_KEYS},
+        "orchestration": {key: 0.0 for key in RESOURCE_KEYS},
+    }
+    for entry in entries:
+        role = (
+            "tool"
+            if entry.matched_tool_call and entry.matched_tool_call != "uncategorized"
+            else "orchestration"
+        )
+        bucket = entry.resource_bucket or resource_bucket_for_syscall(entry.syscall)
+        if bucket not in RESOURCE_KEYS:
+            bucket = "other"
+        roles[role][bucket] += entry.duration * 1000.0
+    return {
+        role: {f"{key}_ms": round(value, 3) for key, value in buckets.items()}
+        for role, buckets in roles.items()
+    }
 
 
 def process_trace_dir(
@@ -734,6 +940,7 @@ def process_trace_dir(
     fs_entries: list[FsEntry] = []
     total_events = 0
     lifecycle_types = {"fork", "exec", "exit"}
+    index = ActiveToolIndex(tool_calls)
     for event in events:
         etype = event.get("type")
         if etype == "syscall":
@@ -757,19 +964,25 @@ def process_trace_dir(
         if is_enoent_noise(entry):
             continue
 
+        # Sweep index gives the active tool set in O(1) amortized instead of an
+        # O(tool_calls) rescan per event.
+        index.advance_to(entry.timestamp)
+        active_tools = index.active()
+
         entry.matched_tool_call = match_event_to_tool(
             entry,
-            tool_calls,
+            active_tools,
             fd_tool_id=event.get("_fd_tool_id"),
             proc_tree=proc_tree,
         )
 
-        if entry.matched_tool_call is None and in_any_tool_window(entry.timestamp, tool_calls):
+        if entry.matched_tool_call is None and active_tools:
             entry.matched_tool_call = "uncategorized"
         fs_entries.append(entry)
 
     matched = sum(1 for e in fs_entries if e.matched_tool_call and e.matched_tool_call != "uncategorized")
     uncategorized = sum(1 for e in fs_entries if e.matched_tool_call == "uncategorized")
+    resource_summary = compute_resource_summary(fs_entries)
 
     result = ParsedTrace()
     result.tool_calls = tool_calls
@@ -785,6 +998,7 @@ def process_trace_dir(
             "process_tree_nodes": len(proc_tree._parents),
             "method": "multi_signal_fd_path_process_tree",
         },
+        "resource_summary": resource_summary,
     }
     return result
 

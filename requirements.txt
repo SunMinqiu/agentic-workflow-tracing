@@ -1,3 +1,4 @@
+-e .
 matplotlib
 numpy
 pandas

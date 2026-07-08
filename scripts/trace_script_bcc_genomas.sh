@@ -18,11 +18,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TOOL_DIR="$ROOT_DIR/src"
 CFG_DIR="$ROOT_DIR/config"
 CONFIG_FILE="${CONFIG_FILE:-$CFG_DIR/config_genomas.env}"
-ANALYSIS_DIR="${ANALYSIS_DIR:-$TOOL_DIR}"
 CALLER_BASE_OUT="${BASE_OUT:-}"
+export PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib_results.sh"
 
 # Source .env.genomas so API keys + AGENT_PYTHON (absolute, sudo-safe)
 # survive `sudo -E`.  deploy_genomas_to_client.sh writes this file with
@@ -54,7 +55,8 @@ fi
 # --- Verify paths and interpreters -----------------------------------------
 mkdir -p "$WORK_DIR"
 mkdir -p "$DATA_DIR" || { echo "Error: cannot create DATA_DIR=$DATA_DIR" >&2; exit 1; }
-mkdir -p "$BASE_OUT"
+BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/phase4_$(date +%Y%m%d_%H%M%S)}"
+require_lustre_base_out "$BASE_OUT"
 BASE_OUT="$(cd "$BASE_OUT" && pwd)"
 
 if [ ! -x "$TRACER_PYTHON" ]; then
@@ -77,12 +79,9 @@ if ! "$AGENT_PYTHON" -c "import sys; sys.path.insert(0,'$GENOMAS_REPO'); import 
     exit 1
 fi
 
-for f in analyze_codebase_genomas.py genomas_tool_logger.py bcc_tracer.py \
-         parse_ebpf.py summarize_pi_events.py compute_parallelism.py; do
-    [ -f "$TOOL_DIR/$f" ] || { echo "Error: $f not found in $TOOL_DIR" >&2; exit 1; }
-done
-[ -f "$ANALYSIS_DIR/visualize_strace.py" ] || {
-    echo "Error: visualize_strace.py not found in $ANALYSIS_DIR" >&2; exit 1;
+[ -d "$ROOT_DIR/src/agent_io_tracing" ] || {
+    echo "Error: package not found: $ROOT_DIR/src/agent_io_tracing" >&2
+    exit 1
 }
 
 if [ "${#WORKLOADS[@]}" -eq 0 ]; then
@@ -169,7 +168,7 @@ for entry in "${WORKLOADS[@]}"; do
 
     # --version embeds NAME so GenoMAS's output/log_<version>.txt is unique
     # per cell (otherwise checkpoint-resume across cells would corrupt data).
-    "$AGENT_PYTHON" "$TOOL_DIR/analyze_codebase_genomas.py" \
+    "$AGENT_PYTHON" -m agent_io_tracing.adapters.genomas.launcher \
         "$WORK" "$OUT" \
         --data-root "$DATA_DIR" \
         --model "$GENOMAS_MODEL" \
@@ -184,6 +183,37 @@ for entry in "${WORKLOADS[@]}"; do
     AGENT_PID=$!
     kill -STOP "$AGENT_PID" >/dev/null 2>&1 || true
 
+    INSTRUMENTATION_LEVEL="ebpf"
+    if [ "${COLLECT_LUSTRE_COUNTERS:-0}" = "1" ] || [ "${COLLECT_LUSTRE_COUNTERS:-0}" = "true" ]; then
+        INSTRUMENTATION_LEVEL="ebpf+lustre-counters"
+    fi
+
+    "$POST_PYTHON" -m agent_io_tracing.experiments.run_manifest \
+        --output "$OUT/manifest.json" \
+        --workload "GenoMAS" \
+        --task-id "$NAME" \
+        --model "$GENOMAS_MODEL" \
+        --api "1" \
+        --replay-mode "$GENOMAS_LLM_REPLAY" \
+        --llm-cache-path "${GENOMAS_LLM_CACHE_PATH:-$OUT/llm_cache.jsonl}" \
+        --agent-count "$MW" \
+        --pid "$AGENT_PID" \
+        --genomas-repo "$GENOMAS_REPO" \
+        --data-dir "$DATA_DIR" \
+        --work-dir "$WORK" \
+        --output-dir "$OUT" \
+        --instrumentation "$INSTRUMENTATION_LEVEL" \
+        > "$OUT/manifest.log" 2>&1 || true
+
+    LUSTRE_SAMPLER_PID=""
+    if [ "${COLLECT_LUSTRE_COUNTERS:-0}" = "1" ] || [ "${COLLECT_LUSTRE_COUNTERS:-0}" = "true" ]; then
+        "$POST_PYTHON" -m agent_io_tracing.tracing.lustre_counters \
+            --output "$OUT/lustre_counters.jsonl" \
+            --interval "$LUSTRE_COUNTER_INTERVAL_SEC" \
+            > "$OUT/lustre_counters.log" 2>&1 &
+        LUSTRE_SAMPLER_PID=$!
+    fi
+
     READY_FIFO="$OUT/bcc.ready.fifo"
     rm -f "$READY_FIFO"
     mkfifo "$READY_FIFO"
@@ -195,7 +225,7 @@ for entry in "${WORKLOADS[@]}"; do
         NET_ARG="--no-include-net"
     fi
 
-    "$TRACER_PYTHON" "$TOOL_DIR/bcc_tracer.py" \
+    "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         $NET_ARG \
@@ -220,6 +250,10 @@ for entry in "${WORKLOADS[@]}"; do
 
     sudo kill -INT "$TRACER_PID" >/dev/null 2>&1 || true
     wait "$TRACER_PID" >/dev/null 2>&1 || true
+    if [ -n "$LUSTRE_SAMPLER_PID" ]; then
+        kill -INT "$LUSTRE_SAMPLER_PID" >/dev/null 2>&1 || true
+        wait "$LUSTRE_SAMPLER_PID" >/dev/null 2>&1 || true
+    fi
     set -e
 
     echo "  End time:    $(date +%H:%M:%S)  (exit=$EXIT_CODE)"
@@ -250,27 +284,37 @@ for ws_out in "$BASE_OUT"/*/; do
     set +e
     failed_step=""
 
-    "$POST_PYTHON" "$TOOL_DIR/parse_ebpf.py" "$ws_out" \
+    "$POST_PYTHON" -m agent_io_tracing.parsing.ebpf "$ws_out" \
         > "$ws_out/parse.log" 2>&1
     PARSE_RC=$?
     [ $PARSE_RC -ne 0 ] && failed_step="parse_ebpf"
     sed 's/^/    /' "$ws_out/parse.log" | tail -5 || true
 
     if [ -f "$ws_out/parsed.json" ] && [ -f "$ws_out/pi_events.jsonl" ]; then
-        "$POST_PYTHON" "$TOOL_DIR/summarize_pi_events.py" "$ws_out" \
+        "$POST_PYTHON" -m agent_io_tracing.analysis.summary "$ws_out" \
             > "$ws_out/summarize.log" 2>&1
         SUM_RC=$?
         [ $SUM_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}summarize"
 
-        "$POST_PYTHON" "$TOOL_DIR/compute_parallelism.py" "$ws_out" \
+        "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" \
             > "$ws_out/parallelism.log" 2>&1
         PAR_RC=$?
         [ $PAR_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}parallelism"
 
-        "$POST_PYTHON" "$ANALYSIS_DIR/visualize_strace.py" "$ws_out" \
+        "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" \
             > "$ws_out/visualize.log" 2>&1
         VIZ_RC=$?
         [ $VIZ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}visualize"
+
+        "$POST_PYTHON" -m agent_io_tracing.lineage.analyzer "$ws_out" \
+            > "$ws_out/lineage.log" 2>&1
+        LIN_RC=$?
+        [ $LIN_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}lineage"
+
+        "$POST_PYTHON" -m agent_io_tracing.analysis.phase1_metrics "$ws_out" \
+            > "$ws_out/phase1_metrics.log" 2>&1
+        P1_RC=$?
+        [ $P1_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}phase1_metrics"
 
         if [ $PAR_RC -eq 0 ] && [ -f "$ws_out/parallelism_summary.json" ]; then
             WCS=$("$POST_PYTHON" -c "import json; print(json.load(open('$ws_out/parallelism_summary.json'))['wall_clock_s'])" 2>/dev/null || echo "?")

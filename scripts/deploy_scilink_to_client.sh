@@ -37,14 +37,19 @@ LOCAL_HARNESS="${LOCAL_HARNESS:-$HOME/Desktop/Benchmarking_Agents/pi-ebpf-tracin
 REMOTE_HARNESS_NAME="${REMOTE_HARNESS_NAME:-pi-ebpf-tracing-handoff}"
 REMOTE_SCILINK_DIR="${REMOTE_SCILINK_DIR:-SciLink}"
 SCILINK_GIT_URL="${SCILINK_GIT_URL:-https://github.com/ziatdinovmax/SciLink.git}"
-# Pin to main for now; replace with a commit SHA once we verify a working
-# revision so future upstream changes don't break the trace harness.
-SCILINK_GIT_REF="${SCILINK_GIT_REF:-main}"
+# Pin to a verified upstream commit so future SciLink changes do not silently
+# change benchmark behavior. Override with SCILINK_GIT_REF=main when you want
+# to deliberately test upstream HEAD.
+SCILINK_GIT_REF="${SCILINK_GIT_REF:-6660c09e491281057d40f6fa26b31a59b8cc37f9}"
 
 # Optional: install Meta's Segment Anything (README mentions it).  EELS demo
 # doesn't actually need it, but other SciLink demos do.  Toggle if you want
 # faster deploys for the smoke test.
 INSTALL_SAM="${INSTALL_SAM:-0}"
+
+# Large Python wheels (torch/scipy/etc.) do not fit in CloudLab's small home
+# filesystem. This path must be a writable large filesystem on the client.
+SCILINK_STORAGE_ROOT="${SCILINK_STORAGE_ROOT:-/mnt/lustrefs/$SSH_USER}"
 
 # ----------------------------------------------------------------
 # Pre-flight (local)
@@ -69,8 +74,8 @@ ssh "$SSH_USER@$CLIENT_NODE" "true"
 #
 # Note: this same path is also where deploy_sragent_to_client.sh writes,
 # so SRAgent state is preserved.  --exclude .env keeps the SRAgent .env
-# (with its keys) intact; --exclude traces/ avoids shipping local trace
-# artefacts back and forth.
+# (with its keys) intact; --exclude results/ avoids shipping local result
+# artefacts into the remote home filesystem.
 # ----------------------------------------------------------------
 if [ ! -d "$LOCAL_HARNESS" ]; then
     echo "Error: local harness dir not found: $LOCAL_HARNESS" >&2
@@ -81,6 +86,7 @@ rsync -av \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude 'traces/' \
+    --exclude 'results/' \
     --exclude '.venv/' \
     --exclude '.env' \
     "$LOCAL_HARNESS/" \
@@ -115,7 +121,8 @@ if [ -d "$REMOTE_SCILINK_DIR/.git" ]; then
     git -C "$REMOTE_SCILINK_DIR" checkout --quiet $SCILINK_GIT_REF
     git -C "$REMOTE_SCILINK_DIR" pull --quiet --ff-only origin $SCILINK_GIT_REF || true
 else
-    git clone --quiet --branch $SCILINK_GIT_REF $SCILINK_GIT_URL $REMOTE_SCILINK_DIR
+    git clone --quiet $SCILINK_GIT_URL $REMOTE_SCILINK_DIR
+    git -C "$REMOTE_SCILINK_DIR" checkout --quiet $SCILINK_GIT_REF
 fi
 
 cd "$REMOTE_SCILINK_DIR"
@@ -132,16 +139,30 @@ p = pathlib.Path.home() / "SciLink/scilink/agents/exp_agents/hyperspectral_analy
 if not p.exists():
     print(f"  WARNING: cannot patch {p} (not found)")
 else:
-    s = p.read_text()
-    # Idempotent: check the __init__ signature for **kwargs before patching.
-    init_sig = s.split("def __init__", 1)[1].split("):", 1)[0]
-    if "**kwargs" in init_sig:
+    lines = p.read_text().splitlines()
+    init_idx = None
+    close_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith("    def __init__("):
+            init_idx = i
+            break
+    if init_idx is not None:
+        for j in range(init_idx + 1, len(lines)):
+            if lines[j] == "    ):":
+                close_idx = j
+                break
+    if init_idx is None or close_idx is None:
+        print("  WARNING: could not locate HyperspectralAnalysisAgent.__init__ signature; kwargs patch skipped")
+    elif any("**kwargs" in line for line in lines[init_idx:close_idx + 1]):
         print(f"  HyperspectralAnalysisAgent already accepts **kwargs (no patch needed)")
     else:
-        old = "enable_human_feedback: bool = True\n    ):"
-        new = "enable_human_feedback: bool = True,\n        **kwargs,\n    ):"
-        assert old in s, "patch anchor not found — SciLink upstream signature changed"
-        p.write_text(s.replace(old, new))
+        prev_idx = close_idx - 1
+        while prev_idx > init_idx and not lines[prev_idx].strip():
+            prev_idx -= 1
+        if not lines[prev_idx].rstrip().endswith(","):
+            lines[prev_idx] = lines[prev_idx].rstrip() + ","
+        lines.insert(close_idx, "        **kwargs,")
+        p.write_text("\n".join(lines) + "\n")
         print(f"  Patched HyperspectralAnalysisAgent.__init__ to accept **kwargs")
 PATCH_PY
 
@@ -196,20 +217,38 @@ PATCH_PY
 # mounted, place BOTH the venv and uv cache there; keep the SciLink source
 # tree on home (it's small).  We then symlink ~/SciLink/.venv to the real
 # Lustre dir, so every later ".venv/bin/python" relative path still works.
-# Detection: /proc/mounts is the authoritative list on every Linux and
-# requires no extra tools (mountpoint(1) is missing on some EL images).
-if grep -qE "[[:space:]]/mnt/lustrefs[[:space:]]" /proc/mounts && [ -w /mnt/lustrefs ]; then
-    VENV_DIR=/mnt/lustrefs/scilink_venv
-    export UV_CACHE_DIR=/mnt/lustrefs/uv_cache_scilink
-    mkdir -p "\$UV_CACHE_DIR"
-    echo "  venv:     \$VENV_DIR (Lustre)"
-    echo "  uv cache: \$UV_CACHE_DIR (Lustre)"
-else
-    VENV_DIR=.venv
-    echo "  WARNING: Lustre not mounted; venv on local home (may run out)"
-fi
-# Drop any partial download from the prior failed install.
+SCILINK_STORAGE_ROOT="$SCILINK_STORAGE_ROOT"
+# Drop partial downloads from prior failed installs before the mount check so
+# a failed retry still frees the small home filesystem.
 rm -rf "\$HOME/.cache/uv/.tmp"* 2>/dev/null || true
+
+sudo mkdir -p "\$SCILINK_STORAGE_ROOT"
+sudo chown "\$USER:\$(id -gn)" "\$SCILINK_STORAGE_ROOT"
+
+if ! df -P "\$SCILINK_STORAGE_ROOT" | awk 'NR == 2 {exit (\$6 == "/") ? 1 : 0}'; then
+    echo "ERROR: \$SCILINK_STORAGE_ROOT is on the root filesystem." >&2
+    echo "       SciLink dependencies are too large for CloudLab home." >&2
+    echo "       Run the Lustre setup first, or rerun deploy with" >&2
+    echo "       SCILINK_STORAGE_ROOT=/path/to/large/mount." >&2
+    echo "       Current filesystems:" >&2
+    df -h >&2 || true
+    exit 1
+fi
+
+if [ ! -w "\$SCILINK_STORAGE_ROOT" ]; then
+    echo "ERROR: \$SCILINK_STORAGE_ROOT is not writable by \$USER." >&2
+    exit 1
+fi
+
+VENV_DIR="\$SCILINK_STORAGE_ROOT/scilink_venv"
+export UV_CACHE_DIR="\$SCILINK_STORAGE_ROOT/uv_cache_scilink"
+mkdir -p "\$UV_CACHE_DIR"
+echo "  storage:  \$SCILINK_STORAGE_ROOT"
+echo "  venv:     \$VENV_DIR"
+echo "  uv cache: \$UV_CACHE_DIR"
+
+# Drop partial downloads from the large uv cache too.
+rm -rf "\$UV_CACHE_DIR/.tmp"* 2>/dev/null || true
 
 uv venv --clear --python 3.12 "\$VENV_DIR"
 
@@ -243,6 +282,40 @@ uv pip install --python .venv/bin/python -e .
 echo "  Installing visualization extras (plotly)..."
 uv pip install --python .venv/bin/python plotly
 
+# SciLink 6660c09 currently pulls edison-client -> ldp -> fhlmi.  ldp 0.48
+# imports the older lmi.config module, but fhlmi 0.43 exposes lmi without that
+# compatibility file.  The EELS examples do not use the literature client, but
+# SciLink imports it during analysis-agent initialization, so provide the small
+# compatibility surface needed for imports to succeed.
+cat > .venv/lib/python3.12/site-packages/lmi/config.py << 'PYEOF'
+from __future__ import annotations
+
+from typing import Any
+from pydantic import BaseModel, Field
+
+
+class ModelSpec(BaseModel):
+    name: str
+    extra_params: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_name(cls, name: str, **kwargs: Any) -> "ModelSpec":
+        return cls(name=name, extra_params=dict(kwargs))
+
+
+class LLMConfig(BaseModel):
+    models: list[ModelSpec]
+    response_validator: Any | None = None
+    tool_parser: Any | None = None
+    router_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    def with_extra_params(self, **kwargs: Any) -> "LLMConfig":
+        models = [m.model_copy(deep=True) for m in self.models]
+        if models:
+            models[0].extra_params.update(kwargs)
+        return self.model_copy(update={"models": models})
+PYEOF
+
 # Optional: Segment Anything (Meta) — only if INSTALL_SAM=1.
 if [ "$INSTALL_SAM" = "1" ]; then
     echo "  Installing segment-anything (Meta)..."
@@ -255,10 +328,12 @@ fi
 # AttributeError via __getattr__ when you try to read it.
 .venv/bin/python - << 'PYEOF'
 import importlib, importlib.metadata as md
-for pkg in ("scilink", "litellm"):
+for pkg in ("scilink", "litellm", "lmi.config",
+            "scilink.agents.exp_agents.analysis_orchestrator"):
     importlib.import_module(pkg)
+    dist_name = pkg.split(".", 1)[0]
     try:
-        v = md.version(pkg)
+        v = md.version(dist_name)
     except md.PackageNotFoundError:
         v = "(unknown)"
     print(f"{pkg}: {v}")
@@ -306,6 +381,7 @@ ssh "$SSH_USER@$CLIENT_NODE" \
 # the same reason.
 export OPENAI_API_KEY="${OPENAI_API_KEY}"
 export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+export FUTUREHOUSE_API_KEY="${FUTUREHOUSE_API_KEY:-}"
 
 # Prevent Python from writing .pyc files into the venv.  Without this,
 # sudo -E runs leave root-owned __pycache__/*.pyc that the regular user
@@ -329,6 +405,7 @@ export POST_PYTHON="${REMOTE_HOME}/$REMOTE_SCILINK_DIR/.venv/bin/python"
 
 # Default model + Lustre data dir (matches deploy-time choices).
 export SCILINK_MODEL="gpt-4o-mini"
+export SCILINK_EMBEDDING_MODEL="text-embedding-3-small"
 export DATA_DIR="/mnt/lustrefs/scilink_data"
 REMOTE_TRACE_ENV
 
@@ -357,13 +434,13 @@ B. Full eBPF-traced run (everything end-to-end, prompt fed via stdin):
   ssh $SSH_USER@$CLIENT_NODE
   cd ~/$REMOTE_HARNESS_NAME
   cat .env.scilink                  # confirm AGENT_PYTHON / OPENAI_API_KEY
-  \${EDITOR:-vi} config_scilink.env # tweak WORKLOADS / RUN_WORKLOADS
+  \${EDITOR:-vi} config/config_scilink.env # tweak WORKLOADS / RUN_WORKLOADS
 
   # sudo required for BCC; -E preserves OPENAI_API_KEY via .env.scilink.
-  sudo -E bash trace_script_bcc_scilink.sh
+  sudo -E bash scripts/trace_script_bcc_scilink.sh
 
   # Outputs land in:
-  #   ~/$REMOTE_HARNESS_NAME/traces/<timestamp>/<workload>/
+  #   /mnt/lustrefs/$SSH_USER/pi-ebpf-tracing-handoff/results/<timestamp>/<workload>/
   # including parsed.json, pi_summary.json, visualizations/index.html.
 Once this is green, we layer on eBPF in the next phase.
 

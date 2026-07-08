@@ -1,0 +1,2 @@
+"""GenoMAS adapter."""
+

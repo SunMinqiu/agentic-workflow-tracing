@@ -16,11 +16,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TOOL_DIR="$ROOT_DIR/src"
 CFG_DIR="$ROOT_DIR/config"
 CONFIG_FILE="${CONFIG_FILE:-$CFG_DIR/config_scilink.env}"
-ANALYSIS_DIR="${ANALYSIS_DIR:-$TOOL_DIR}"
 CALLER_BASE_OUT="${BASE_OUT:-}"
+export PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib_results.sh"
 # TRACER_PYTHON / AGENT_PYTHON / POST_PYTHON come from config_scilink.env
 # (sourced below).  Two interpreters are required because BCC bindings are
 # tied to the system Python (3.6 on CentOS Stream 8) while SciLink needs ≥3.12.
@@ -88,43 +89,18 @@ if ! "$AGENT_PYTHON" -c "import scilink, litellm" >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -f "$TOOL_DIR/analyze_codebase_scilink.py" ]; then
-    echo "Error: analyze_codebase_scilink.py not found in $TOOL_DIR" >&2
+[ -d "$ROOT_DIR/src/agent_io_tracing" ] || {
+    echo "Error: package not found: $ROOT_DIR/src/agent_io_tracing" >&2
     exit 1
-fi
-
-if [ ! -f "$TOOL_DIR/litellm_tool_logger.py" ]; then
-    echo "Error: litellm_tool_logger.py not found in $TOOL_DIR" >&2
-    exit 1
-fi
-
-if [ ! -f "$TOOL_DIR/bcc_tracer.py" ] || [ ! -f "$TOOL_DIR/parse_ebpf.py" ]; then
-    echo "Error: bcc tracer/parser scripts not found in $TOOL_DIR" >&2
-    exit 1
-fi
-
-if [ ! -f "$TOOL_DIR/summarize_pi_events.py" ]; then
-    echo "Error: summarize_pi_events.py not found in $TOOL_DIR" >&2
-    exit 1
-fi
-
-if [ ! -f "$TOOL_DIR/compute_parallelism.py" ]; then
-    echo "Error: compute_parallelism.py not found in $TOOL_DIR" >&2
-    exit 1
-fi
-
-if [ ! -f "$ANALYSIS_DIR/visualize_strace.py" ]; then
-    echo "Error: visualization script not found in $ANALYSIS_DIR" >&2
-    exit 1
-fi
+}
 
 if [ "${#WORKLOADS[@]}" -eq 0 ]; then
     echo "Error: WORKLOADS array is empty (configure config_scilink.env)" >&2
     exit 1
 fi
 
-BASE_OUT="${BASE_OUT:-$ROOT_DIR/traces/$(date +%Y%m%d_%H%M%S)}"
-mkdir -p "$BASE_OUT"
+BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/$(date +%Y%m%d_%H%M%S)}"
+require_lustre_base_out "$BASE_OUT"
 BASE_OUT="$(cd "$BASE_OUT" && pwd)"
 WORK_DIR="$(mkdir -p "$WORK_DIR" && cd "$WORK_DIR" && pwd)"
 DATA_DIR="$(mkdir -p "$DATA_DIR" && cd "$DATA_DIR" && pwd)"
@@ -226,7 +202,7 @@ for entry in "${WORKLOADS[@]}"; do
 
     # Run SciLink under the litellm-based logger.  --prompt feeds the REPL
     # via stdin; --mode autonomous (inside SRARGS) silences follow-ups.
-    "$AGENT_PYTHON" "$TOOL_DIR/analyze_codebase_scilink.py" \
+    "$AGENT_PYTHON" -m agent_io_tracing.adapters.scilink.launcher \
         "$WORK" "$OUT" "$SUBCMD" \
         --prompt "$PROMPT" "${PRE_FLAG[@]}" \
         -- "${SRARGS_ARRAY[@]}" \
@@ -245,7 +221,7 @@ for entry in "${WORKLOADS[@]}"; do
         NET_ARG="--no-include-net"
     fi
 
-    "$TRACER_PYTHON" "$TOOL_DIR/bcc_tracer.py" \
+    "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         $NET_ARG \
@@ -286,6 +262,8 @@ POST_FAIL_NAMES=()
 for ws_out in "$BASE_OUT"/*/; do
     [ -d "$ws_out" ] || continue
     NAME="$(basename "$ws_out")"
+    WS_OUT_ABS="$(cd "$ws_out" && pwd)"
+    LINEAGE_WORKLOAD_DATA="$DATA_DIR/$NAME"
 
     if [ ! -f "$ws_out/ebpf_events.log" ]; then
         echo "Skipping $NAME (no ebpf_events.log)"
@@ -297,7 +275,7 @@ for ws_out in "$BASE_OUT"/*/; do
     failed_step=""
 
     echo "  Parsing eBPF logs..."
-    "$POST_PYTHON" "$TOOL_DIR/parse_ebpf.py" \
+    "$POST_PYTHON" -m agent_io_tracing.parsing.ebpf \
         "$ws_out" \
         > "$ws_out/parse.log" 2>&1
     PARSE_RC=$?
@@ -307,14 +285,14 @@ for ws_out in "$BASE_OUT"/*/; do
     if [ -f "$ws_out/parsed.json" ]; then
         if [ -f "$ws_out/pi_events.jsonl" ] && [ -f "$ws_out/tool_calls.log" ]; then
             echo "  Summarizing pi-compat events..."
-            "$POST_PYTHON" "$TOOL_DIR/summarize_pi_events.py" "$ws_out" \
+            "$POST_PYTHON" -m agent_io_tracing.analysis.summary "$ws_out" \
                 > "$ws_out/summarize.log" 2>&1
             SUM_RC=$?
             sed 's/^/    /' "$ws_out/summarize.log" || true
             [ $SUM_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}summarize"
 
             echo "  Computing DAG + parallelism metrics..."
-            "$POST_PYTHON" "$TOOL_DIR/compute_parallelism.py" "$ws_out" \
+            "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" \
                 > "$ws_out/parallelism.log" 2>&1
             PAR_RC=$?
             sed 's/^/    /' "$ws_out/parallelism.log" || true
@@ -327,8 +305,24 @@ for ws_out in "$BASE_OUT"/*/; do
             echo "  Skipping pi summary (pi_events.jsonl or tool_calls.log missing)"
         fi
 
+        echo "  Computing lineage/artifact metrics..."
+        LINEAGE_DATA_PATH_PREFIXES="$WS_OUT_ABS/scilink_session/:$WS_OUT_ABS/work/:$LINEAGE_WORKLOAD_DATA/:$SCILINK_REPO/examples/" \
+        LINEAGE_EXCLUDE_PATH_SUBSTRINGS="/.venv/" \
+        "$POST_PYTHON" -m agent_io_tracing.lineage.analyzer "$ws_out" \
+            > "$ws_out/lineage.log" 2>&1
+        LIN_RC=$?
+        sed 's/^/    /' "$ws_out/lineage.log" || true
+        [ $LIN_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}lineage"
+
+        echo "  Computing phase-1 I/O metrics..."
+        "$POST_PYTHON" -m agent_io_tracing.analysis.phase1_metrics "$ws_out" \
+            > "$ws_out/phase1_metrics.log" 2>&1
+        P1_RC=$?
+        sed 's/^/    /' "$ws_out/phase1_metrics.log" || true
+        [ $P1_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}phase1_metrics"
+
         echo "  Generating visualizations..."
-        "$POST_PYTHON" "$ANALYSIS_DIR/visualize_strace.py" "$ws_out" \
+        "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" \
             > "$ws_out/visualize.log" 2>&1
         VIZ_RC=$?
         sed 's/^/    /' "$ws_out/visualize.log" || true

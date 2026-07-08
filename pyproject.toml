@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-io-tracing"
+version = "0.1.0"
+description = "Agent-aware workflow I/O tracing and characterization toolkit."
+readme = "Overview.md"
+requires-python = ">=3.10"
+dependencies = [
+  "matplotlib",
+  "numpy",
+  "pandas",
+  "plotly",
+]
+
+[project.optional-dependencies]
+chemgraph = [
+  "mcp",
+  "pydantic",
+]
+dev = [
+  "pytest",
+]
+
+[project.scripts]
+agent-trace-parse-ebpf = "agent_io_tracing.parsing.ebpf:main"
+agent-trace-summary = "agent_io_tracing.analysis.summary:main"
+agent-trace-parallelism = "agent_io_tracing.analysis.parallelism:main"
+agent-trace-lineage = "agent_io_tracing.lineage.analyzer:main"
+agent-trace-phase1 = "agent_io_tracing.analysis.phase1_metrics:main"
+agent-trace-io-api = "agent_io_tracing.analysis.io_api_classifier:main"
+agent-trace-viz = "agent_io_tracing.viz.trace:main"
+agent-trace-fanout-plot = "agent_io_tracing.viz.fanout_plot:main"
+agent-trace-fanout-index = "agent_io_tracing.viz.fanout_index:main"
+agent-trace-stage-geo = "agent_io_tracing.experiments.stage_geo_view:main"
+agent-trace-w0 = "agent_io_tracing.experiments.w0_microbench:main"
+agent-trace-manifest = "agent_io_tracing.experiments.run_manifest:main"
+agent-trace-lustre-counters = "agent_io_tracing.tracing.lustre_counters:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agent_io_tracing = ["adapters/pi/*.ts"]

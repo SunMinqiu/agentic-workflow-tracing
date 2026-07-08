@@ -2,12 +2,22 @@
 cloudlab_env.sh
 *.env.local
 .env
+.env.*
 
 # ---- Trace data / generated outputs ----
+results/
+runs/
+artifacts/
+outputs/
 traces/
 GenoMAS_traces/
+fanout_runs/
 phase6_out/
 summarize_pi/
+*_out/
+*_traces/
+phase*_out/
+lustre_setup_*.log
 
 # ---- Private notes ----
 0513.md
@@ -16,11 +26,14 @@ summarize_pi/
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
 .venv/
 venv/
 
 # ---- OS / editor cruft ----
 .DS_Store
 *.swp
+.claude/
 .idea/
 .vscode/

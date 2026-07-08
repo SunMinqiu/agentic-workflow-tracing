@@ -8,14 +8,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TOOL_DIR="$ROOT_DIR/src"
 CFG_DIR="$ROOT_DIR/config"
 CONFIG_FILE="${CONFIG_FILE:-$CFG_DIR/config.env}"
-ANALYSIS_DIR="${ANALYSIS_DIR:-$TOOL_DIR}"
 PI_ANALYZE_ARGS="${PI_ANALYZE_ARGS:-}"
 CALLER_BASE_OUT="${BASE_OUT:-}"
 AGENT_PYTHON="${AGENT_PYTHON:-/mnt/lus_fs/software/views/piostack/bin/python3}"
 POST_PYTHON="${POST_PYTHON:-python3}"
+export PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib_results.sh"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "Error: config file not found: $CONFIG_FILE" >&2
@@ -54,39 +55,20 @@ if ! pi --version >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -f "$TOOL_DIR/analyze_codebase_pi.py" ]; then
-    echo "Error: analyze_codebase_pi.py not found in $TOOL_DIR" >&2
+[ -d "$ROOT_DIR/src/agent_io_tracing" ] || {
+    echo "Error: package not found: $ROOT_DIR/src/agent_io_tracing" >&2
     exit 1
-fi
+}
 
-if [ ! -f "$TOOL_DIR/tool_call_logger.ts" ]; then
-    echo "Error: tool_call_logger.ts not found in $TOOL_DIR" >&2
-    exit 1
-fi
-
-if [ ! -f "$TOOL_DIR/bcc_tracer.py" ] || [ ! -f "$TOOL_DIR/parse_ebpf.py" ]; then
-    echo "Error: bcc tracer/parser scripts not found in $TOOL_DIR" >&2
-    exit 1
-fi
-
-if [ ! -f "$TOOL_DIR/summarize_pi_events.py" ]; then
-    echo "Error: summarize_pi_events.py not found in $TOOL_DIR" >&2
-    exit 1
-fi
-
-if [ ! -f "$ANALYSIS_DIR/visualize_strace.py" ]; then
-    echo "Error: visualization script not found in $ANALYSIS_DIR" >&2
-    exit 1
-fi
-
-BASE_OUT="${BASE_OUT:-$ROOT_DIR/traces/$(date +%Y%m%d_%H%M%S)}"
-mkdir -p "$BASE_OUT"
+BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/$(date +%Y%m%d_%H%M%S)}"
+require_lustre_base_out "$BASE_OUT"
+BASE_OUT="$(cd "$BASE_OUT" && pwd)"
 
 echo "=== CloudLab Lustre Agent FS Tracer (BCC + Pi) ==="
 echo "Cases directory: $CASES_DIR"
 echo "Output directory: $BASE_OUT"
 echo "Workflow directory: $SCRIPT_DIR"
-echo "Visualization directory: $ANALYSIS_DIR"
+echo "Package path: $ROOT_DIR/src"
 echo ""
 
 IFS=',' read -r -a RUN_REPO_ARRAY <<< "${RUN_REPOS:-}"
@@ -124,7 +106,7 @@ for repo in "$CASES_DIR"/*/; do
 
     set +e
     # Start the agent paused so no tool activity runs before probes are active.
-    "$AGENT_PYTHON" "$TOOL_DIR/analyze_codebase_pi.py" "$repo" "$OUT" $PI_ANALYZE_ARGS \
+    "$AGENT_PYTHON" -m agent_io_tracing.adapters.pi.launcher "$repo" "$OUT" $PI_ANALYZE_ARGS \
         >"$OUT/pi.out" 2>"$OUT/pi.err" &
     AGENT_PID=$!
     kill -STOP "$AGENT_PID" >/dev/null 2>&1 || true
@@ -134,7 +116,7 @@ for repo in "$CASES_DIR"/*/; do
     mkfifo "$READY_FIFO"
 
     # Start tracer and wait for explicit readiness before continuing agent.
-    "$AGENT_PYTHON" "$TOOL_DIR/bcc_tracer.py" \
+    "$AGENT_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         --ready-fd 3 \
@@ -178,20 +160,20 @@ for repo_out in "$BASE_OUT"/*/; do
 
     echo "Processing: $REPO_NAME"
     echo "  Parsing eBPF logs..."
-    "$POST_PYTHON" "$TOOL_DIR/parse_ebpf.py" \
+    "$POST_PYTHON" -m agent_io_tracing.parsing.ebpf \
         "$repo_out" \
         2>&1 | sed 's/^/    /'
 
     if [ -f "$repo_out/parsed.json" ]; then
         if [ -f "$repo_out/pi_events.jsonl" ] && [ -f "$repo_out/tool_calls.log" ]; then
             echo "  Summarizing pi events..."
-            "$POST_PYTHON" "$TOOL_DIR/summarize_pi_events.py" "$repo_out" 2>&1 | sed 's/^/    /'
+            "$POST_PYTHON" -m agent_io_tracing.analysis.summary "$repo_out" 2>&1 | sed 's/^/    /'
         else
             echo "  Skipping pi summary (pi_events.jsonl or tool_calls.log missing)"
         fi
 
         echo "  Generating visualizations..."
-        "$POST_PYTHON" "$ANALYSIS_DIR/visualize_strace.py" "$repo_out" 2>&1 | sed 's/^/    /'
+        "$POST_PYTHON" -m agent_io_tracing.viz.trace "$repo_out" 2>&1 | sed 's/^/    /'
     else
         echo "  Skipping visualization (parsed.json not found)"
     fi

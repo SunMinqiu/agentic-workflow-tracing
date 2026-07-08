@@ -15,11 +15,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TOOL_DIR="$ROOT_DIR/src"
 CFG_DIR="$ROOT_DIR/config"
 CONFIG_FILE="${CONFIG_FILE:-$CFG_DIR/config_sragent.env}"
-ANALYSIS_DIR="${ANALYSIS_DIR:-$TOOL_DIR}"
 CALLER_BASE_OUT="${BASE_OUT:-}"
+export PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib_results.sh"
 # TRACER_PYTHON / AGENT_PYTHON / POST_PYTHON are populated by config_sragent.env
 # (sourced below).  Two interpreters are required because BCC bindings are
 # tied to the system Python (3.6 on CentOS Stream 8) while SRAgent needs ≥3.11.
@@ -81,38 +82,19 @@ if ! "$AGENT_PYTHON" -c "import SRAgent" >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -f "$TOOL_DIR/analyze_codebase_sragent.py" ]; then
-    echo "Error: analyze_codebase_sragent.py not found in $TOOL_DIR" >&2
+[ -d "$ROOT_DIR/src/agent_io_tracing" ] || {
+    echo "Error: package not found: $ROOT_DIR/src/agent_io_tracing" >&2
     exit 1
-fi
-
-if [ ! -f "$TOOL_DIR/langchain_tool_logger.py" ]; then
-    echo "Error: langchain_tool_logger.py not found in $TOOL_DIR" >&2
-    exit 1
-fi
-
-if [ ! -f "$TOOL_DIR/bcc_tracer.py" ] || [ ! -f "$TOOL_DIR/parse_ebpf.py" ]; then
-    echo "Error: bcc tracer/parser scripts not found in $TOOL_DIR" >&2
-    exit 1
-fi
-
-if [ ! -f "$TOOL_DIR/summarize_pi_events.py" ]; then
-    echo "Error: summarize_pi_events.py not found in $TOOL_DIR" >&2
-    exit 1
-fi
-
-if [ ! -f "$ANALYSIS_DIR/visualize_strace.py" ]; then
-    echo "Error: visualization script not found in $ANALYSIS_DIR" >&2
-    exit 1
-fi
+}
 
 if [ "${#WORKLOADS[@]}" -eq 0 ]; then
     echo "Error: WORKLOADS array is empty (configure config_sragent.env)" >&2
     exit 1
 fi
 
-BASE_OUT="${BASE_OUT:-$ROOT_DIR/traces/$(date +%Y%m%d_%H%M%S)}"
-mkdir -p "$BASE_OUT"
+BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/$(date +%Y%m%d_%H%M%S)}"
+require_lustre_base_out "$BASE_OUT"
+BASE_OUT="$(cd "$BASE_OUT" && pwd)"
 
 echo "=== SRAgent FS+Net Tracer (BCC) ==="
 echo "Work dir:   $WORK_DIR"
@@ -199,7 +181,7 @@ for entry in "${WORKLOADS[@]}"; do
     fi
 
     # Start the agent paused so no tool activity runs before probes are active.
-    "$AGENT_PYTHON" "$TOOL_DIR/analyze_codebase_sragent.py" \
+    "$AGENT_PYTHON" -m agent_io_tracing.adapters.sragent.launcher \
         "$WORK" "$OUT" "$SUBCMD" "${PRE_FLAG[@]}" -- "${SRARGS_ARRAY[@]}" \
         > "$OUT/sragent.log" 2>&1 &
     # `&>` style merge: stdout (Rich banner / final results) and stderr (agent
@@ -221,7 +203,7 @@ for entry in "${WORKLOADS[@]}"; do
 
     # Start tracer with TRACER_PYTHON (system py3 with python3-bcc bindings),
     # wait for explicit readiness before continuing agent.
-    "$TRACER_PYTHON" "$TOOL_DIR/bcc_tracer.py" \
+    "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         $NET_ARG \
@@ -274,7 +256,7 @@ for ws_out in "$BASE_OUT"/*/; do
     failed_step=""
 
     echo "  Parsing eBPF logs..."
-    "$POST_PYTHON" "$TOOL_DIR/parse_ebpf.py" \
+    "$POST_PYTHON" -m agent_io_tracing.parsing.ebpf \
         "$ws_out" \
         > "$ws_out/parse.log" 2>&1
     PARSE_RC=$?
@@ -284,7 +266,7 @@ for ws_out in "$BASE_OUT"/*/; do
     if [ -f "$ws_out/parsed.json" ]; then
         if [ -f "$ws_out/pi_events.jsonl" ] && [ -f "$ws_out/tool_calls.log" ]; then
             echo "  Summarizing pi-compat events..."
-            "$POST_PYTHON" "$TOOL_DIR/summarize_pi_events.py" "$ws_out" \
+            "$POST_PYTHON" -m agent_io_tracing.analysis.summary "$ws_out" \
                 > "$ws_out/summarize.log" 2>&1
             SUM_RC=$?
             sed 's/^/    /' "$ws_out/summarize.log" || true
@@ -294,7 +276,7 @@ for ws_out in "$BASE_OUT"/*/; do
         fi
 
         echo "  Generating visualizations..."
-        "$POST_PYTHON" "$ANALYSIS_DIR/visualize_strace.py" "$ws_out" \
+        "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" \
             > "$ws_out/visualize.log" 2>&1
         VIZ_RC=$?
         sed 's/^/    /' "$ws_out/visualize.log" || true

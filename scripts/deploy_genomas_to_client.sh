@@ -91,12 +91,20 @@ echo "  Lustre mount OK: $MOUNT_PATH"
 #   - $MOUNT_PATH/genomas_venv     : Python venv (kept separate from data
 #                                    tree so we can tar the data tree alone
 #                                    as evidence)
+#   - $MOUNT_PATH/genomas_output   : GenoMAS ./output symlink target
+#   - $MOUNT_PATH/$SSH_USER/pi-ebpf-tracing-handoff/results : trace outputs
 #   - $MOUNT_PATH/uv_cache_genomas : uv wheel cache (deduplicated across
 #                                    deploy re-runs)
-sudo mkdir -p "$REMOTE_DATA_DIR" "$MOUNT_PATH/genomas_venv" "$MOUNT_PATH/uv_cache_genomas"
-sudo chown -R "$SSH_USER" "$REMOTE_DATA_DIR" "$MOUNT_PATH/genomas_venv" "$MOUNT_PATH/uv_cache_genomas" || true
+sudo mkdir -p "$REMOTE_DATA_DIR/GEO" "$REMOTE_DATA_DIR/TCGA" \
+    "$MOUNT_PATH/genomas_venv" "$MOUNT_PATH/genomas_output" \
+    "$MOUNT_PATH/$SSH_USER/pi-ebpf-tracing-handoff/results" "$MOUNT_PATH/uv_cache_genomas"
+sudo chown -R "$SSH_USER" "$REMOTE_DATA_DIR" "$MOUNT_PATH/genomas_venv" \
+    "$MOUNT_PATH/genomas_output" "$MOUNT_PATH/$SSH_USER/pi-ebpf-tracing-handoff/results" \
+    "$MOUNT_PATH/uv_cache_genomas" || true
 echo "  Lustre data dir ready: $REMOTE_DATA_DIR"
 echo "  Lustre venv dir  ready: $MOUNT_PATH/genomas_venv"
+echo "  Lustre output dir ready: $MOUNT_PATH/genomas_output"
+echo "  Lustre results dir ready: $MOUNT_PATH/$SSH_USER/pi-ebpf-tracing-handoff/results"
 echo "  Lustre cache dir ready: $MOUNT_PATH/uv_cache_genomas"
 # Quick smoke write to confirm we still have write perms (catches the case
 # where a prior 'sudo -E' run reverted ownership to root).
@@ -112,6 +120,7 @@ rsync -av \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude 'traces/' \
+    --exclude 'results/' \
     --exclude '.venv/' \
     --exclude '.env' \
     --exclude '.env.sragent' \
@@ -154,6 +163,23 @@ fi
 
 cd "$REMOTE_GENOMAS_DIR"
 echo "  HEAD: \$(git rev-parse --short HEAD)"
+
+# GenoMAS writes sizeable preprocess artefacts to ./output.  Keep that path
+# as a symlink into Lustre so live runs do not fill the 16 GB root disk.
+mkdir -p /mnt/lustrefs/genomas_output
+if [ -L output ]; then
+    ln -sfn /mnt/lustrefs/genomas_output output
+elif [ -d output ]; then
+    if find output -mindepth 1 -print -quit | grep -q .; then
+        echo "  Preserving existing ./output contents by moving them to Lustre"
+        rsync -a output/ /mnt/lustrefs/genomas_output/
+    fi
+    rm -rf output
+    ln -s /mnt/lustrefs/genomas_output output
+else
+    ln -s /mnt/lustrefs/genomas_output output
+fi
+echo "  GenoMAS output -> \$(readlink -f output)"
 
 # CloudLab home is ~16 GB with little free.  GenoMAS deps are smaller than
 # SciLink+torch (no CUDA wheels) but still ~1-2 GB.  Put the venv + uv cache

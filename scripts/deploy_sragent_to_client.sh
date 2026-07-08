@@ -118,6 +118,7 @@ rsync -av --delete \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude 'traces/' \
+    --exclude 'results/' \
     --exclude '.env' \
     "$LOCAL_HARNESS/" \
     "$SSH_USER@$CLIENT_NODE:$REMOTE_HARNESS_NAME/"
@@ -256,7 +257,7 @@ Run the trace on the client:
   # by the trace script, so it's belt-and-suspenders).
   sudo -E bash trace_script_bcc_sragent.sh
 
-Outputs land in ~/$REMOTE_HARNESS_NAME/traces/<timestamp>/<workload>/
+Outputs land in /mnt/lustrefs/$SSH_USER/pi-ebpf-tracing-handoff/results/<timestamp>/<workload>/
 including parsed.json, pi_summary.json, visualizations/index.html.
 
 Lustre side ($REMOTE_DATA_DIR/<workload>/) holds the big stuff:

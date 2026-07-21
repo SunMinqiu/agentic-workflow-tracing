@@ -210,10 +210,6 @@ for entry in "${WORKLOADS[@]}"; do
     AGENT_PID=$!
     kill -STOP "$AGENT_PID" >/dev/null 2>&1 || true
 
-    READY_FIFO="$OUT/bcc.ready.fifo"
-    rm -f "$READY_FIFO"
-    mkfifo "$READY_FIFO"
-
     BCC_NET_FLAG="${BCC_INCLUDE_NET:-1}"
     if [ "$BCC_NET_FLAG" = "1" ] || [ "$BCC_NET_FLAG" = "true" ]; then
         NET_ARG="--include-net"
@@ -221,31 +217,37 @@ for entry in "${WORKLOADS[@]}"; do
         NET_ARG="--no-include-net"
     fi
 
-    "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
+    sudo -E env "PYTHONPATH=$PYTHONPATH" "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         $NET_ARG \
-        --ready-fd 3 \
-        3>"$READY_FIFO" \
         >"$OUT/bcc.out" 2>"$OUT/bcc.err" &
     TRACER_PID=$!
 
-    READY_MSG=""
-    if read -r READY_MSG <"$READY_FIFO"; then
-        :
-    fi
-    rm -f "$READY_FIFO"
-
-    if [ "$READY_MSG" != "ready" ]; then
-        echo "  Warning: tracer did not signal readiness; continuing anyway" >&2
+    # sudo closes non-standard file descriptors on this CloudLab image, so the
+    # --ready-fd FIFO handshake cannot be used for the privileged tracer.
+    # Wait until the tracer creates the JSONL stream (meta record written) or
+    # exits with an error before resuming the paused agent.
+    TRACER_READY=0
+    for _ in $(seq 1 100); do
+        if [ -s "$OUT/ebpf_events.log" ]; then
+            TRACER_READY=1
+            break
+        fi
+        if ! kill -0 "$TRACER_PID" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$TRACER_READY" != "1" ]; then
+        echo "  Warning: tracer did not create ebpf_events.log before agent resume" >&2
     fi
     kill -CONT "$AGENT_PID" >/dev/null 2>&1 || true
 
     wait "$AGENT_PID"
     EXIT_CODE=$?
 
-    sudo kill -INT "$TRACER_PID" >/dev/null 2>&1 || true
-    wait "$TRACER_PID" >/dev/null 2>&1 || true
+    stop_tracer "$TRACER_PID"
     set -e
 
     echo "  End time:  $(date +%H:%M:%S)"
@@ -320,6 +322,13 @@ for ws_out in "$BASE_OUT"/*/; do
         P1_RC=$?
         sed 's/^/    /' "$ws_out/phase1_metrics.log" || true
         [ $P1_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}phase1_metrics"
+
+        echo "  Generating per-run I/O characterization figures..."
+        "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs . \
+            > "$ws_out/per_run_io_char.log" 2>&1
+        PRC_RC=$?
+        sed 's/^/    /' "$ws_out/per_run_io_char.log" || true
+        [ $PRC_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}per_run_io_char"
 
         echo "  Generating visualizations..."
         "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" \

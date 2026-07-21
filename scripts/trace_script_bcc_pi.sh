@@ -138,8 +138,7 @@ for repo in "$CASES_DIR"/*/; do
     wait "$AGENT_PID"
     EXIT_CODE=$?
 
-    sudo kill -INT "$TRACER_PID" >/dev/null 2>&1 || true
-    wait "$TRACER_PID" >/dev/null 2>&1 || true
+    stop_tracer "$TRACER_PID"
     set -e
 
     echo "  End time: $(date +%H:%M:%S)"

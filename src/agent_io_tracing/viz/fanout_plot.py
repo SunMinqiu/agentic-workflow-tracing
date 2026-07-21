@@ -10,7 +10,7 @@ Per cell it pulls:
   phase1_metrics.json   -> metadata_data_ratio.{storage_metadata_ops,data_ops,
                            storage_metadata_to_data_ops},
                            analytical_optimum_amplification.{actual_generated_files,
-                           actual_write_bytes, file_count_amplification}
+                           actual_write_bytes}
   lineage/io_summary.json -> workload.{distinct_files,read_bytes,write_bytes}
   parallelism_summary.json -> wall_clock_s, total_self_time_s (LLM)
 
@@ -90,8 +90,6 @@ def cell_metrics(run: Path, cell: str) -> dict | None:
         "read_amp": (total_in / uniq_in) if uniq_in else None,
         "read_MB": (wl.get("read_bytes", 0) or 0) / 1e6,      # all-category total
         "write_MB": (wl.get("write_bytes", 0) or 0) / 1e6,
-        # (file_count_amplification dropped: == generated_files, since the
-        #  analytical optimum is always 1 batched file.)
         # Two times: wall (elapsed) and total_work (ΣLLM+ΣTool+residual, the
         # worker-robust "total time" — same number as the donut center).
         "wall_s": par.get("wall_clock_s"),

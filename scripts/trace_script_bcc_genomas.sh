@@ -214,10 +214,6 @@ for entry in "${WORKLOADS[@]}"; do
         LUSTRE_SAMPLER_PID=$!
     fi
 
-    READY_FIFO="$OUT/bcc.ready.fifo"
-    rm -f "$READY_FIFO"
-    mkfifo "$READY_FIFO"
-
     BCC_NET_FLAG="${BCC_INCLUDE_NET:-1}"
     if [ "$BCC_NET_FLAG" = "1" ] || [ "$BCC_NET_FLAG" = "true" ]; then
         NET_ARG="--include-net"
@@ -225,31 +221,33 @@ for entry in "${WORKLOADS[@]}"; do
         NET_ARG="--no-include-net"
     fi
 
-    "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
+    sudo -E env "PYTHONPATH=$PYTHONPATH" "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         $NET_ARG \
-        --ready-fd 3 \
-        3>"$READY_FIFO" \
         >"$OUT/bcc.out" 2>"$OUT/bcc.err" &
     TRACER_PID=$!
 
-    READY_MSG=""
-    if read -r READY_MSG <"$READY_FIFO"; then
-        :
-    fi
-    rm -f "$READY_FIFO"
-
-    if [ "$READY_MSG" != "ready" ]; then
-        echo "  Warning: tracer did not signal readiness; continuing anyway" >&2
+    TRACER_READY=0
+    for _ in $(seq 1 100); do
+        if [ -s "$OUT/ebpf_events.log" ]; then
+            TRACER_READY=1
+            break
+        fi
+        if ! kill -0 "$TRACER_PID" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$TRACER_READY" != "1" ]; then
+        echo "  Warning: tracer did not create ebpf_events.log before agent resume" >&2
     fi
     kill -CONT "$AGENT_PID" >/dev/null 2>&1 || true
 
     wait "$AGENT_PID"
     EXIT_CODE=$?
 
-    sudo kill -INT "$TRACER_PID" >/dev/null 2>&1 || true
-    wait "$TRACER_PID" >/dev/null 2>&1 || true
+    stop_tracer "$TRACER_PID"
     if [ -n "$LUSTRE_SAMPLER_PID" ]; then
         kill -INT "$LUSTRE_SAMPLER_PID" >/dev/null 2>&1 || true
         wait "$LUSTRE_SAMPLER_PID" >/dev/null 2>&1 || true
@@ -301,11 +299,6 @@ for ws_out in "$BASE_OUT"/*/; do
         PAR_RC=$?
         [ $PAR_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}parallelism"
 
-        "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" \
-            > "$ws_out/visualize.log" 2>&1
-        VIZ_RC=$?
-        [ $VIZ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}visualize"
-
         "$POST_PYTHON" -m agent_io_tracing.lineage.analyzer "$ws_out" \
             > "$ws_out/lineage.log" 2>&1
         LIN_RC=$?
@@ -315,6 +308,16 @@ for ws_out in "$BASE_OUT"/*/; do
             > "$ws_out/phase1_metrics.log" 2>&1
         P1_RC=$?
         [ $P1_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}phase1_metrics"
+
+        "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs . \
+            > "$ws_out/per_run_io_char.log" 2>&1
+        PRC_RC=$?
+        [ $PRC_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}per_run_io_char"
+
+        "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" \
+            > "$ws_out/visualize.log" 2>&1
+        VIZ_RC=$?
+        [ $VIZ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}visualize"
 
         if [ $PAR_RC -eq 0 ] && [ -f "$ws_out/parallelism_summary.json" ]; then
             WCS=$("$POST_PYTHON" -c "import json; print(json.load(open('$ws_out/parallelism_summary.json'))['wall_clock_s'])" 2>/dev/null || echo "?")
@@ -342,9 +345,10 @@ for ws_out in "$BASE_OUT"/*/; do
     [ -d "$ws_out" ] || continue
     [ -f "$ws_out/parallelism_summary.json" ] || continue
     NAME="$(basename "$ws_out")"
-    # Parse mw and rep out of the cell name (mw{N}_rep{R}).
-    MW="$(echo "$NAME" | sed -E 's/mw([0-9]+)_rep[0-9]+.*/\1/')"
-    REP="$(echo "$NAME" | sed -E 's/mw[0-9]+_rep([0-9]+).*/\1/')"
+    # Workers are encoded as the trailing _w<N> in the cell name (e.g. A_c8_w4,
+    # B_t2_w2).  The cell_name column itself carries the trait/cohort spec.
+    MW="$(echo "$NAME" | sed -E 's/.*_w([0-9]+).*/\1/')"
+    REP="1"
     LINE=$("$POST_PYTHON" - "$ws_out" << 'PYEOF'
 import json, sys
 from pathlib import Path

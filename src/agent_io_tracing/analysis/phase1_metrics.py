@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -31,10 +32,22 @@ try:
         classify_syscall,
         resource_bucket_for_syscall,
     )
+    from agent_io_tracing.lineage.analyzer import is_workload_artifact
+    from agent_io_tracing.analysis.labels import (
+        phase_label_for_tool_call,
+        role_for_entry,
+        role_for_tool_call,
+    )
+    from agent_io_tracing.analysis.size_bins import darshan_hist
 except Exception:  # pragma: no cover - script still reports partial metrics
     classify_syscall = None  # type: ignore
     resource_bucket_for_syscall = None  # type: ignore
     aggregate_io_api = None  # type: ignore
+    is_workload_artifact = None  # type: ignore
+    phase_label_for_tool_call = None  # type: ignore
+    role_for_entry = None  # type: ignore
+    role_for_tool_call = None  # type: ignore
+    darshan_hist = None  # type: ignore
 
 
 DATA_SYSCALLS = {"read", "write", "pread64", "pwrite64", "readv", "writev",
@@ -53,6 +66,75 @@ OPEN_STAT_SYSCALLS = {"open", "openat", "openat2", "stat", "fstat", "lstat",
 # and generalizes past this one workflow via substring match, not an exact list.
 STATE_FILE_PATH_HINTS = ("cohort_info", "completed_tasks", "_state.json",
                          "manifest.json", ".lock")
+
+PAGE_CACHE_TIME_BINS = [
+    (0.0, 1.0, "<1s"),
+    (1.0, 30.0, "1-30s"),
+    (30.0, 5 * 60.0, "30s-5min"),
+    (5 * 60.0, 30 * 60.0, "5-30min"),
+    (30 * 60.0, float("inf"), ">30min"),
+]
+
+
+def page_cache_time_hist(values: list[float]) -> dict[str, int]:
+    hist = {label: 0 for _, _, label in PAGE_CACHE_TIME_BINS}
+    for value in values:
+        for lo, hi, label in PAGE_CACHE_TIME_BINS:
+            if lo <= value < hi:
+                hist[label] += 1
+                break
+    return hist
+
+# Markers that a failed open/stat is the CPython import machinery probing
+# sys.path (every `import x` stats/opens the candidate name in each sys.path
+# entry, and all-but-one return ENOENT). These failures are interpreter noise,
+# not the agent probing candidate data paths, so they must be excluded before
+# the count is read as an Axis-4 exploration/backtracking signal.
+_IMPORT_ROOT_MARKERS = (
+    "site-packages", "dist-packages", "/lib/python", "/lib64/python",
+    "lib-dynload", "__pycache__", ".egg", ".dist-info", "/python3.",
+)
+# Markers of the dynamic linker / import-hook machinery (not the agent probing
+# candidate data paths): glibc-hwcaps searches every CPU-feature-optimized .so
+# variant (all-but-one ENOENT); editable installs register a finder/path-hook
+# that "opens" synthetic names; and code exec reports pseudo-paths like
+# <string> / <unknown> / <frozen ...> that are not filesystem candidates at all.
+_LOADER_NOISE_MARKERS = (
+    "glibc-hwcaps/", "__editable__", ".__path_hook__", ".finder.",
+)
+_MODULE_SUFFIX_RE = re.compile(r"\.(py[cod]?|so|pyd|abi3\.so)$")
+_EXT_MODULE_RE = re.compile(r"\.(cpython-\d+[^/]*|abi3)\.so$")
+# A shared object (foo.so, libbar.so.6). A *failed* probe for one is always the
+# dynamic linker searching its HWCAP/tls/arch subdir cascade (…/tls/haswell/
+# avx512_1/x86_64/lib.so — all-but-one ENOENT), never the agent probing a
+# candidate data path, so it is filtered regardless of location.
+_SHARED_OBJ_RE = re.compile(r"\.so(\.\d+)*$")
+
+
+def _is_python_import_probe(path: str | None) -> bool:
+    """True if a failed open/stat looks like CPython's import search / dynamic
+    linker rather than an agent-issued candidate-path probe."""
+    if not path:
+        return False
+    # Pseudo-paths from exec of code strings (<string>, <unknown>, <frozen ...>)
+    # are not filesystem candidates.
+    if path.startswith("<") and path.endswith(">"):
+        return True
+    if any(m in path for m in _LOADER_NOISE_MARKERS):
+        return True
+    base = path.rsplit("/", 1)[-1]
+    if _SHARED_OBJ_RE.search(base):
+        return True
+    # Compiled-extension names (foo.cpython-311-x86_64-linux-gnu.so, foo.abi3.so)
+    # are unambiguous import machinery regardless of location.
+    if _EXT_MODULE_RE.search(base):
+        return True
+    if _MODULE_SUFFIX_RE.search(base) and any(m in path for m in _IMPORT_ROOT_MARKERS):
+        return True
+    # Namespace/package dir probes under an import root.
+    if base == "__init__.py" or any(m in path for m in _IMPORT_ROOT_MARKERS):
+        return True
+    return False
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -78,6 +160,24 @@ def pct(values: list[float], pred) -> float | None:
     if not values:
         return None
     return 100.0 * sum(1 for v in values if pred(v)) / len(values)
+
+
+def _entry_end_ms(entry: dict[str, Any]) -> float | None:
+    ts_ms = entry.get("ts_ms")
+    if isinstance(ts_ms, (int, float)):
+        return float(ts_ms)
+    ts = entry.get("timestamp")
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts).timestamp() * 1000.0
+    except ValueError:
+        return None
+
+
+def _entry_end_s(entry: dict[str, Any]) -> float | None:
+    ms = _entry_end_ms(entry)
+    return ms / 1000.0 if ms is not None else None
 
 
 def read_artifacts(trace_dir: Path) -> list[dict[str, Any]]:
@@ -132,16 +232,9 @@ def phase_for_entry(entry: dict[str, Any], phases: dict[str, dict[str, Any]],
                     tool_calls: dict[str, dict[str, Any]]) -> str:
     tid = entry.get("matched_tool_call")
     if isinstance(tid, str):
-        if tid in phases and phases[tid].get("phase"):
-            role = phases[tid].get("genomas_role")
-            return f"{phases[tid]['phase']}:{role}" if role else str(phases[tid]["phase"])
-        tc = tool_calls.get(tid)
-        if tc:
-            inp = tc.get("input_params") or {}
-            phase = inp.get("phase") or tc.get("tool_name") or "tool"
-            role = inp.get("role")
-            return f"{phase}:{role}" if role else str(phase)
-        return "uncategorized_tool"
+        if phase_label_for_tool_call:
+            return phase_label_for_tool_call(tid, tool_calls.get(tid), phases)
+        return str((phases.get(tid) or {}).get("phase") or "uncategorized_tool")
     return "orchestration"
 
 
@@ -177,10 +270,15 @@ READ_SYSCALLS_STRICT = {"read", "pread64", "readv", "preadv", "preadv2"}
 WRITE_SYSCALLS_STRICT = {"write", "pwrite64", "writev", "pwritev", "pwritev2"}
 STDIO_READ_FUNCS = {"fread"}
 STDIO_WRITE_FUNCS = {"fwrite"}
+HDF5_READ_FUNCS = {"H5Dread"}
+HDF5_WRITE_FUNCS = {"H5Dwrite"}
+MPIIO_READ_FUNCS = {"MPI_File_read", "MPI_File_read_at", "MPI_File_read_all"}
+MPIIO_WRITE_FUNCS = {"MPI_File_write", "MPI_File_write_at", "MPI_File_write_all"}
 
 
 def compute_reread_attribution(parsed: dict[str, Any],
-                               phases: dict[str, dict[str, Any]]) -> dict[str, Any]:
+                               phases: dict[str, dict[str, Any]],
+                               artifacts: list[dict[str, Any]]) -> dict[str, Any]:
     """Classify rereads of the same file as agent-induced vs. residual,
     joined on the *specific* tool_call_id (``matched_tool_call``) rather
     than the coarser ``phase:role`` label used by compute_latency_by_phase /
@@ -208,11 +306,15 @@ def compute_reread_attribution(parsed: dict[str, Any],
         here. Named `different_tool_call_id` for that reason (not
         "cross-stage").
     """
+    # Workload data only: otherwise re-imports of .venv libraries across code-exec
+    # steps count as "agent-induced reread waste", which they are not.
+    _wl = make_workload_filter(artifacts)
     entries = [
         e for e in parsed.get("fs_entries", [])
         if str(e.get("syscall")) in READ_SYSCALLS_STRICT
         and isinstance(e.get("path"), str)
         and isinstance(e.get("matched_tool_call"), str)
+        and _wl(e["path"])
     ]
 
     touches: dict[tuple[str, str, Any], dict[str, Any]] = {}
@@ -270,11 +372,18 @@ def compute_reread_attribution(parsed: dict[str, Any],
 
 
 def compute_bytes_ops_by_phase(parsed: dict[str, Any],
-                               phases: dict[str, dict[str, Any]]) -> dict[str, Any]:
+                               phases: dict[str, dict[str, Any]],
+                               artifacts: list[dict[str, Any]]) -> dict[str, Any]:
     """Same phase join as compute_latency_by_phase, but rolling up bytes/op
     counts instead of latency. This is what turns a validated phase tag (e.g.
-    ``action_unit_backtrack``) into an actual retry-induced-bytes number."""
+    ``action_unit_backtrack``) into an actual retry-induced-bytes number.
+
+    Scoped to workload data only (same workload-artifact set as the per-syscall
+    histogram and the batching-efficiency table); otherwise interpreter imports
+    (.venv), logger output and our own trace files leak in and pollute the
+    per-phase attribution (~40% of ops in some traces)."""
     tool_calls = build_tool_call_map(parsed)
+    _wl = make_workload_filter(artifacts)
     by_phase: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"ops": 0, "read_ops": 0, "write_ops": 0,
                  "read_bytes": 0, "write_bytes": 0}
@@ -282,6 +391,8 @@ def compute_bytes_ops_by_phase(parsed: dict[str, Any],
     for e in parsed.get("fs_entries", []):
         syscall = str(e.get("syscall"))
         if syscall not in DATA_SYSCALLS:
+            continue
+        if not _wl(e.get("path") or ""):
             continue
         ph = phase_for_entry(e, phases, tool_calls)
         d = by_phase[ph]
@@ -297,34 +408,56 @@ def compute_bytes_ops_by_phase(parsed: dict[str, Any],
     return dict(sorted(by_phase.items()))
 
 
-def compute_interface_byte_mix(parsed: dict[str, Any]) -> dict[str, Any]:
-    """Axis 3 Phase A: measured interface bytes from libc probes + syscalls.
+def compute_interface_byte_mix(parsed: dict[str, Any],
+                               artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Axis 2 Phase A: measured interface bytes from libc probes + syscalls.
 
-    fread/fwrite uprobes sit above read/write syscalls, so raw STDIO and POSIX
-    observations are overlapping layers, not additive. The de-overlapped view
-    subtracts observed STDIO bytes from kernel read/write bytes to estimate the
-    direct-POSIX lower bound.
+    fread/fwrite uprobes are usable for workload comparison only when the tracer
+    captured FILE*->_fileno and the parser resolved that fd to a workload path.
+    Pathless STDIO probes are retained separately as process-tree observations.
     """
+    wl = make_workload_filter(artifacts)
     raw = {
         "stdio_read_bytes": 0,
         "stdio_write_bytes": 0,
+        "stdio_process_tree_read_bytes": 0,
+        "stdio_process_tree_write_bytes": 0,
         "posix_read_bytes_observed": 0,
         "posix_write_bytes_observed": 0,
         "stdio_ops": 0,
+        "stdio_process_tree_ops": 0,
         "posix_ops": 0,
     }
     for e in parsed.get("fs_entries", []):
         syscall = str(e.get("syscall") or "")
+        path = e.get("path") or ""
+        is_stdio = syscall in (STDIO_READ_FUNCS | STDIO_WRITE_FUNCS)
+        if path and not wl(path):
+            continue
+        if not path:
+            if not is_stdio:
+                continue
+            scope = "process_tree"
+        else:
+            scope = "workload"
         size = e.get("actual_size") or e.get("bytes_transferred") or 0
         size = int(size) if isinstance(size, (int, float)) and size > 0 else 0
         if size <= 0:
             continue
         if syscall in STDIO_READ_FUNCS:
-            raw["stdio_read_bytes"] += size
-            raw["stdio_ops"] += 1
+            if scope == "workload":
+                raw["stdio_read_bytes"] += size
+                raw["stdio_ops"] += 1
+            else:
+                raw["stdio_process_tree_read_bytes"] += size
+                raw["stdio_process_tree_ops"] += 1
         elif syscall in STDIO_WRITE_FUNCS:
-            raw["stdio_write_bytes"] += size
-            raw["stdio_ops"] += 1
+            if scope == "workload":
+                raw["stdio_write_bytes"] += size
+                raw["stdio_ops"] += 1
+            else:
+                raw["stdio_process_tree_write_bytes"] += size
+                raw["stdio_process_tree_ops"] += 1
         elif syscall in READ_SYSCALLS_STRICT:
             raw["posix_read_bytes_observed"] += size
             raw["posix_ops"] += 1
@@ -333,49 +466,277 @@ def compute_interface_byte_mix(parsed: dict[str, Any]) -> dict[str, Any]:
             raw["posix_ops"] += 1
 
     stdio_bytes = raw["stdio_read_bytes"] + raw["stdio_write_bytes"]
+    stdio_process_tree_bytes = (
+        raw["stdio_process_tree_read_bytes"] + raw["stdio_process_tree_write_bytes"]
+    )
     posix_observed = raw["posix_read_bytes_observed"] + raw["posix_write_bytes_observed"]
-    posix_direct = max(0, posix_observed - stdio_bytes)
-    denom = stdio_bytes + posix_direct
     return {
         **raw,
         "stdio_bytes": stdio_bytes,
+        "stdio_process_tree_bytes": stdio_process_tree_bytes,
         "posix_observed_bytes": posix_observed,
-        "posix_direct_bytes_est": posix_direct,
-        "stdio_pct_deoverlapped": (100.0 * stdio_bytes / denom) if denom else None,
-        "posix_direct_pct_deoverlapped": (100.0 * posix_direct / denom) if denom else None,
         "note": (
-            "fread/fwrite probes and read/write syscalls are different layers; "
-            "deoverlapped POSIX is max(kernel read/write bytes - STDIO bytes, 0)."
+            "POSIX bytes are workload-scoped. STDIO bytes are workload-scoped only "
+            "when FILE*->_fileno was captured and resolved to a workload path; "
+            "pathless STDIO is reported separately at process-tree scope and must "
+            "not be added to or divided against workload POSIX bytes."
         ),
     }
 
 
-def compute_directory_scan_count(parsed: dict[str, Any]) -> dict[str, Any]:
+def compute_measured_interface_layers(parsed: dict[str, Any],
+                                      artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Axis 2 Phase B: measured interface-layer calls from uprobes + syscalls.
+
+    The MMAP layer counts file-backed mmap() calls; its bytes are the mapped
+    region length (an upper bound on the volume actually read/written through
+    the mapping, since page access happens without further syscalls).
+    """
+    wl = make_workload_filter(artifacts)
+    layers: dict[str, dict[str, Any]] = {
+        "STDIO": {
+            "ops": 0, "read_ops": 0, "write_ops": 0,
+            "bytes_resolved": True, "bytes": 0,
+            "process_tree_ops": 0, "process_tree_bytes": 0,
+            "scope": "workload_when_path_resolved",
+            "by_function": Counter(),
+        },
+        "POSIX": {
+            "ops": 0, "read_ops": 0, "write_ops": 0,
+            "bytes_resolved": True, "bytes": 0, "by_function": Counter(),
+        },
+        "MMAP": {
+            "ops": 0, "read_ops": 0, "write_ops": 0,
+            "bytes_resolved": False, "bytes": None,
+            "mapped_bytes_upper_bound": 0, "by_function": Counter(),
+        },
+        "HDF5": {
+            "ops": 0, "read_ops": 0, "write_ops": 0,
+            "bytes_resolved": False, "bytes": None, "by_function": Counter(),
+        },
+        "MPI-IO": {
+            "ops": 0, "read_ops": 0, "write_ops": 0,
+            "bytes_resolved": False, "bytes": None, "raw_count_total": 0,
+            "by_function": Counter(),
+        },
+    }
+
+    for e in parsed.get("fs_entries", []):
+        syscall = str(e.get("syscall") or "")
+        path = e.get("path") or ""
+        if path and not wl(path):
+            continue
+        if not path and syscall not in (STDIO_READ_FUNCS | STDIO_WRITE_FUNCS):
+            continue
+        is_stdio = syscall in (STDIO_READ_FUNCS | STDIO_WRITE_FUNCS)
+        stdio_workload_scoped = bool(path)
+        size = e.get("actual_size") or e.get("bytes_transferred") or 0
+        size = int(size) if isinstance(size, (int, float)) and size > 0 else 0
+        if is_stdio:
+            d = layers["STDIO"]
+            d["by_function"][syscall] += 1
+            if stdio_workload_scoped:
+                d["ops"] += 1
+                d["bytes"] += size
+                if syscall in STDIO_READ_FUNCS:
+                    d["read_ops"] += 1
+                else:
+                    d["write_ops"] += 1
+            else:
+                d["process_tree_ops"] += 1
+                d["process_tree_bytes"] += size
+        elif syscall in READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT:
+            d = layers["POSIX"]
+            d["ops"] += 1
+            d["by_function"][syscall] += 1
+            d["bytes"] += size
+            if syscall in READ_SYSCALLS_STRICT:
+                d["read_ops"] += 1
+            else:
+                d["write_ops"] += 1
+        elif syscall == "mmap":
+            # Only file-backed, successful mappings (resolved path via fd,
+            # return != MAP_FAILED). Anonymous maps have no resolved path.
+            path = e.get("path")
+            ret = e.get("return_value")
+            if not isinstance(path, str) or not path:
+                continue
+            if isinstance(ret, int) and ret == -1:
+                continue
+            prot = int(e.get("flags") or 0)
+            if prot & 0x4:  # PROT_EXEC: shared-library / code loads, not data I/O
+                continue
+            length = e.get("requested_size") or 0
+            length = int(length) if isinstance(length, (int, float)) and length > 0 else 0
+            d = layers["MMAP"]
+            d["ops"] += 1
+            d["by_function"]["mmap"] += 1
+            d["mapped_bytes_upper_bound"] += length
+            if prot & 0x1:  # PROT_READ
+                d["read_ops"] += 1
+            if prot & 0x2:  # PROT_WRITE
+                d["write_ops"] += 1
+
+    by_tool: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"hdf5_write_ops": 0, "physical_write_ops": 0, "physical_pwrite_ops": 0}
+    )
+    for e in parsed.get("fs_entries", []):
+        path = e.get("path") or ""
+        if not wl(path):
+            continue
+        tid = e.get("matched_tool_call")
+        if not isinstance(tid, str):
+            continue
+        syscall = str(e.get("syscall") or "")
+        if syscall in WRITE_SYSCALLS_STRICT:
+            by_tool[tid]["physical_write_ops"] += 1
+        if syscall in {"pwrite64", "pwritev", "pwritev2"}:
+            by_tool[tid]["physical_pwrite_ops"] += 1
+
+    for e in parsed.get("lib_io_entries", []):
+        library = str(e.get("library") or "")
+        function = str(e.get("function") or "")
+        if library == "hdf5":
+            d = layers["HDF5"]
+            d["ops"] += 1
+            d["by_function"][function] += 1
+            if function in HDF5_READ_FUNCS:
+                d["read_ops"] += 1
+            elif function in HDF5_WRITE_FUNCS:
+                d["write_ops"] += 1
+                tid = e.get("matched_tool_call")
+                if isinstance(tid, str):
+                    by_tool[tid]["hdf5_write_ops"] += 1
+        elif library == "mpiio":
+            d = layers["MPI-IO"]
+            d["ops"] += 1
+            d["by_function"][function] += 1
+            if function in MPIIO_READ_FUNCS:
+                d["read_ops"] += 1
+            elif function in MPIIO_WRITE_FUNCS:
+                d["write_ops"] += 1
+            count = e.get("count")
+            if isinstance(count, (int, float)) and count > 0:
+                d["raw_count_total"] += int(count)
+
+    tool_ratios = []
+    for tid, vals in by_tool.items():
+        h5 = vals["hdf5_write_ops"]
+        phys = vals["physical_write_ops"]
+        pwrite = vals["physical_pwrite_ops"]
+        if h5 <= 0:
+            continue
+        tool_ratios.append({
+            "tool_call_id": tid,
+            **vals,
+            "hdf5_write_to_physical_write_ops": (h5 / phys) if phys else None,
+            "physical_write_to_hdf5_write_ops": (phys / h5) if h5 else None,
+            "hdf5_write_to_pwrite_ops": (h5 / pwrite) if pwrite else None,
+            "pwrite_to_hdf5_write_ops": (pwrite / h5) if h5 else None,
+        })
+
+    total_h5_write = layers["HDF5"]["write_ops"]
+    total_phys_write = layers["POSIX"]["write_ops"]
+    total_pwrite = sum(
+        1 for e in parsed.get("fs_entries", [])
+        if str(e.get("syscall")) in {"pwrite64", "pwritev", "pwritev2"}
+        and wl(e.get("path") or "")
+    )
+    out_layers = {}
+    for name, vals in layers.items():
+        clean = dict(vals)
+        clean["by_function"] = dict(vals["by_function"])
+        out_layers[name] = clean
+    return {
+        "layers": out_layers,
+        "logical_physical_write_ratio": {
+            "hdf5_write_ops": total_h5_write,
+            "physical_write_ops": total_phys_write,
+            "physical_pwrite_ops": total_pwrite,
+            "hdf5_write_to_physical_write_ops": (
+                total_h5_write / total_phys_write if total_phys_write else None
+            ),
+            "physical_write_to_hdf5_write_ops": (
+                total_phys_write / total_h5_write if total_h5_write else None
+            ),
+            "hdf5_write_to_pwrite_ops": (
+                total_h5_write / total_pwrite if total_pwrite else None
+            ),
+            "pwrite_to_hdf5_write_ops": (
+                total_pwrite / total_h5_write if total_h5_write else None
+            ),
+            "by_tool_call": tool_ratios[:50],
+        },
+        "note": (
+            "POSIX and mmap layers are scoped to workload artifacts. STDIO is "
+            "workload-scoped only when FILE* fd resolution produced a workload path; "
+            "otherwise pathless STDIO probes are kept as process-tree-only context. "
+            "MMAP bytes are mapped-region length, an upper bound on actual page access. "
+            "HDF5/MPI-IO uprobes are pathless and therefore reported as observed calls, not workload-filtered bytes."
+        ),
+    }
+
+
+def compute_directory_scan_count(parsed: dict[str, Any],
+                                 artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    # Workload directories only: otherwise Python's sys.path / site-packages
+    # walking dominates "top rescanned directories".
+    _wl = make_workload_dir_filter(artifacts)
     entries = [e for e in parsed.get("fs_entries", [])
-              if str(e.get("syscall")) in DIRECTORY_SCAN_SYSCALLS]
+              if str(e.get("syscall")) in DIRECTORY_SCAN_SYSCALLS
+              and _wl(e.get("path") or "")]
     by_path = Counter(e.get("path") for e in entries if e.get("path"))
+    hist = Counter(">=10" if c >= 10 else str(c) for c in by_path.values())
     return {
         "total_scans": len(entries),
         "unique_directories_scanned": len(by_path),
         "rescanned_directories": sum(1 for c in by_path.values() if c > 1),
-        "top_rescanned": by_path.most_common(5),
+        "scans_per_dir_hist": {k: hist.get(k, 0) for k in [*(str(i) for i in range(1, 10)), ">=10"]},
+        "p95_scans_per_dir": percentile([float(c) for c in by_path.values()], 95),
     }
 
 
 def compute_failed_open_stat_count(parsed: dict[str, Any]) -> dict[str, Any]:
-    entries = [
-        e for e in parsed.get("fs_entries", [])
-        if str(e.get("syscall")) in OPEN_STAT_SYSCALLS
-        and isinstance(e.get("return_value"), (int, float))
-        and e.get("return_value") < 0
-    ]
-    by_syscall = Counter(str(e.get("syscall")) for e in entries)
-    by_path = Counter(e.get("path") for e in entries if e.get("path"))
+    # Denominator: every open/stat/access attempt (success or failure), used to
+    # normalize the failed-probe count so traces of different length are
+    # comparable. CPython import-machinery probes are excluded from both the
+    # numerator and denominator so the rate reflects agent-level path probing,
+    # not the interpreter statting sys.path on every `import`.
+    total_attempts = 0
+    total_attempts_agent = 0
+    failed_all = 0
+    import_probe_failed = 0
+    agent_entries: list[dict[str, Any]] = []
+    for e in parsed.get("fs_entries", []):
+        if str(e.get("syscall")) not in OPEN_STAT_SYSCALLS:
+            continue
+        is_import = _is_python_import_probe(e.get("path"))
+        total_attempts += 1
+        if not is_import:
+            total_attempts_agent += 1
+        rv = e.get("return_value")
+        if not (isinstance(rv, (int, float)) and rv < 0):
+            continue
+        failed_all += 1
+        if is_import:
+            import_probe_failed += 1
+        else:
+            agent_entries.append(e)
+
+    by_syscall = Counter(str(e.get("syscall")) for e in agent_entries)
+    by_path = Counter(e.get("path") for e in agent_entries if e.get("path"))
     return {
-        "total_failed": len(entries),
+        # Agent-level (import probes excluded) — the Axis-4 exploration signal.
+        "total_failed": len(agent_entries),
+        "failed_rate": (len(agent_entries) / total_attempts_agent
+                        if total_attempts_agent else None),
         "by_syscall": dict(by_syscall),
         "distinct_paths_involved": len(by_path),
         "top_failing_paths": by_path.most_common(5),
+        # Transparency: how much interpreter noise was filtered out.
+        "total_failed_raw": failed_all,
+        "import_probe_failed_excluded": import_probe_failed,
+        "total_open_stat_attempts": total_attempts,
     }
 
 
@@ -448,19 +809,25 @@ def compute_op_ratios(parsed: dict[str, Any]) -> dict[str, Any]:
 
 def compute_request_size_cdf(parsed: dict[str, Any]) -> dict[str, Any]:
     sizes = []
+    bytes_total = 0.0
+    bytes_weighted_num = 0.0
     for e in parsed.get("fs_entries", []):
         if str(e.get("syscall")) not in DATA_SYSCALLS:
             continue
         sz = e.get("requested_size") or e.get("actual_size") or e.get("bytes_transferred")
         if isinstance(sz, (int, float)) and sz > 0:
             sizes.append(float(sz))
+            bytes_total += float(sz)
+            bytes_weighted_num += float(sz) * float(sz)
     return {
         "count": len(sizes),
         "p50_bytes": percentile(sizes, 50),
         "p95_bytes": percentile(sizes, 95),
         "p99_bytes": percentile(sizes, 99),
         "pct_lt_4kb": pct(sizes, lambda x: x < 4096),
+        "pct_lt_64kb": pct(sizes, lambda x: x < 64 * 1024),
         "pct_lt_10mb": pct(sizes, lambda x: x < 10 * 1024 * 1024),
+        "bytes_weighted_mean_request_bytes": (bytes_weighted_num / bytes_total) if bytes_total else None,
     }
 
 
@@ -509,111 +876,304 @@ def compute_fs_io_non_llm(parsed: dict[str, Any], pi_summary: dict[str, Any],
     }
 
 
+def make_workload_filter(artifacts: list[dict[str, Any]]):
+    """Predicate: is this path workload data (vs interpreter/.venv/trace noise)?
+
+    Source of truth is the lineage step's already-workload-scoped artifacts.csv,
+    which was produced with each run's correct LINEAGE_DATA_PATH_PREFIXES. Using
+    that path set makes the analysis env-independent and guarantees it matches
+    the per-syscall histogram exactly. Falls back to is_workload_artifact (env
+    prefixes) only when artifacts.csv is missing/empty."""
+    workload_paths = {row.get("path") for row in artifacts if row.get("path")}
+    if workload_paths:
+        return lambda p: p in workload_paths
+    if is_workload_artifact is not None:
+        return is_workload_artifact
+    return lambda _p: True
+
+
+def make_workload_dir_filter(artifacts: list[dict[str, Any]]):
+    """Predicate for DIRECTORY paths (getdents), which are never in artifacts.csv
+    (that lists files). A directory is workload iff some workload file lives under
+    it. Env-independent, same source of truth as make_workload_filter."""
+    workload_paths = {row.get("path") for row in artifacts if row.get("path")}
+    if not workload_paths:
+        if is_workload_artifact is not None:
+            return is_workload_artifact
+        return lambda _p: True
+
+    def _is_workload_dir(d: str) -> bool:
+        if not d:
+            return False
+        prefix = d.rstrip("/") + "/"
+        return any(f == d or f.startswith(prefix) for f in workload_paths)
+
+    return _is_workload_dir
+
+
 def compute_analytical_optimum(parsed: dict[str, Any],
                                artifacts: list[dict[str, Any]],
                                optimal_request_bytes: int) -> dict[str, Any]:
+    # Historical field name retained for compatibility. This now returns only
+    # honest workload-scoped counts; synthetic 4 MiB optimum/amplification
+    # fields live in neither JSON nor figures.
+    _ = optimal_request_bytes
+    _wl = make_workload_filter(artifacts)
+
     generated = []
     for row in artifacts:
+        path = row.get("path", "")
+        if not _wl(path):
+            continue
         try:
             writes = int(float(row.get("n_writes") or 0))
             write_bytes = int(float(row.get("total_write_bytes") or 0))
         except ValueError:
             continue
         if writes > 0 or write_bytes > 0:
-            generated.append((row.get("path", ""), writes, write_bytes))
+            generated.append((path, writes, write_bytes))
     actual_generated_files = len({p for p, _, _ in generated if p})
-    actual_write_bytes = sum(wb for _, _, wb in generated)
-    actual_write_ops = sum(1 for e in parsed.get("fs_entries", [])
-                           if str(e.get("syscall")) in {"write", "pwrite64", "writev", "pwritev"})
-    actual_metadata_ops = sum(
-        1 for e in parsed.get("fs_entries", [])
-        if storage_metadata_syscall(str(e.get("syscall")))
-    )
-    # Read side (axis 5 small-I/O aggregation potential): mirror the write-side
-    # amplification. actual_read_ops / optimum_read_ops answers "how many read
-    # calls could be saved if fragmented reads were merged to optimal-size
-    # requests," the read analogue of write_call_amplification.
+
+    actual_write_ops = 0
+    actual_write_bytes = 0
     actual_read_ops = 0
     actual_read_bytes = 0
+    actual_metadata_ops = 0
     for e in parsed.get("fs_entries", []):
-        if str(e.get("syscall")) in READ_SYSCALLS_STRICT:
+        syscall = str(e.get("syscall"))
+        path = e.get("path") or ""
+        if not _wl(path):
+            continue
+        if storage_metadata_syscall(syscall):
+            actual_metadata_ops += 1
+            continue
+        is_read = syscall in READ_SYSCALLS_STRICT
+        is_write = syscall in WRITE_SYSCALLS_STRICT
+        if not (is_read or is_write):
+            continue
+        sz = e.get("bytes_transferred") or 0
+        if not (isinstance(sz, (int, float)) and sz > 0):
+            continue
+        if is_read:
             actual_read_ops += 1
-            sz = e.get("actual_size") or e.get("requested_size") or e.get("bytes_transferred") or 0
-            actual_read_bytes += sz if isinstance(sz, (int, float)) and sz > 0 else 0
-    optimum_read_ops = (
-        max(1, math.ceil(actual_read_bytes / optimal_request_bytes))
-        if actual_read_bytes else 0
-    )
-    optimum_files = 1 if actual_generated_files else 0
-    optimum_write_ops = (
-        max(1, math.ceil(actual_write_bytes / optimal_request_bytes))
-        if actual_write_bytes else 0
-    )
-    # Batched-file lower bound: create/open + close + at least one metadata
-    # lookup/attribute update. This is intentionally conservative.
-    optimum_metadata_ops = 3 if actual_generated_files else 0
+            actual_read_bytes += sz
+        else:
+            actual_write_ops += 1
+            actual_write_bytes += sz
     return {
         "actual_generated_files": actual_generated_files,
         "actual_write_bytes": actual_write_bytes,
         "actual_write_ops": actual_write_ops,
         "actual_storage_metadata_ops": actual_metadata_ops,
-        "optimum_files": optimum_files,
-        "optimum_write_ops": optimum_write_ops,
-        "optimum_storage_metadata_ops": optimum_metadata_ops,
-        "file_count_amplification": (
-            actual_generated_files / optimum_files if optimum_files else None
-        ),
-        "write_call_amplification": (
-            actual_write_ops / optimum_write_ops if optimum_write_ops else None
-        ),
         "actual_read_bytes": actual_read_bytes,
         "actual_read_ops": actual_read_ops,
-        "optimum_read_ops": optimum_read_ops,
-        "read_call_amplification": (
-            actual_read_ops / optimum_read_ops if optimum_read_ops else None
-        ),
-        "metadata_op_amplification": (
-            actual_metadata_ops / optimum_metadata_ops if optimum_metadata_ops else None
-        ),
         "assumption": (
-            f"analytical optimum is one batched output file with "
-            f"{optimal_request_bytes}B read/write requests; no reference run"
+            "workload data only (same filter as the per-syscall request-size "
+            "histogram; excludes Python imports / .venv / logger / trace output)"
         ),
     }
 
 
-def compute_sequentiality(parsed: dict[str, Any]) -> dict[str, Any]:
-    by_file: dict[str, list[tuple[int, int]]] = defaultdict(list)
+def compute_sequentiality(parsed: dict[str, Any],
+                          artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    wl = make_workload_filter(artifacts)
+    data_syscalls = READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT
+    streams_tid: dict[tuple[str, int, int, int], list[tuple[float, int, int, bool]]] = defaultdict(list)
+    streams_pid: dict[tuple[str, int, int, int], list[tuple[float, int, int, bool]]] = defaultdict(list)
+    eligible_ops = 0
+    ops_with_offset = 0
+    ops_with_offset_by_kind = Counter()
+    excluded = Counter()
+
     for e in parsed.get("fs_entries", []):
-        path = e.get("path")
+        syscall = str(e.get("syscall"))
+        if syscall not in data_syscalls:
+            continue
+        if not is_storage_file_io(e):
+            excluded["non_storage"] += 1
+            continue
+        path = e.get("path") or ""
+        if not wl(path):
+            excluded["non_workload"] += 1
+            continue
+        size = _io_bytes(e)
+        if size <= 0:
+            excluded["zero_bytes"] += 1
+            continue
+        eligible_ops += 1
         off = e.get("offset")
-        size = e.get("actual_size") or e.get("requested_size")
-        if isinstance(path, str) and isinstance(off, int) and isinstance(size, int) and size > 0:
-            by_file[path].append((off, size))
-    total = consecutive = backward = random = 0
-    for events in by_file.values():
-        prev_end = None
-        for off, size in events:
-            if prev_end is not None:
-                total += 1
-                if off == prev_end:
-                    consecutive += 1
-                elif off < prev_end:
-                    backward += 1
+        if not isinstance(off, int):
+            excluded["missing_offset"] += 1
+            continue
+        ops_with_offset += 1
+        kind = "write" if syscall in WRITE_SYSCALLS_STRICT else "read"
+        ops_with_offset_by_kind[kind] += 1
+        fd = e.get("file_descriptor")
+        gen = e.get("open_generation")
+        pid = e.get("pid")
+        tid = e.get("tid")
+        if not all(isinstance(x, int) for x in (fd, gen, pid, tid)):
+            excluded["missing_stream_identity"] += 1
+            continue
+        ts = _entry_end_s(e) or 0.0
+        item = (ts, off, size, bool(e.get("append")))
+        streams_tid[(kind, tid, fd, gen)].append(item)
+        streams_pid[(kind, pid, fd, gen)].append(item)
+
+    def classify_streams(
+        streams: dict[tuple[str, int, int, int], list[tuple[float, int, int, bool]]]
+    ) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "read": Counter(),
+            "write": Counter(),
+            "stride_hist": {},
+            "n_streams": 0,
+            "n_streams_with_transitions": 0,
+        }
+        strides: list[int] = []
+        for (kind, _owner, _fd, _gen), events in streams.items():
+            events.sort(key=lambda x: x[0])
+            if events:
+                out["n_streams"] += 1
+            prev_last = None
+            stream_transitions = 0
+            for _ts, off, size, is_append in events:
+                if kind == "write" and is_append:
+                    out[kind]["append_ops"] += 1
+                    prev_last = None
+                    continue
+                last_byte = off + size - 1
+                if prev_last is not None:
+                    stream_transitions += 1
+                    if off == prev_last + 1:
+                        out[kind]["consecutive"] += 1
+                    elif off > prev_last + 1:
+                        out[kind]["sequential_gap"] += 1
+                        strides.append(off - prev_last - 1)
+                    else:
+                        out[kind]["backward_or_random"] += 1
+                prev_last = last_byte
+            if stream_transitions:
+                out["n_streams_with_transitions"] += 1
+        for kind in ("read", "write"):
+            c = out[kind]
+            transitions = c.get("consecutive", 0) + c.get("sequential_gap", 0) + c.get("backward_or_random", 0)
+            seq_ops = c.get("consecutive", 0) + c.get("sequential_gap", 0)
+            if kind == "write":
+                seq_ops += c.get("append_ops", 0)
+            rand_ops = c.get("backward_or_random", 0)
+            c["transitions"] = transitions
+            c["seq_ops"] = seq_ops
+            c["rand_ops"] = rand_ops
+            c["pct_consecutive"] = 100.0 * c.get("consecutive", 0) / transitions if transitions else None
+            c["pct_sequential_including_gap"] = (
+                100.0 * (c.get("consecutive", 0) + c.get("sequential_gap", 0)) / transitions
+                if transitions else None
+            )
+            c["pct_backward_or_random"] = 100.0 * c.get("backward_or_random", 0) / transitions if transitions else None
+            out[kind] = dict(c)
+        out["stride_hist"] = darshan_hist(strides) if darshan_hist else {}
+        return out
+
+    def mergeability(
+        streams: dict[tuple[str, int, int, int], list[tuple[float, int, int, bool]]],
+        max_chunk_bytes: int = 4 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        actual_ops = 0
+        merged_ops = 0
+        saved_ops = 0
+        total_bytes = 0
+        bytes_in_consecutive_runs = 0
+
+        def finish_run(n_ops: int, n_bytes: int) -> None:
+            nonlocal merged_ops, saved_ops, bytes_in_consecutive_runs
+            if n_ops <= 0:
+                return
+            chunks = max(1, math.ceil(n_bytes / max_chunk_bytes))
+            merged_ops += chunks
+            saved_ops += max(0, n_ops - chunks)
+            if n_ops >= 2:
+                bytes_in_consecutive_runs += n_bytes
+
+        for (_kind, _owner, _fd, _gen), events in streams.items():
+            events.sort(key=lambda x: x[0])
+            run_ops = 0
+            run_bytes = 0
+            prev_last = None
+            for _ts, off, size, _is_append in events:
+                actual_ops += 1
+                total_bytes += size
+                last_byte = off + size - 1
+                if prev_last is not None and off == prev_last + 1:
+                    run_ops += 1
+                    run_bytes += size
                 else:
-                    random += 1
-            prev_end = off + size
+                    finish_run(run_ops, run_bytes)
+                    run_ops = 1
+                    run_bytes = size
+                prev_last = last_byte
+            finish_run(run_ops, run_bytes)
+
+        return {
+            "actual_ops_with_offset": actual_ops,
+            "merged_ops_if_consecutive_runs_capped_at_4mb": merged_ops if actual_ops else None,
+            "saved_ops": saved_ops if actual_ops else None,
+            "saved_ops_pct_of_actual_ops": 100.0 * saved_ops / actual_ops if actual_ops else None,
+            "bytes_total_with_offset": total_bytes,
+            "bytes_in_consecutive_runs": bytes_in_consecutive_runs,
+            "bytes_in_consecutive_runs_pct": (
+                100.0 * bytes_in_consecutive_runs / total_bytes if total_bytes else None
+            ),
+            "max_merge_chunk_bytes": max_chunk_bytes,
+            "note": (
+                "Only adjacent operations with explicit offsets in the same "
+                "(tid, fd, open_generation) stream are considered mergeable; "
+                "runs are split at 4 MiB boundaries."
+            ),
+        }
+
+    pct_with_offset = 100.0 * ops_with_offset / eligible_ops if eligible_ops else None
+    tid_classified = classify_streams(streams_tid)
+    pid_classified = classify_streams(streams_pid)
+    four_cell = {
+        "seq_read": (tid_classified.get("read") or {}).get("seq_ops", 0),
+        "rand_read": (tid_classified.get("read") or {}).get("rand_ops", 0),
+        "seq_write": (tid_classified.get("write") or {}).get("seq_ops", 0),
+        "rand_write": (tid_classified.get("write") or {}).get("rand_ops", 0),
+    }
+    four_total = sum(four_cell.values())
+    four_cell_pct = {
+        key: (100.0 * val / four_total if four_total else None)
+        for key, val in four_cell.items()
+    }
+    note = (
+        "sequentiality uses workload storage data syscalls with kernel/file offsets; "
+        "read and write streams are classified separately by fd open generation. "
+        "mmap reads are invisible, buffered I/O is measured at the POSIX/VFS layer, "
+        "and logical offsets do not imply physical layout."
+    )
+    if not ops_with_offset:
+        note += " No offset-bearing data operations were available in this parsed trace."
     return {
-        "transitions": total,
-        "pct_consecutive": 100.0 * consecutive / total if total else None,
-        "pct_backward": 100.0 * backward / total if total else None,
-        "pct_gap_random": 100.0 * random / total if total else None,
-        "note": "requires offset-capable syscalls; read/write without offsets are excluded",
+        "eligible_data_ops": eligible_ops,
+        "ops_with_offset": ops_with_offset,
+        "ops_with_offset_by_kind": {
+            "read": int(ops_with_offset_by_kind.get("read", 0)),
+            "write": int(ops_with_offset_by_kind.get("write", 0)),
+        },
+        "pct_ops_with_offset": pct_with_offset,
+        "excluded_ops": dict(excluded),
+        "four_cell": four_cell,
+        "four_cell_pct": four_cell_pct,
+        "by_stream_tid_fd_open_generation": tid_classified,
+        "by_stream_pid_fd_open_generation": pid_classified,
+        "mergeability": mergeability(streams_tid),
+        "note": note,
     }
 
 
 def compute_access_type_rhwhrw(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Axis 2: read-heavy / write-heavy / read-write file classification by
+    """Axis 1: read-heavy / write-heavy / read-write file classification by
     read/write byte volume (Patel FAST'20 Fig. 3a). Distinct from the lineage
     reuse_class (which splits by reader-call count): this splits by which
     direction the *bytes* flow. A file's read share = rb/(rb+wb); RH if >=2/3,
@@ -660,13 +1220,18 @@ def compute_access_type_rhwhrw(artifacts: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
-def inter_arrival_deltas(parsed: dict[str, Any]) -> tuple[list[float], int]:
+def inter_arrival_deltas(parsed: dict[str, Any],
+                         artifacts: list[dict[str, Any]]) -> tuple[list[float], int]:
     """Raw per-file inter-access time gaps (seconds) and the number of files
     that were re-accessed. An access is any data syscall carrying a path;
     consecutive identical timestamps on one file (buffered reads on one fd)
     collapse to a single point so we measure logical re-access gaps, not
     per-syscall noise. Shared by compute_inter_arrival (percentiles) and the
-    inter-arrival CDF figure (full distribution)."""
+    inter-arrival CDF figure (full distribution).
+
+    Workload data only: otherwise repeated .venv library reads dominate the
+    re-access gaps and describe interpreter behaviour, not the workload."""
+    _wl = make_workload_filter(artifacts)
     ts_by_path: dict[str, list[float]] = defaultdict(list)
     for e in parsed.get("fs_entries", []):
         if str(e.get("syscall")) not in DATA_SYSCALLS:
@@ -675,10 +1240,12 @@ def inter_arrival_deltas(parsed: dict[str, Any]) -> tuple[list[float], int]:
         ts = e.get("timestamp")
         if not isinstance(path, str) or not isinstance(ts, str):
             continue
-        try:
-            ts_by_path[path].append(datetime.fromisoformat(ts).timestamp())
-        except ValueError:
+        if not _wl(path):
             continue
+        t = _entry_end_s(e)
+        if t is None:
+            continue
+        ts_by_path[path].append(t)
     deltas: list[float] = []
     files_reaccessed = 0
     for stamps in ts_by_path.values():
@@ -690,13 +1257,20 @@ def inter_arrival_deltas(parsed: dict[str, Any]) -> tuple[list[float], int]:
     return deltas, files_reaccessed
 
 
-def compute_inter_arrival(parsed: dict[str, Any]) -> dict[str, Any]:
-    """Axis 2: distribution of the time gap (seconds) between successive
+def compute_inter_arrival(parsed: dict[str, Any],
+                          artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Axis 1: distribution of the time gap (seconds) between successive
     accesses to the same file (Patel FAST'20 Fig. 5a/6b analogue)."""
-    deltas, files_reaccessed = inter_arrival_deltas(parsed)
+    deltas, files_reaccessed = inter_arrival_deltas(parsed, artifacts)
     return {
         "files_with_repeat_access": files_reaccessed,
         "n_intervals": len(deltas),
+        "hist": page_cache_time_hist(deltas),
+        "hist_bins": [label for _, _, label in PAGE_CACHE_TIME_BINS],
+        "hist_note": (
+            "Time bins are chosen for page-cache/writeback semantics, not from "
+            "the cited inter-arrival literature."
+        ),
         "p50_s": percentile(deltas, 50),
         "p95_s": percentile(deltas, 95),
         "p99_s": percentile(deltas, 99),
@@ -707,7 +1281,7 @@ def compute_inter_arrival(parsed: dict[str, Any]) -> dict[str, Any]:
 
 def compute_exploration_overhead(bytes_ops_by_phase: dict[str, Any],
                                  artifacts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Axis 4: assemble the single exploratory-I/O overhead ratio the pieces of
+    """Axis 3: assemble the single exploratory-I/O overhead ratio the pieces of
     which already exist. Exploration bytes = I/O in backtrack phases (retry that
     re-does a step) + dead-write bytes (files written but never read = abandoned
     artifacts). Denominator = all data bytes seen across phases.
@@ -748,29 +1322,36 @@ def compute_exploration_overhead(bytes_ops_by_phase: dict[str, Any],
 
 
 def _binned_series(parsed: dict[str, Any], window_s: float,
-                   syscalls: set[str]) -> list[float]:
+                   timeline: dict[str, Any] | None,
+                   syscalls: set[str],
+                   artifacts: list[dict[str, Any]] | None = None) -> list[float]:
     """Bytes per fixed time window over the run, for the given syscall set."""
+    wl = make_workload_filter(artifacts or []) if artifacts is not None else None
     points: list[tuple[float, float]] = []
     for e in parsed.get("fs_entries", []):
         if str(e.get("syscall")) not in syscalls:
             continue
-        ts = e.get("timestamp")
-        if not isinstance(ts, str):
+        if wl is not None and not wl(e.get("path") or ""):
             continue
-        try:
-            t = datetime.fromisoformat(ts).timestamp()
-        except ValueError:
+        t = _entry_end_s(e)
+        if t is None:
             continue
         sz = e.get("actual_size") or e.get("requested_size") or e.get("bytes_transferred") or 0
         points.append((t, float(sz) if isinstance(sz, (int, float)) and sz > 0 else 0.0))
-    if not points:
+    if not points and not timeline:
         return []
-    t0 = min(t for t, _ in points)
-    t1 = max(t for t, _ in points)
+    if timeline and timeline.get("wall_s"):
+        t0 = float(timeline.get("wall_start_ms") or 0.0) / 1000.0
+        t1 = t0 + float(timeline.get("wall_s") or 0.0)
+    else:
+        t0 = min(t for t, _ in points)
+        t1 = max(t for t, _ in points)
     nbins = max(1, int((t1 - t0) / window_s) + 1)
     series = [0.0] * nbins
     for t, sz in points:
-        series[min(nbins - 1, int((t - t0) / window_s))] += sz
+        idx = int((t - t0) / window_s)
+        if 0 <= idx < nbins:
+            series[idx] += sz
     return series
 
 
@@ -786,15 +1367,16 @@ def _autocorr(series: list[float], lag: int) -> float | None:
     return cov / var
 
 
-def compute_io_autocorrelation(parsed: dict[str, Any]) -> dict[str, Any]:
-    """Axis 6: read/write autocorrelation at 1/5/25-minute windows and a few
+def compute_io_autocorrelation(parsed: dict[str, Any],
+                               artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Axis 5: read/write autocorrelation at 1/5/25-minute windows and a few
     lags, plus lag-0 read-write cross-correlation (Patel SC'19 Fig. 9)."""
     windows = {"1min": 60.0, "5min": 300.0, "25min": 1500.0}
     lags = [1, 2, 3]
     out: dict[str, Any] = {}
     for name, w in windows.items():
-        r = _binned_series(parsed, w, READ_SYSCALLS_STRICT)
-        wr = _binned_series(parsed, w, WRITE_SYSCALLS_STRICT)
+        r = _binned_series(parsed, w, None, READ_SYSCALLS_STRICT, artifacts)
+        wr = _binned_series(parsed, w, None, WRITE_SYSCALLS_STRICT, artifacts)
         # Cross-correlation needs aligned bins; rebin both on the same grid.
         cross = None
         m = min(len(r), len(wr))
@@ -817,11 +1399,12 @@ def compute_io_autocorrelation(parsed: dict[str, Any]) -> dict[str, Any]:
 
 
 def compute_intensity_phases(parsed: dict[str, Any],
+                             timeline: dict[str, Any] | None = None,
                              window_s: float = 60.0) -> dict[str, Any]:
-    """Axis 6: high/low-intensity I/O phase segmentation. Bin total I/O bytes
+    """Axis 5: high/low-intensity I/O phase segmentation. Bin total I/O bytes
     into fixed windows, threshold at the 75th/25th percentile of non-empty bins,
     and segment consecutive high / low bins (Patel SC'19 Fig. 7/8)."""
-    series = _binned_series(parsed, window_s,
+    series = _binned_series(parsed, window_s, timeline,
                             READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT)
     nonzero = [x for x in series if x > 0]
     if len(nonzero) < 4:
@@ -858,6 +1441,373 @@ def compute_intensity_phases(parsed: dict[str, Any],
             "mean_len_bins": (sum(lo_segs) / len(lo_segs)) if lo_segs else None,
             "max_len_bins": max(lo_segs) if lo_segs else 0,
         },
+    }
+
+
+def _entry_interval_ms(entry: dict[str, Any]) -> tuple[float, float] | None:
+    end_ms = _entry_end_ms(entry)
+    if end_ms is None:
+        return None
+    dur_ms = max(0.0, float(entry.get("duration") or 0.0) * 1000.0)
+    return end_ms - dur_ms, end_ms
+
+
+def _union_length_ms(intervals: list[tuple[float, float]]) -> float:
+    total = 0.0
+    cur_s = cur_e = None
+    for s, e in sorted((s, e) for s, e in intervals if e > s):
+        if cur_s is None:
+            cur_s, cur_e = s, e
+        elif s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+    if cur_s is not None and cur_e is not None:
+        total += cur_e - cur_s
+    return total
+
+
+def _merged_intervals_ms(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for s, e in sorted((s, e) for s, e in intervals if e > s):
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _point_in_intervals_ms(t: float, intervals: list[tuple[float, float]]) -> bool:
+    return any(s <= t <= e for s, e in intervals)
+
+
+def _interval_overlap_ms(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+
+
+def _io_bytes(entry: dict[str, Any]) -> int:
+    value = entry.get("bytes_transferred") or entry.get("actual_size") or entry.get("requested_size") or 0
+    return int(value) if isinstance(value, (int, float)) and value > 0 else 0
+
+
+def _fs_entry_bounds_ms(parsed: dict[str, Any]) -> tuple[float, float] | None:
+    bounds: list[float] = []
+    for e in parsed.get("fs_entries", []):
+        iv = _entry_interval_ms(e)
+        if iv is not None:
+            bounds.extend(iv)
+    if not bounds:
+        return None
+    return min(bounds), max(bounds)
+
+
+def _llm_intervals_ms(trace_dir: Path) -> list[tuple[float, float]]:
+    events_path = trace_dir / "pi_events.jsonl"
+    if not events_path.is_file():
+        return []
+    try:
+        from agent_io_tracing.analysis.parallelism import _load_llm_events
+
+        llms, _, _ = _load_llm_events(events_path)
+    except Exception:
+        return []
+    return [(ev.start_ms, ev.end_ms) for ev in llms if ev.end_ms > ev.start_ms]
+
+
+def _run_timeline_ms(
+    trace_dir: Path,
+    parsed: dict[str, Any],
+    phases: dict[str, dict[str, Any]],
+    tool_calls: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """One wall-clock timeline shared by inference and bandwidth metrics."""
+    events: dict[str, Any] = {}
+    try:
+        from agent_io_tracing.analysis.parallelism import load_events
+
+        events = load_events(trace_dir)
+    except Exception:
+        events = {}
+
+    llm_intervals: list[tuple[float, float]] = []
+    tool_intervals: list[tuple[float, float]] = []
+    phase_intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    role_intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
+
+    for ev in events.values():
+        s = float(getattr(ev, "start_ms", 0.0))
+        e = float(getattr(ev, "end_ms", 0.0))
+        if e <= s:
+            continue
+        if getattr(ev, "kind", None) == "llm":
+            llm_intervals.append((s, e))
+            continue
+        if getattr(ev, "kind", None) != "tool":
+            continue
+        rid = getattr(ev, "run_id", None)
+        if not isinstance(rid, str):
+            continue
+        tc = tool_calls.get(rid) or {
+            "tool_id": rid,
+            "tool_name": getattr(ev, "name", None),
+            "name": getattr(ev, "name", None),
+            "role": getattr(ev, "role", None),
+            "input_params": getattr(ev, "args", None) or {},
+        }
+        iv = (s, e)
+        tool_intervals.append(iv)
+        if phase_label_for_tool_call:
+            phase_intervals[phase_label_for_tool_call(rid, tc, phases)].append(iv)
+        if role_for_tool_call:
+            role_intervals[role_for_tool_call(rid, tc, phases)].append(iv)
+
+    event_bounds = [
+        t
+        for iv in [*llm_intervals, *tool_intervals]
+        for t in iv
+    ]
+    fs_bounds = _fs_entry_bounds_ms(parsed)
+    timestamp_has_ts_ms = any(
+        isinstance(e.get("ts_ms"), (int, float))
+        for e in parsed.get("fs_entries", [])
+    )
+    if fs_bounds and event_bounds:
+        fs_start, fs_end = fs_bounds
+        ev_start, ev_end = min(event_bounds), max(event_bounds)
+        overlap_ms = min(fs_end, ev_end) - max(fs_start, ev_start)
+        if overlap_ms < -1000.0:
+            skew_ms = ev_start - fs_start
+            source = "ts_ms" if timestamp_has_ts_ms else "naive ISO timestamp"
+            raise RuntimeError(
+                "Filesystem event timestamps and LLM/tool event timestamps are "
+                f"on different timebases (source={source}; fs=[{fs_start:.0f}, {fs_end:.0f}] ms, "
+                f"events=[{ev_start:.0f}, {ev_end:.0f}] ms, approx skew={skew_ms/1000.0:.1f}s). "
+                "Re-parse ebpf_events.log with a parser that writes absolute ts_ms; "
+                "do not use inference-overlap metrics from this parsed.json."
+            )
+    if fs_bounds:
+        event_bounds.extend(fs_bounds)
+
+    wall_start = min(event_bounds) if event_bounds else 0.0
+    summary = load_json(trace_dir / "parallelism_summary.json", {})
+    wall_clock_s = summary.get("wall_clock_s")
+    if isinstance(wall_clock_s, (int, float)) and wall_clock_s > 0 and event_bounds:
+        wall_end = wall_start + float(wall_clock_s) * 1000.0
+    elif event_bounds:
+        wall_end = max(event_bounds)
+        wall_clock_s = max(0.0, (wall_end - wall_start) / 1000.0)
+    else:
+        wall_end = wall_start
+        wall_clock_s = 0.0
+
+    tool_busy_s = _union_length_ms(tool_intervals) / 1000.0
+    orchestration_s = max(0.0, float(wall_clock_s or 0.0) - tool_busy_s)
+    if orchestration_s > 0:
+        phase_intervals.setdefault("orchestration", [])
+        role_intervals.setdefault("(unattributed)", [])
+
+    return {
+        "wall_start_ms": wall_start,
+        "wall_end_ms": wall_end,
+        "wall_s": float(wall_clock_s or 0.0),
+        "llm_intervals": _merged_intervals_ms(llm_intervals),
+        "tool_intervals": _merged_intervals_ms(tool_intervals),
+        "phase_intervals": {k: _merged_intervals_ms(v) for k, v in phase_intervals.items()},
+        "role_intervals": {k: _merged_intervals_ms(v) for k, v in role_intervals.items()},
+        "phase_wall_s": {
+            k: _union_length_ms(v) / 1000.0 for k, v in phase_intervals.items()
+        } | {"orchestration": orchestration_s},
+        "role_wall_s": {
+            k: _union_length_ms(v) / 1000.0 for k, v in role_intervals.items()
+        } | {"(unattributed)": orchestration_s},
+    }
+
+
+def compute_io_vs_inference(
+    trace_dir: Path,
+    parsed: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    timeline: dict[str, Any],
+) -> dict[str, Any]:
+    llm_intervals = timeline.get("llm_intervals") or []
+    wl = make_workload_filter(artifacts)
+    io_events: list[tuple[float, int]] = []
+    for e in parsed.get("fs_entries", []):
+        if str(e.get("syscall")) not in (READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT):
+            continue
+        path = e.get("path") or ""
+        if not wl(path):
+            continue
+        size = _io_bytes(e)
+        if size <= 0:
+            continue
+        iv = _entry_interval_ms(e)
+        if iv is None:
+            continue
+        _, end = iv
+        io_events.append((end, size))
+    wall_start = float(timeline.get("wall_start_ms") or 0.0)
+    wall_end = float(timeline.get("wall_end_ms") or wall_start)
+    wall_ms = max(float(timeline.get("wall_s") or 0.0) * 1000.0, wall_end - wall_start)
+    if wall_ms <= 0:
+        return {
+            "pct_time_in_inference": None,
+            "pct_bytes_during_inference": None,
+            "bandwidth_ratio": None,
+            "inference_gap_s": {"count": 0, "p50": None, "p95": None, "max": None},
+        }
+    inference_ms = _union_length_ms(llm_intervals)
+    bytes_busy = sum(size for t, size in io_events if _point_in_intervals_ms(t, llm_intervals))
+    total_bytes = sum(size for _, size in io_events)
+    idle_ms = max(wall_ms - inference_ms, 0.0)
+    busy_bw = bytes_busy / (inference_ms / 1000.0) if inference_ms > 0 else None
+    idle_bytes = total_bytes - bytes_busy
+    idle_bw = idle_bytes / (idle_ms / 1000.0) if idle_ms > 0 else None
+    gaps: list[float] = []
+    cursor = wall_start
+    for s, e in llm_intervals:
+        if s > cursor:
+            gaps.append((s - cursor) / 1000.0)
+        cursor = max(cursor, e)
+    if wall_end > cursor:
+        gaps.append((wall_end - cursor) / 1000.0)
+    return {
+        "pct_time_in_inference": 100.0 * inference_ms / wall_ms if wall_ms else None,
+        "pct_bytes_during_inference": 100.0 * bytes_busy / total_bytes if total_bytes else None,
+        "bandwidth_ratio": (
+            busy_bw / idle_bw
+            if isinstance(busy_bw, (int, float)) and isinstance(idle_bw, (int, float)) and idle_bw > 0
+            else None
+        ),
+        "bytes_during_inference": bytes_busy,
+        "bytes_outside_inference": idle_bytes,
+        "inference_gap_s": {
+            "count": len(gaps),
+            "p50": percentile(gaps, 50),
+            "p95": percentile(gaps, 95),
+            "max": max(gaps) if gaps else None,
+        },
+        "caveat": (
+            "workload data only; bytes are attributed by syscall end timestamp, "
+            "so a long operation crossing an LLM boundary is counted wholly on "
+            "the side where it returns."
+        ),
+    }
+
+
+MIN_EFFECTIVE_BW_OPS = 5
+MIN_EFFECTIVE_BW_IO_TIME_S = 1e-3
+
+
+def _bandwidth_stats(items: list[tuple[float, float, int]],
+                     wall_s: float | None = None) -> dict[str, Any]:
+    if not items:
+        return {"ops": 0, "bytes": 0, "io_time_s": 0.0, "busy_time_s": 0.0,
+                "wall_s": float(wall_s or 0.0), "effective_Bps": None, "aggregate_Bps": None,
+                "duty_cycle": None, "effective_reliable": False,
+                "effective_unreliable_reason": "no operations"}
+    intervals = [(s, e) for s, e, _ in items]
+    bytes_total = sum(size for _, _, size in items)
+    io_time_s = sum(max(e - s, 0.0) for s, e, _ in items) / 1000.0
+    busy_s = _union_length_ms(intervals) / 1000.0
+    if wall_s is None:
+        wall_s = (max(e for _, e, _ in items) - min(s for s, _, _ in items)) / 1000.0
+    effective_reliable = len(items) >= MIN_EFFECTIVE_BW_OPS and io_time_s >= MIN_EFFECTIVE_BW_IO_TIME_S
+    unreliable_reason = None
+    if not effective_reliable:
+        if len(items) < MIN_EFFECTIVE_BW_OPS:
+            unreliable_reason = f"ops<{MIN_EFFECTIVE_BW_OPS}"
+        if io_time_s < MIN_EFFECTIVE_BW_IO_TIME_S:
+            suffix = f"io_time_s<{MIN_EFFECTIVE_BW_IO_TIME_S:g}"
+            unreliable_reason = f"{unreliable_reason}; {suffix}" if unreliable_reason else suffix
+    return {
+        "ops": len(items),
+        "bytes": bytes_total,
+        "io_time_s": io_time_s,
+        "busy_time_s": busy_s,
+        "wall_s": wall_s,
+        "effective_Bps": bytes_total / io_time_s if effective_reliable else None,
+        "aggregate_Bps": bytes_total / busy_s if busy_s > 0 else None,
+        "duty_cycle": busy_s / wall_s if wall_s > 0 else None,
+        "effective_reliable": effective_reliable,
+        "effective_unreliable_reason": unreliable_reason,
+    }
+
+
+def compute_effective_bandwidth(
+    trace_dir: Path,
+    parsed: dict[str, Any],
+    phases: dict[str, dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+    timeline: dict[str, Any],
+) -> dict[str, Any]:
+    tool_calls = build_tool_call_map(parsed)
+    wl = make_workload_filter(artifacts)
+    llm_intervals = timeline.get("llm_intervals") or []
+    by_phase: dict[str, dict[str, list[tuple[float, float, int]]]] = defaultdict(lambda: {"read": [], "write": []})
+    by_role: dict[str, dict[str, list[tuple[float, float, int]]]] = defaultdict(lambda: {"read": [], "write": []})
+    by_inference: dict[str, dict[str, list[tuple[float, float, int]]]] = defaultdict(lambda: {"read": [], "write": []})
+    global_items: dict[str, list[tuple[float, float, int]]] = {"read": [], "write": []}
+    for e in parsed.get("fs_entries", []):
+        syscall = str(e.get("syscall"))
+        if syscall not in (READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT):
+            continue
+        path = e.get("path") or ""
+        if not wl(path):
+            continue
+        size = _io_bytes(e)
+        iv = _entry_interval_ms(e)
+        if size <= 0 or iv is None:
+            continue
+        kind = "write" if syscall in WRITE_SYSCALLS_STRICT else "read"
+        item = (iv[0], iv[1], size)
+        phase = phase_for_entry(e, phases, tool_calls)
+        role = (
+            role_for_entry(e, tool_calls, phases)
+            if role_for_entry else "(unattributed)"
+        )
+        inf_state = "inference_busy" if _point_in_intervals_ms(iv[1], llm_intervals) else "inference_idle"
+        by_phase[phase][kind].append(item)
+        by_role[role][kind].append(item)
+        by_inference[inf_state][kind].append(item)
+        global_items[kind].append(item)
+
+    phase_wall_s = timeline.get("phase_wall_s") or {}
+    role_wall_s = timeline.get("role_wall_s") or {}
+    run_wall_s = float(timeline.get("wall_s") or 0.0)
+    inference_wall_s = _union_length_ms(llm_intervals) / 1000.0
+    inference_walls = {
+        "inference_busy": inference_wall_s,
+        "inference_idle": max(0.0, run_wall_s - inference_wall_s),
+    }
+
+    def finish(
+        groups: dict[str, dict[str, list[tuple[float, float, int]]]],
+        walls: dict[str, float],
+    ) -> dict[str, Any]:
+        return {
+            name: {
+                "read": _bandwidth_stats(vals.get("read", []), walls.get(name)),
+                "write": _bandwidth_stats(vals.get("write", []), walls.get(name)),
+            }
+            for name, vals in sorted(groups.items())
+        }
+
+    return {
+        "global": {
+            "read": _bandwidth_stats(global_items["read"], run_wall_s),
+            "write": _bandwidth_stats(global_items["write"], run_wall_s),
+        },
+        "by_phase": finish(by_phase, phase_wall_s),
+        "by_role": finish(by_role, role_wall_s),
+        "by_inference_state": finish(by_inference, inference_walls),
+        "caveat": (
+            "syscall duration is application-observed return latency with page cache; "
+            "write may return before durable media, and cache-hit reads need not touch disk. "
+            "Bytes are attributed by syscall end timestamp. Duty cycle is wall-clock "
+            "storage-busy time / group wall-time union, not worker-time share."
+        ),
     }
 
 
@@ -960,7 +1910,10 @@ def write_markdown(trace_dir: Path, metrics: dict[str, Any]) -> None:
 
     iface = metrics.get("interface_mix") or {}
     lines.append(f"- **I/O interface mix**: `{json.dumps(iface, ensure_ascii=False)}`")
-
+    lines.append(
+        f"- **Measured interface layers (uprobe/syscall)**: "
+        f"`{json.dumps(metrics.get('measured_interface_layers'), ensure_ascii=False)}`"
+    )
     reread = metrics.get("reread_attribution") or {}
     ai = reread.get("agent_induced") or {}
     lines.append(
@@ -995,6 +1948,8 @@ def build_metrics(trace_dir: Path, optimal_request_bytes: int) -> dict[str, Any]
     lineage = load_json(trace_dir / "lineage" / "io_summary.json", {})
     artifacts = read_artifacts(trace_dir)
     phases = read_event_phase_index(trace_dir)
+    tool_calls = build_tool_call_map(parsed)
+    timeline = _run_timeline_ms(trace_dir, parsed, phases, tool_calls)
 
     generated_code = trace_dir / "generated_code.jsonl"
     interface_mix = (
@@ -1014,20 +1969,23 @@ def build_metrics(trace_dir: Path, optimal_request_bytes: int) -> dict[str, Any]
             parsed, artifacts, optimal_request_bytes
         ),
         "interface_mix": interface_mix,
-        "interface_byte_mix": compute_interface_byte_mix(parsed),
+        "interface_byte_mix": compute_interface_byte_mix(parsed, artifacts),
+        "measured_interface_layers": compute_measured_interface_layers(parsed, artifacts),
         "namespace": lineage.get("namespace", {}),
-        "sequentiality": compute_sequentiality(parsed),
-        "bytes_ops_by_phase": compute_bytes_ops_by_phase(parsed, phases),
-        "reread_attribution": compute_reread_attribution(parsed, phases),
-        "directory_scan": compute_directory_scan_count(parsed),
+        "sequentiality": compute_sequentiality(parsed, artifacts),
+        "bytes_ops_by_phase": compute_bytes_ops_by_phase(parsed, phases, artifacts),
+        "reread_attribution": compute_reread_attribution(parsed, phases, artifacts),
+        "directory_scan": compute_directory_scan_count(parsed, artifacts),
         "failed_open_stat": compute_failed_open_stat_count(parsed),
         "error_log_reads": compute_error_log_reads(artifacts),
         "state_file_rewrite_frequency": compute_state_file_rewrite_frequency(artifacts),
         # Newly implemented axis metrics (data-derived, no oracle required)
         "access_type_rhwhrw": compute_access_type_rhwhrw(artifacts),          # axis 2
-        "inter_arrival": compute_inter_arrival(parsed),                        # axis 2
-        "io_autocorrelation": compute_io_autocorrelation(parsed),             # axis 6
-        "intensity_phases": compute_intensity_phases(parsed),                 # axis 6
+        "inter_arrival": compute_inter_arrival(parsed, artifacts),             # axis 2
+        "io_autocorrelation": compute_io_autocorrelation(parsed, artifacts),  # axis 6
+        "intensity_phases": compute_intensity_phases(parsed, timeline),       # axis 6
+        "io_vs_inference": compute_io_vs_inference(trace_dir, parsed, artifacts, timeline),
+        "effective_bandwidth": compute_effective_bandwidth(trace_dir, parsed, phases, artifacts, timeline),
     }
     # axis 4: assembled from bytes_ops_by_phase (already computed above) + reuse
     metrics["exploration_overhead"] = compute_exploration_overhead(

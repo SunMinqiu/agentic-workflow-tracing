@@ -93,6 +93,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Forward to main.py (default: none).")
     p.add_argument("--max-workers", type=int, default=1,
                    help="Forward to main.py (default: 1).")
+    p.add_argument("--max-cohorts", type=int, default=0,
+                   help="Cap GEO cohorts processed PER TRAIT (0 = all).  Exported "
+                        "as GENOMAS_MAX_COHORTS for the deploy-patched environment.py "
+                        "so I/O experiments can sweep cohort count as the workload axis.")
     return p
 
 
@@ -137,7 +141,14 @@ def slice_task_info(
             continue
         entry = dict(original[trait])
         if not keep_conditions:
-            entry["conditions"] = []
+            # GenoMAS builds questions = trait × conditions and iterates the
+            # cohort-preprocessing loop INSIDE the per-condition loop.  An EMPTY
+            # conditions list therefore yields ZERO questions → nothing runs
+            # (silent 0 LLM calls).  Keep exactly ONE condition so the matrix
+            # collapses to one task per trait — the original intent — while the
+            # cohort loop still executes.
+            conds = entry.get("conditions") or []
+            entry["conditions"] = conds[:1]
         sliced[trait] = entry
     return sliced, original
 
@@ -242,6 +253,15 @@ def main() -> int:
     # AFTER backing up task_info.json (path was absolute then) so the
     # restore step still finds the right file.
     os.chdir(genomas_repo)
+
+    # Export the per-trait cohort cap BEFORE GenoMAS imports/runs so the
+    # deploy-patched environment.py (which reads GENOMAS_MAX_COHORTS) limits
+    # os.listdir(geo_trait_dir) to the first N cohorts.  0/unset = all cohorts.
+    if args.max_cohorts and args.max_cohorts > 0:
+        os.environ["GENOMAS_MAX_COHORTS"] = str(args.max_cohorts)
+        print(f"[analyze_codebase_genomas] GENOMAS_MAX_COHORTS="
+              f"{args.max_cohorts} (per-trait GEO cohort cap)", file=sys.stderr)
+
     patched = install_global(handler)
     if not patched:
         print(f"[analyze_codebase_genomas] WARNING: no LLM clients patched; "

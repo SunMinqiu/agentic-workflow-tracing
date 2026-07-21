@@ -170,21 +170,31 @@ for entry in "${CELLS[@]}"; do
         LUSTRE_SAMPLER_PID=$!
     fi
 
-    # 3) Start the tracer; wait for ready; CONT the agent.
-    READY_FIFO="$OUT/bcc.ready.fifo"; rm -f "$READY_FIFO"; mkfifo "$READY_FIFO"
+    # 3) Start the privileged tracer; wait until it creates the JSONL stream;
+    # CONT the agent. sudo closes non-standard fds on this CloudLab image, so
+    # the --ready-fd FIFO handshake cannot be used here.
     NET_ARG="--include-net"; [ "${BCC_INCLUDE_NET:-1}" = "1" ] || NET_ARG="--no-include-net"
-    "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
+    sudo -E env "PYTHONPATH=$PYTHONPATH" "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
         --root-pid "$AGENT_PID" --output "$OUT/ebpf_events.log" \
-        $NET_ARG --ready-fd 3 3>"$READY_FIFO" \
+        $NET_ARG \
         >"$OUT/bcc.out" 2>"$OUT/bcc.err" &
     TRACER_PID=$!
-    READY_MSG=""; read -r READY_MSG <"$READY_FIFO" || true; rm -f "$READY_FIFO"
-    [ "$READY_MSG" = "ready" ] || echo "  Warning: tracer not ready; continuing" >&2
+    TRACER_READY=0
+    for _ in $(seq 1 100); do
+        if [ -s "$OUT/ebpf_events.log" ]; then
+            TRACER_READY=1
+            break
+        fi
+        if ! kill -0 "$TRACER_PID" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    [ "$TRACER_READY" = "1" ] || echo "  Warning: tracer not ready; continuing" >&2
     kill -CONT "$AGENT_PID" >/dev/null 2>&1 || true
 
     wait "$AGENT_PID"; EXIT_CODE=$?
-    sudo kill -INT "$TRACER_PID" >/dev/null 2>&1 || true
-    wait "$TRACER_PID" >/dev/null 2>&1 || true
+    stop_tracer "$TRACER_PID"
     if [ -n "$LUSTRE_SAMPLER_PID" ]; then
         kill -INT "$LUSTRE_SAMPLER_PID" >/dev/null 2>&1 || true
         wait "$LUSTRE_SAMPLER_PID" >/dev/null 2>&1 || true
@@ -212,6 +222,7 @@ for ws_out in "$BASE_OUT"/*/; do
         "$POST_PYTHON" -m agent_io_tracing.lineage.analyzer "$ws_out" > "$ws_out/lineage.log" 2>&1
         "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" > "$ws_out/parallelism.log" 2>&1
         "$POST_PYTHON" -m agent_io_tracing.analysis.phase1_metrics "$ws_out" > "$ws_out/phase1_metrics.log" 2>&1
+        "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs . > "$ws_out/per_run_io_char.log" 2>&1
         "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" > "$ws_out/visualize.log" 2>&1
     else
         echo "  Skipping post (parsed.json or pi_events.jsonl missing)"
@@ -233,7 +244,7 @@ def jload(p, d=None):
 cols = ["cell", "axis", "param", "n_traits", "n_cohorts",
         "generated_files", "distinct_files",
         "storage_metadata_ops", "data_ops", "metadata_to_data",
-        "read_bytes", "write_bytes", "file_count_amplification",
+        "read_bytes", "write_bytes",
         "wall_clock_s", "total_llm_s"]
 rows = []
 for d in sorted(base.iterdir()):
@@ -261,7 +272,6 @@ for d in sorted(base.iterdir()):
         ratios.get("data_ops", ""),
         ratios.get("storage_metadata_to_data_ops", ""),
         wl.get("read_bytes", ""), wl.get("write_bytes", ""),
-        opt.get("file_count_amplification", ""),
         par.get("wall_clock_s", ""),
         par.get("total_self_time_s", ""),
     ])

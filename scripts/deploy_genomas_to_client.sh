@@ -248,6 +248,64 @@ PYEOF
 
 # Confirm GenoMAS entry point file is present.
 test -f main.py || { echo "ERROR: GenoMAS main.py missing"; exit 1; }
+
+# --- FreeInference (custom OpenAI-compatible endpoint) model registration ---
+# GenoMAS's utils/llm.py has a CLOSED MODEL_INFO registry; validate_model()
+# rejects any model not in it ("Could not detect a provider").  When a custom
+# OPENAI_BASE_URL + GENOMAS_MODEL are configured, register that model under
+# MODEL_INFO['openai'] so it routes through OpenAIClient, whose AsyncOpenAI is
+# built with NO base_url and therefore auto-reads OPENAI_BASE_URL from env.
+# Idempotent; no-op unless both values are set (i.e. FreeInference mode).
+GENOMAS_MODEL_REG="${GENOMAS_MODEL:-}"
+OPENAI_BASE_REG="${OPENAI_BASE_URL:-}"
+if [ -n "\$OPENAI_BASE_REG" ] && [ -n "\$GENOMAS_MODEL_REG" ]; then
+  .venv/bin/python - "\$GENOMAS_MODEL_REG" << 'PYEOF'
+import sys
+model = sys.argv[1]
+path = "utils/llm.py"
+src = open(path).read()
+if f"'{model}'" in src:
+    print(f"  [freeinference] model {model} already in MODEL_INFO; skip")
+else:
+    anchor = "    'openai': {\n"
+    if anchor in src:
+        entry = (f"        '{model}': {{'input_price': 0.0, 'output_price': 0.0}},"
+                 f"  # FreeInference (OpenAI-compatible via OPENAI_BASE_URL)\n")
+        open(path, "w").write(src.replace(anchor, anchor + entry, 1))
+        print(f"  [freeinference] registered {model} under MODEL_INFO['openai']")
+    else:
+        print("  [freeinference] WARNING: MODEL_INFO['openai'] anchor not found; skipped")
+PYEOF
+fi
+
+# --- cohort-count knob for I/O experiments (GENOMAS_MAX_COHORTS) ---
+# GenoMAS's environment.py lists ALL GEO cohorts per trait with no cap, so the
+# workload (and its I/O) can't be swept by cohort count.  Patch the enumeration
+# to honour GENOMAS_MAX_COHORTS (0/unset = all).  Idempotent.
+.venv/bin/python - << 'PYEOF'
+path = "environment.py"
+src = open(path).read()
+if "GENOMAS_MAX_COHORTS" in src:
+    print("  [max-cohorts] environment.py already patched; skip")
+else:
+    needle = "cohorts = os.listdir(geo_trait_dir) + ['TCGA']"
+    idx = src.find(needle)
+    if idx == -1:
+        print("  [max-cohorts] WARNING: cohort-listing line not found; skipped")
+    else:
+        line_start = src.rfind("\n", 0, idx) + 1
+        indent = src[line_start:idx]
+        block = (
+            f"{indent}_mc = int(os.environ.get('GENOMAS_MAX_COHORTS', '0') or '0')\n"
+            f"{indent}if _mc > 0:\n"
+            f"{indent}    cohorts = sorted(os.listdir(geo_trait_dir))[:_mc]\n"
+            f"{indent}else:\n"
+            f"{indent}    cohorts = os.listdir(geo_trait_dir) + ['TCGA']"
+        )
+        src = src[:line_start] + block + src[idx + len(needle):]
+        open(path, "w").write(src)
+        print("  [max-cohorts] patched environment.py cohort enumeration")
+PYEOF
 .venv/bin/python -c "from utils.config import setup_arg_parser; setup_arg_parser().parse_args(['--version','probe','--model','gpt-5-mini-2025-08-07']); print('CLI parser OK')"
 REMOTE_UV
 
@@ -260,6 +318,22 @@ REMOTE_UV
 #       `sudo -E` (HOME=/root) doesn't break AGENT_PYTHON resolution.
 # ----------------------------------------------------------------
 REMOTE_HOME=$(ssh -T "$SSH_USER@$CLIENT_NODE" 'echo $HOME')
+
+# FreeInference / any OpenAI-compatible endpoint (optional).  Emitted into both
+# env files only when OPENAI_BASE_URL is set locally (e.g. cloudlab_env.sh).
+# NOTE: GenoMAS uses a custom _1-suffixed key convention in its own LLM client;
+# whether that client honours OPENAI_BASE_URL must be confirmed on the client
+# (test one cell) — writing the var is harmless but may need a GenoMAS-side tweak.
+if [ -n "${OPENAI_BASE_URL:-}" ]; then
+    OPENAI_BASE_BLOCK="export OPENAI_BASE_URL=\"${OPENAI_BASE_URL}\"
+export OPENAI_API_BASE=\"${OPENAI_API_BASE:-$OPENAI_BASE_URL}\""
+    # ~/GenoMAS/.env is a plain dotenv (no `export` keyword needed).
+    OPENAI_BASE_BLOCK_DOTENV="OPENAI_BASE_URL=${OPENAI_BASE_URL}
+OPENAI_API_BASE=${OPENAI_API_BASE:-$OPENAI_BASE_URL}"
+else
+    OPENAI_BASE_BLOCK="# No custom OPENAI_BASE_URL set; using provider default (api.openai.com)."
+    OPENAI_BASE_BLOCK_DOTENV="# No custom OPENAI_BASE_URL set; using provider default (api.openai.com)."
+fi
 
 echo "==> [3a/5] Writing ${REMOTE_HOME}/$REMOTE_GENOMAS_DIR/.env"
 ssh "$SSH_USER@$CLIENT_NODE" \
@@ -282,6 +356,9 @@ GOOGLE_API_KEY_1=${GOOGLE_API_KEY:-}
 
 # --- Novita (optional; needed for --use-api with open-source models) ---
 NOVITA_API_KEY_1=${NOVITA_API_KEY:-}
+
+# --- Custom OpenAI-compatible endpoint (e.g. FreeInference), if set ---
+${OPENAI_BASE_BLOCK_DOTENV}
 REMOTE_GENOMAS_ENV
 
 echo "==> [3b/5] Writing ${REMOTE_HOME}/$REMOTE_HARNESS_NAME/.env.genomas"
@@ -296,6 +373,7 @@ export OPENAI_ORGANIZATION_1="${OPENAI_ORGANIZATION:-}"
 export ANTHROPIC_API_KEY_1="${ANTHROPIC_API_KEY:-}"
 export GOOGLE_API_KEY_1="${GOOGLE_API_KEY:-}"
 export NOVITA_API_KEY_1="${NOVITA_API_KEY:-}"
+${OPENAI_BASE_BLOCK}
 
 # Prevent root-owned __pycache__ files under sudo -E.
 export PYTHONDONTWRITEBYTECODE=1
@@ -307,7 +385,9 @@ export AGENT_PYTHON="${REMOTE_HOME}/$REMOTE_GENOMAS_DIR/.venv/bin/python"
 export POST_PYTHON="${REMOTE_HOME}/$REMOTE_GENOMAS_DIR/.venv/bin/python"
 
 # Defaults for the workload matrix (Phase 4).
-export GENOMAS_MODEL="gpt-5-mini-2025-08-07"
+# Override GENOMAS_MODEL in the local env (cloudlab_env.sh) to switch providers,
+# e.g. export GENOMAS_MODEL="openai/glm-5.1" for FreeInference.
+export GENOMAS_MODEL="${GENOMAS_MODEL:-gpt-5-mini-2025-08-07}"
 export DATA_DIR="${REMOTE_DATA_DIR}"
 REMOTE_TRACE_ENV
 

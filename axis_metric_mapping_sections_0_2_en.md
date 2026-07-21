@@ -1,132 +1,70 @@
 # Agentic Scientific Workflow I/O Characterization
 ## Structural-Difference Axis × Metric × Implementation Status
 
-This document extracts **Section 0 (Foundations)** and **Section 2 (Per-Axis Detail Tables)**
-from the mapping table, translated to English. The per-axis tables add an
-**Implemented?** column reflecting the current state of this repository's code.
+This document extracts **Section 0 (Foundations)** and **Section 2 (Per-Axis Detail Tables)** from the mapping table, translated to English. The per-axis tables add an **Implemented?** column reflecting the current state of this repository's code.
 
 ---
 
 ## 0. Foundations: Two Premise Definitions
 
-### 0.1 Where the six structural-difference axes come from
+### 0.1 Where the five structural-difference axes come from
 
-These axes are **not** reverse-engineered from a literature metric table ("what can we
-measure?"). They are derived from **the research question itself**: an agentic workflow is,
-by definition, one where the decision-maker has been swapped from a static scheduler to an
-autonomous agent. Once you think through *in what respects that swap changes execution*, the
-categories of anomaly become finite and enumerable. The six axes are that enumeration:
+These axes are **not** reverse-engineered from a literature metric table ("what can we measure?"). They are derived from **the research question itself**: an agentic workflow is, by definition, one where the decision-maker has been swapped from a static scheduler to an autonomous agent. Once you think through *in what respects that swap changes execution*, the categories of anomaly become finite and enumerable. The five axes are that enumeration:
 
 | # | Axis | Structural difference: agent vs. traditional workflow |
 |---|---|---|
-| 1 | Runtime decision timing | Whole DAG known before submission → decide one step at a time |
-| 2 | Context-limited state persistence | In-memory state never lost → context window gets truncated / summarized |
-| 3 | Generated-code I/O interface layer | Domain expert hand-writes format-specific I/O → agent-generated generic code |
-| 4 | Exploratory branching and backtracking | Run-to-completion DAG → explore-abandon-retry |
-| 5 | Reasoning-step/data-granularity alignment | Tasks split by data size → LLM subjectively splits into reasoning steps |
-| 6 | Uncoordinated agent concurrency | Scheduler has unified view of resources → many independent LLM calls, none aware of the others |
+| 1 | Context-limited state persistence | In-memory state never lost → context window gets truncated / summarized |
+| 2 | Measured I/O interface layer | Domain expert hand-writes format-specific I/O → agent-generated generic code |
+| 3 | Exploratory branching and backtracking | Run-to-completion DAG → explore-abandon-retry |
+| 4 | Reasoning-step/data-granularity alignment | Tasks split by data size → LLM subjectively splits into reasoning steps |
+| 5 | I/O concurrency (uncoordinated across agents) | Scheduler coordinates I/O with a global resource view → concurrent I/O from mutually-unaware workers / LLM calls; **the primary target is measured I/O concurrency and burstiness, with workflow-level parallelism secondary** |
 
 ### 0.2 Oracle definition (foundation for the whole table)
 
-> **Oracle = the deterministic script distilled from a successful agent trace after
-> "static de-duplication."**
+> **Oracle = the deterministic script distilled from a successful agent trace after "static de-duplication."**
 
-**What "static de-duplication" means:** for the same file, same byte range, with no write
-in between two accesses, collapse the repeated reads into one; drop the I/O produced by
-exploratory branches that were abandoned; keep the deterministic I/O sequence the task
-genuinely requires.
+**What "static de-duplication" means:** for the same file, same byte range, with no write in between two accesses, collapse the repeated reads into one; drop the I/O produced by exploratory branches that were abandoned; keep the deterministic I/O sequence the task genuinely requires.
 
-**The Oracle's role:** it processes **the same data and completes the same task** as the
-agent. Therefore the "I/O intrinsically required by the data / the task" is *equal on both
-sides and cancels out*. **The difference between the agent version and the oracle version is
-precisely the overhead unique to the agent's runtime adaptivity.**
+**The Oracle's role:** it processes **the same data and completes the same task** as the agent. Therefore the "I/O intrinsically required by the data / the task" is *equal on both sides and cancels out*. **The difference between the agent version and the oracle version is precisely the overhead unique to the agent's runtime adaptivity.**
 
-**Attribution principle (runs through the whole table):** never attribute a *single* access
-as "agent-caused vs. task-caused" (you can't tell on a single access, and you shouldn't try);
-attribute only on the **difference between the agent's distribution/count and the oracle's
-distribution/count**. The data-driven part is subtracted away by the oracle; what remains is
-the agent's.
+**Attribution principle (runs through the whole table):** never attribute a *single* access as "agent-caused vs. task-caused" (you can't tell on a single access, and you shouldn't try); attribute only on the **difference between the agent's distribution/count and the oracle's distribution/count**. The data-driven part is subtracted away by the oracle; what remains is the agent's.
 
-**Known weakness (to state honestly when writing):** the oracle is distilled from a
-*successful* agent run, not a theoretical optimum. What we measure is "the cost of runtime
-adaptivity"; we do **not** claim "how far from optimal." Static de-duplication gives the
-oracle some normativity (it is not a verbatim copy of the agent's I/O), but it is still a
-baseline, not a lower bound.
+**Known weakness (to state honestly when writing):** the oracle is distilled from a *successful* agent run, not a theoretical optimum. What we measure is "the cost of runtime adaptivity"; we do **not** claim "how far from optimal." Static de-duplication gives the oracle some normativity (it is not a verbatim copy of the agent's I/O), but it is still a baseline, not a lower bound.
 
 ### 0.3 Analysis-pitfall declaration (not a metric — a caveat that must be stated when doing makespan/throughput decomposition)
 
-> **The "high end-stage throughput masks the upstream bottleneck" pitfall:** when
-> decomposing overall I/O efficiency or makespan, you must not look only at the throughput
-> numbers of the end-stage task, or you will mistakenly judge the whole thing efficient.
+> **The "high end-stage throughput masks the upstream bottleneck" pitfall:** when decomposing overall I/O efficiency or makespan, you must not look only at the throughput numbers of the end-stage task, or you will mistakenly judge the whole thing efficient.
 
-Tang IPDPS'26 Finding 13 (Fig. 5: in DeepDriveMD the train→final group writes
-checkpoints/embeddings at 2.4 GB/s, but the upstream n-1 sim→agg / sim→train groups have
-much lower throughput) and Raj CPU-Centric's "high end-stage GPU throughput masks the
-CPU-side tool-execution bottleneck" are **two independent appearances of the same analysis
-framework** — one in a traditional HPC workflow, one in agentic serving — cross-validating
-the generality of this pitfall.
+Tang IPDPS'26 Finding 13 (Fig. 5: in DeepDriveMD the train→final group writes checkpoints/embeddings at 2.4 GB/s, but the upstream n-1 sim→agg / sim→train groups have much lower throughput) and Raj CPU-Centric's "high end-stage GPU throughput masks the CPU-side tool-execution bottleneck" are **two independent appearances of the same analysis framework** — one in a traditional HPC workflow, one in agentic serving — cross-validating the generality of this pitfall.
 
-Constraint for this project: v3's 9th category "makespan decomposition (compute time vs. I/O
-wait time)" must add this caveat — decompose segment by segment per agent / reasoning phase,
-rather than reporting only end-stage aggregate throughput.
+Constraint for this project: v3's 9th category "makespan decomposition (compute time vs. I/O wait time)" must add this caveat — decompose segment by segment per agent / reasoning phase, rather than reporting only end-stage aggregate throughput.
 
 ### 0.4 Oracle qualification of the Producer-Consumer taxonomy (preventing misuse of Tang's four-way classification)
 
-Tang IPDPS'26's P-C four-way classification (1-1 / 1-n / n-1 / n-n, Table I) **presupposes a
-static DAG** (producer and consumer known in advance). Agentic workflows **have no fixed
-DAG**, so this taxonomy cannot be transplanted directly.
+Tang IPDPS'26's P-C four-way classification (1-1 / 1-n / n-1 / n-n, Table I) **presupposes a static DAG** (producer and consumer known in advance). Agentic workflows **have no fixed DAG**, so this taxonomy cannot be transplanted directly.
 
-> **Qualification: the P-C taxonomy has explanatory power only relative to an oracle
-> baseline.** That is, measure the deviation between "the oracle version's P-C relationships"
-> and "the agent version's P-C relationships" (fan-in/fan-out divergence), rather than
-> treating Tang's four-way classification as an inherent static property of the agent
-> workflow.
+> **Qualification: the P-C taxonomy has explanatory power only relative to an oracle baseline.** That is, measure the deviation between "the oracle version's P-C relationships" and "the agent version's P-C relationships" (fan-in/fan-out divergence), rather than treating Tang's four-way classification as an inherent static property of the agent workflow.
 
-When citing Tang's P-C formalization in writing/modeling, it must be anchored under this
-qualification; otherwise it implicitly assumes "the agent workflow has a static DAG," which
-conflicts with our premise.
+When citing Tang's P-C formalization in writing/modeling, it must be anchored under this qualification; otherwise it implicitly assumes "the agent workflow has a static DAG," which conflicts with our premise.
 
-### 0.5 Relationship between this project's six axes and Raj's three axes (heading off a reviewer's challenge that the two classifications conflict)
+### 0.5 Relationship between this project's five axes and Raj's three axes (heading off a reviewer's challenge that the two classifications conflict)
 
-Raj CPU-Centric classifies agent workloads along three orthogonal compile-time axes:
-**orchestrator (LLM / Host) × path (static / dynamic) × repetitiveness (single-step /
-multi-step)** (Fig. 1). This project's six axes are "in what respects the agent deviates from
-a traditional workflow." Their relationship is explicitly **orthogonal, a division of labor,
-non-conflicting**:
+Raj CPU-Centric classifies agent workloads along three orthogonal compile-time axes: **orchestrator (LLM / Host) × path (static / dynamic) × repetitiveness (single-step / multi-step)** (Fig. 1). This project's five axes are "in what respects the agent deviates from a traditional workflow." Their relationship is explicitly **orthogonal, a division of labor, non-conflicting**:
 
-| | Raj's three axes | This project's six axes |
+| | Raj's three axes | This project's five axes |
 |---|---|---|
 | Question answered | what the agent **looks like** (workload classification) | what **I/O anomalies** the agent commits (anomaly-source classification) |
-| Role in this project | **benchmark sampling frame** — ensures the measured agents cover different quadrants (e.g., dynamic-path × multi-step vs. static-path × single-step) | **measurement frame** — quantifies each agent's deviation along the six axes |
+| Role in this project | **benchmark sampling frame** — ensures the measured agents cover different quadrants (e.g., dynamic-path × multi-step vs. static-path × single-step) | **measurement frame** — quantifies each agent's deviation along the five axes |
 
-**Joint proposition that can be stated:** agents in different Raj quadrants deviate to
-different degrees along this project's six axes (expected: dynamic-path × multi-step agents
-deviate most on Axis 1 decision timing and Axis 4 branching/backtracking). This way the two
-classifications cite each other without clashing, and give this project a testable
-hypothesis.
-
-Note: Raj's "dynamic path" conceptually overlaps with this project's Axis 1 "decision
-timing" (dynamic path ≈ decide one step at a time), but Raj uses it only as a workload label
-and never measures its I/O consequences; this project's Axis 1 is what measures the
-consequences — overlapping but not redundant.
+**Joint proposition that can be stated:** agents in different Raj quadrants deviate to different degrees along this project's five axes (expected: dynamic-path × multi-step agents deviate most on branching/backtracking, state persistence, and concurrency). This way the two classifications cite each other without clashing, and give this project a testable hypothesis.
 
 ---
 
 ## 2. Per-Axis Detail Tables: Metric × Approach × Literature Source × Oracle Role × Implemented?
 
-**Legend for the Implemented? column:** ✅ implemented · ⚠️ partially implemented · ❌ not
-implemented. Per the working convention, a metric whose **only** missing piece is the oracle
-comparison is counted as ✅ implemented (the oracle gap is not held against it); rows marked
-⚠️ have a *non-oracle* gap.
+**Legend for the Implemented? column:** ✅ implemented · ⚠️ partially implemented · ❌ not implemented. Per the working convention, a metric whose **only** missing piece is the oracle comparison is counted as ✅ implemented (the oracle gap is not held against it); rows marked ⚠️ have a *non-oracle* gap.
 
-### Axis 1 · Runtime decision timing
-
-| Metric | Approach | Literature source (fig./table) | Oracle role | Implemented? |
-|---|---|---|---|---|
-| **Non-prefetchable access fraction:** fraction of accesses where the next file to be read was decided by the agent only one step (or within N steps) before the read happened | Fully custom | No direct match. Contrast reference: Patel FAST'20 mitigation "transparently prefetch files expected to be accessed soon into a burst buffer" (Finding 3, Fig. 5a) — traditional workflows can prefetch precisely *because* the DAG is known; the missing capability this metric quantifies | No oracle subtraction needed, but the oracle supplies "the set of accesses that could have been prefetched had the DAG been known" as the denominator reference | ❌ Not implemented. Infrastructure is in place (tool-call time windows + `fs_entries` timestamps + `generated_code` recording access paths), but no metric computes the fraction of "next-read file decided within N steps before the read"; missing the prefetchability criterion and the denominator set. |
-| **Decision-to-access lead-time distribution:** the time/step gap from "target path fixed by the agent" to "actual I/O occurs" | Fully custom | None | Compared against the oracle: in the oracle script every access has "infinite" lead time (full foreknowledge); the agent's finite lead-time distribution is the deviation | ❌ Not implemented. Lead time is computable from existing tool-call windows and fs timestamps, but no metric produces it. |
-
-### Axis 2 · Context-limited state persistence (rereads)
+### Axis 1 · Context-limited state persistence (rereads)
 
 | Metric | Approach | Literature source (fig./table) | Oracle role | Implemented? |
 |---|---|---|---|---|
@@ -134,29 +72,30 @@ comparison is counted as ✅ implemented (the oracle gap is not held against it)
 | **RH/WH/RW file classification:** partition files into read-heavy / write-heavy / read-write by read/write volume | Borrow directly (as a descriptive dimension) | Patel FAST'20 Fig. 3a (22% RH / 7% WH / 71% RW, Finding 1) | Descriptive, no oracle needed | ✅ Implemented. `compute_access_type_rhwhrw` splits files by read/write byte volume via `read_share = rb/(rb+wb)` (RH ≥ 2/3, WH ≤ 1/3, RW otherwise), reporting counts/pct/bytes. Measured: GenoMAS 37.7% RH / 59.4% WH / 2.8% RW vs. ChemGraph 54.7 / 4.0 / 41.3 — already separates the two systems. |
 | **Amnesiac-reread volume (core, custom):** repeated reads where file content/mtime is unchanged between two reads — the extra count and bytes beyond the oracle version | Borrow inter-arrival tool + custom "did content change" criterion + oracle subtraction | Scaffolding borrows Patel FAST'20 Fig. 5b (distribution of consecutive same-type run counts, producer-consumer asymmetry, Finding 4); but "zero content change between two reads" as a criterion has no literature match and must be built | **Core.** Attribution is not per access but on "agent reads file N times − oracle reads same file M times = the excess N−M is agent amnesia" | ⚠️ Partially implemented. Done: `phase1_metrics.compute_reread_attribution` deduplicates by `(path, tool_call_id, fd)` then splits rereads into agent-induced (`same_step_reopen`, `reread_after_backtrack`) vs. residual cross-stage reuse. Still missing (a non-oracle gap): the "content/mtime unchanged between two reads" criterion is not yet implemented — currently proxied by the `action_unit_backtrack` phase and dependent on GenoMAS-specific tagging. |
 | **Read amplification** (logical read bytes / physically required bytes) | Borrow tool, redefine + oracle subtraction | Patel FAST'20 Fig. 10a/b (data-volume CoV only 12% but I/O-time CoV reaches 39%, up to 68% for RH files, Finding 10) as a "cross-run stability" reference | The absolute read-amp value cannot be attributed; agent read amp − oracle read amp is the agent's excess | ✅ Implemented (the only thing not done is the oracle subtraction, which by convention is not counted as a gap). lineage `read_amplification` = total read bytes / `true_size` (per file); `build_reuse_summary` `read_reuse_factor` = total reads / unique read bytes. |
-| **Directory rescans:** repeated `getdents`/directory listings caused by state not being retained across steps | Borrow metadata-reuse counting, redefine | Patel FAST'20 inter-arrival/reuse tooling is the closest measurement precedent; the mechanism here is agent state loss rather than normal workflow reuse | Descriptive unless compared against oracle/stateful baseline | ✅ Implemented. `compute_directory_scan_count` reports total scans, unique scanned directories, rescanned directories, and top rescanned paths. Moved to Axis 2 because it measures state/context persistence rather than decision timing. |
+| **Directory rescans:** repeated `getdents`/directory listings caused by state not being retained across steps | Borrow metadata-reuse counting, redefine | Patel FAST'20 inter-arrival/reuse tooling is the closest measurement precedent; the mechanism here is agent state loss rather than normal workflow reuse | Descriptive unless compared against oracle/stateful baseline | ✅ Implemented. `compute_directory_scan_count` reports total scans, unique scanned directories, rescanned directories, `scans_per_dir_hist`, and `p95_scans_per_dir`. |
+| **State-file rewrite frequency:** rewrite count of small coordination/progress-state files (cohort_info / completed_tasks / *_state.json / manifest / .lock), reflecting non-persistent in-memory state pushed into external files and read-modify-written per task | Repurpose reuse counting | No direct match; per-task rewrite is a symptom of externalized agent state | Descriptive; high n_writes relative to the number of logical tasks is a read-modify-write-per-task misconfiguration candidate; attributing the excess needs an oracle | ✅ Implemented. `compute_state_file_rewrite_frequency` matches `STATE_FILE_PATH_HINTS` and reports state_shaped_files / total_writes / per-file n_writes/n_reads. Hangs on Axis 1 (state persistence): these external state files are rewritten repeatedly precisely because in-memory state gets truncated/lost. |
 
-### Axis 3 · Generated-code I/O interface layer
+### Axis 2 · Measured I/O interface layer
 
 | Metric | Approach | Literature source (fig./table) | Oracle role | Implemented? |
 |---|---|---|---|---|
 | **I/O interface-type distribution** (POSIX / MPI-IO / STDIO / high-level library) share within the workflow | Borrow directly | Bez HPDC'22 Table 6 (on Summit SCNL, STDIO is 4.37× POSIX and 200×+ MPI-IO); Bez survey Figs. 13/14 and interface-share stats (MPI-IO 57.53% / POSIX 47.26% / STDIO 3.42%); Patel FAST'20 Figs. 8a–c (per-run per-file transfer volume by interface and cross-rank stddev) | Descriptive, no oracle needed | ⚠️ Partially implemented. Done: `io_api_classifier` AST-classifies agent-generated code into stdio / posix_raw / structured / mpiio / vector_index, aggregating `layer_exec_counts`, `pct_stdio_only`, `pct_structured_any`; this is static, from generated source — not measured syscall bytes. Phase A now adds libc `fread/fwrite` uprobes plus existing read/write syscalls for a measured STDIO/POSIX byte estimate. Still missing: no MPI-IO byte scenario in current traces. |
 | **Performance consequence of interface choice:** read/write throughput of different interfaces at the same transfer size | Borrow directly (as the quantitative basis for "how costly is the wrong interface") | Bez HPDC'22 Figs. 11a/b, 12a/b (POSIX beats STDIO across the board, up to 40× in the 100 GB–1 TB range, 3× for small files) | Descriptive | ❌ Not implemented. No feature measures throughput/cost by interface. |
-| **Logical-to-physical amplification factor:** tool-call-layer logical read/write bytes / subprocess-layer physical read/write bytes | Borrow tool (cross-layer reshape idea) + custom layer definition | Bez survey Figs. 15/16 (an app-layer 4 MB contiguous HDF5 request is split by MPI-IO collective into many 1 MB POSIX requests, becoming non-contiguous due to stripe config; context is lost layer by layer) — direct theoretical support for "pattern reshapes per layer" | Partial. The amplification factor itself is independently measurable; "should it have been amplified" needs an oracle comparison | ⚠️ Partially implemented. Done: `compute_analytical_optimum`'s write_call / file_count / metadata_op amplification, plus lineage `read_amplification`. Still missing: the "tool-call-layer logical bytes / subprocess-layer physical bytes" cross-layer ratio is not broken out separately; layering relies on the coarse `io_layers` tag in `generated_code`. |
+| **Logical-to-physical amplification factor:** tool-call-layer logical read/write bytes / subprocess-layer physical read/write bytes | Borrow tool (cross-layer reshape idea) + custom layer definition | Bez survey Figs. 15/16 (an app-layer 4 MB contiguous HDF5 request is split by MPI-IO collective into many 1 MB POSIX requests, becoming non-contiguous due to stripe config; context is lost layer by layer) — direct theoretical support for "pattern reshapes per layer" | Partial. The amplification factor itself is independently measurable; "should it have been amplified" needs an oracle comparison | ❌ Not implemented. The "tool-call-layer logical bytes / subprocess-layer physical bytes" cross-layer ratio is not broken out; the old file-count/metadata-op pseudo-denominators have been deleted to avoid misreporting. |
 | **Interface hop count:** number of software-stack layers a single logical access traverses | Custom, from the "reshape per layer" idea | Bez survey Figs. 15/16 (same as above; the argument requires distinguishing local/global/system-wide scope and stating which layer a pattern is described at) | Descriptive | ❌ Largely not implemented. `generated_code` records the `io_layers` each snippet touches (the set of layers), but that is not "the number of software-stack layers one logical access traverses"; no local/global/system-wide scope characterization. |
 | **Interface mismatch (core, custom):** the gap between the interface the agent actually chose vs. the interface the oracle version should have used (e.g., agent uses generic open/read to read a whole file; oracle uses an HDF5 slice for an incremental read) | Fully custom + oracle comparison | No direct match. In traditional research the interface is chosen by a human (the expert knows to use collective I/O); there is no "should have chosen but didn't" comparison | **Core.** The oracle script represents "the interface a domain expert / the de-duplicated version should use"; the agent's interface deviation from it is the mismatch | ✅ Implemented (the "interface it should have used" is judged by the H1 heuristic; the oracle normative baseline is missing but by convention not counted as a gap). `io_api_classifier`'s H1 criterion (using stdio where structured was appropriate) + verdicts compared against HPC expectations; `pct_stdio_only` / `pct_structured_any` are the mismatch signals. |
 | **Format-layout alignment mismatch (core, custom — one layer deeper than interface mismatch):** even when the agent picks the right structured format (e.g., HDF5), whether its access pattern aligns with the file's internal layout (chunk size / chunked vs. contiguous) | Borrow tool + oracle comparison | Tang IPDPS'26 Finding 14 (Fig. 5: train achieves markedly higher HDF5 throughput than infer because its access pattern aligns better with the chunk layout; PtychoNN/Montage likewise) + Case Study c (HDF5 chunked→contiguous tuning, 1.9× speedup under high concurrency, Table VI) — **direct proof that "picking the right format ≠ efficient; the layout must also align with the access pattern"** | **Core.** Answers the leftover gap in "interface mismatch": the agent's mismatch is not only choosing the wrong interface but also mis-configuring the layout after choosing the right format. The oracle represents the version whose access pattern and layout are aligned | ❌ Not implemented. `io_api_classifier` detects the structured layer (h5py / `create_dataset`, etc.) but does not inspect HDF5 chunk configuration (chunk size, chunked vs. contiguous) nor compare it against the access stride; no layout-alignment metric exists. Also, the real traces (GenoMAS, etc.) use csv/json rather than HDF5, so there is no chunked-format scenario to measure yet. |
 
-### Axis 4 · Exploratory branching and backtracking
+### Axis 3 · Exploratory branching and backtracking
 
 | Metric | Approach | Literature source (fig./table) | Oracle role | Implemented? |
 |---|---|---|---|---|
 | **Exploratory-I/O overhead ratio (core, custom):** read/write bytes produced by abandoned exploratory branches / total read/write bytes | Fully custom + oracle subtraction | None. Traditional workflows have no "give up halfway and restart"; in Bharathi the SIPHT Patser job count varies with input (Fig. 6/Table 5), but that is a **deterministic fan-out driven by data size, not exploratory backtracking**, and must be clearly distinguished in the text | **Core.** The oracle drops abandoned branches during distillation; agent total − oracle = exploration overhead | ❌ Not implemented as a finding. Current raw `dead_write` cannot distinguish final outputs from exploratory waste without an oracle; it must be computed by oracle subtraction. The old report panel has been removed to avoid presenting this as a standalone finding. |
-| **Survival rate of exploratory writes:** fraction of intermediate files the agent wrote but that were never read by any later step | Fully custom | No direct match. Can reference Patel SC'19 Fig. 13 (~20% of opened files are never closed) as a methodological precedent that "resource leakage is quantifiable," but the mechanism differs (that is open/close leakage, not abandoned exploratory artifacts) | The oracle contains none of these abandoned artifacts, so it is naturally 0; the agent-side fraction is the deviation | ⚠️ Raw metric only. lineage `reuse_class = dead_write` and `dead_write_pct_of_write` exist, but raw dead writes include final outputs and are biased high until final outputs are removed / oracle subtraction is applied. |
-| **Failed open/stat probes:** failed existence checks while exploring candidate paths | Fully custom descriptive signal | No direct match; it is a branch/search symptom rather than a traditional workflow metric | Descriptive; oracle can subtract task-intrinsic missing checks if needed | ✅ Implemented. `compute_failed_open_stat_count` reports failed open/stat/access calls by syscall and path. Moved to Axis 4 because it is an exploration/backtracking symptom, not a decision-timing metric. |
+| **Failed open/stat probes:** failed existence checks while exploring candidate paths | Fully custom descriptive signal | No direct match; it is a branch/search symptom rather than a traditional workflow metric | Descriptive; oracle can subtract task-intrinsic missing checks if needed | ✅ Implemented. `compute_failed_open_stat_count` reports the agent-level `total_failed` + a normalized `failed_rate` (denominator = agent-level open/stat/access attempts) + by-syscall/top paths. **CPython import probes are filtered out** (every `import` stats/opens each sys.path candidate and almost all return ENOENT — interpreter noise, not agent candidate-path probing), with `import_probe_failed_excluded` / `total_failed_raw` exposed for transparency. |
+| **Error-log reads:** the agent reading back files lineage classified as `logs` (its own / the workflow's log output) — a canonical exploration/debug signal | Fully custom descriptive signal | No direct match; a branch/search-debug symptom, not a traditional workflow metric | Descriptive; a successful oracle script needs no log read-back to diagnose, so the agent-side read-back volume is the deviation | ✅ Implemented. `compute_error_log_reads` reports log_files / log_files_ever_read / total_reads / total_read_bytes. |
 | **Retry-count distribution:** how many times the same reasoning goal is re-executed (e.g., `RunFinalInterpretation` called twice in a SciLink trace) | Fully custom | None | In the oracle each goal executes once; the agent's excess is exploratory retry | ⚠️ Partially implemented. Done: the `action_unit_backtrack` phase exists and `bytes_ops_by_phase` counts its volume. Still missing: no direct output of the "same reasoning goal re-executed N times" distribution; the generic count for cases like SciLink's `RunFinalInterpretation`-called-twice is not implemented. |
 
-### Axis 5 · Reasoning-step/data-granularity alignment
+### Axis 4 · Reasoning-step/data-granularity alignment
 
 | Metric | Approach | Literature source (fig./table) | Oracle role | Implemented? |
 |---|---|---|---|---|
@@ -164,13 +103,15 @@ comparison is counted as ✅ implemented (the oracle gap is not held against it)
 | **Small-I/O aggregation potential:** the fixed overhead that could be saved by merging the agent's fragmented accesses to the oracle's boundaries | Borrow tool, repurpose | Nawaz Figs. 4/5 (mConcatFit reads 6173 small files averaging 0.3 KB, 22–29% of makespan); mitigation "bulk-transfer merges small-file transfer requests" is directly the "how much could alignment save" estimation method; Bez HPDC'22 Fig. 3 (97% of reads / 99% of writes are files < 1 GB) | The oracle supplies the merged target boundaries | ✅ Implemented. `compute_analytical_optimum` now emits both write-side `write_call_amplification` and read-side `read_call_amplification` (actual/optimum, 4 MB request boundary). Measured on GenoMAS p5: read side 44.4× (3689 read calls vs. optimal 83). |
 | **Fragmentation attribution label:** among fragmented accesses, the ratio originating from reasoning-step boundaries (agent) vs. from the data format itself (task) | Uses oracle subtraction to realize "don't attribute on a single access" | No direct match | **Core method.** A single 4 KB read cannot be attributed; agent request-size distribution − oracle request-size distribution — the difference is the fragmentation caused by reasoning-step boundaries | ✅ Implemented (reuses the agent distribution from `compute_request_size_cdf`; this metric's only gap is subtracting the oracle distribution, which by convention is not counted). |
 
-### Axis 6 · Uncoordinated agent concurrency
+### Axis 5 · I/O concurrency (uncoordinated across agents)
+
+**This axis is primarily about *measured I/O concurrency*, with workflow / LLM-call parallelism as secondary background.** The primary metrics are `io_busy_workers` (how many workers are I/O-busy at once), I/O read/write autocorrelation, and high/low-intensity phase segmentation — they quantify how I/O is concurrent and bursty in time. `workflow concurrency (opportunity)`, `role_io_attribution`, and the interference redefinition are the secondary dimension, explaining "who is running concurrently and why it is uncoordinated" — they are not the measurement focus of this axis.
 
 | Metric | Approach | Literature source (fig./table) | Oracle role | Implemented? |
 |---|---|---|---|---|
-| **I/O read/write autocorrelation** (1/5/25-minute windows, multiple lags) + read-write cross-correlation | Borrow directly | Patel SC'19 Figs. 9a–c (autocorrelation significant at ≥5-min windows, weak at 1-min; read-write cross-correlation weak throughout) | Descriptive, no oracle needed | ✅ Implemented. `compute_io_autocorrelation` produces read/write lag-1–3 autocorrelation at 1/5/25-min windows plus lag-0 read-write cross-correlation. Note: short traces (e.g. 16 min) leave too few bins in the 5/25-min windows to be stable; a longer run is needed. |
-| **I/O parallelism CDF:** cluster size of simultaneously I/O-busy worker units | Borrow directly | Patel SC'19 Figs. 11a/b (mean parallelism only 5.58 read / 5.93 write, >85% of cases use <10 OSTs out of 248 available); Table 1 (write parallelism 16%–240% higher than read in high-intensity phases) | Descriptive | ✅ Implemented. `parallelism.active_degree` now has `io_busy_workers`, computed from overlapping read/write-family syscall intervals and libc `fread/fwrite` probes when present. The previous semantic-event degree remains but is renamed **workflow concurrency (opportunity)** because it measures available overlap, not measured I/O concurrency. |
-| **High/low-intensity I/O phase segmentation** (top-25% / bottom-25% quantiles) + phase length and gaps | Borrow directly | Patel SC'19 Fig. 7 (read phases longer at 6.62 min but rarer; writes more frequent and shorter), Fig. 8 (low-intensity phases show the opposite correspondence); Patel FAST'20 Figs. 9a–c (3–5 am has the largest, most time-consuming volume; time strongly negatively correlated with CoV, Spearman −0.94) | Descriptive | ✅ Implemented. `compute_intensity_phases` bins I/O bytes into 60 s windows, thresholds at the 75th/25th percentile of non-empty bins, and segments consecutive high/low-intensity bins (count / mean length / max length). Measured on GenoMAS p5: 16 bins, 4 high-intensity phases (all single-bin bursts). |
-| **I/O time skew across concurrent ranks/agents** (compute cycles wasted while fast waits for slow) | Borrow directly, change the attribution source | Patel FAST'20 Figs. 8a–c (OST load imbalance causes large I/O-time differences across concurrent ranks; fast ranks wait for slow, Finding 8) | Descriptive | ⚠️ Partially implemented. Done: `compute_self_intervals` computes de-nested per-worker self-time by role, `parallel_time_ratio`, observed-pid parallelism, `build_role_io_attribution` per-role bytes; supports GenoMAS fanout. Still missing: no dedicated "fast waits for slow" skew / wasted-cycle quantity. |
-| **Concurrent-write run count and system-level contention** | Borrow directly | Patel FAST'20 Fig. 6c (write runs 25 GB each vs. read runs 17 GB, Finding 6, mitigation "limit concurrent write runs") | Descriptive | ⚠️ Weakly partially implemented. Done: fanout visualizations (`fanout_plot`, `fanout_input_sizes`) aggregate across multiple runs. Still missing: no system-level concurrent-write contention metric is computed. |
-| **Interference-source redefinition (conceptual work required, not a new metric):** traditional interference comes from between MPI ranks / between concurrent applications; in the agent setting it comes from multiple independent LLM calls being unaware of each other's resource usage | Borrow all measurement tools, rewrite the story | Conceptual reference Bez survey Figs. 15/16 (two concurrent IOR instances interleave requests; clear inter-application interference) | Descriptive | ✅ Implemented (concept + tooling). This axis's redefinition is realized as "measure the time overlap among agent/LLM/tool + `role_io_attribution` for who concurrently consumes resources" rather than MPI ranks; the parallelism module is its operationalization. |
+| **I/O parallelism CDF (primary):** cluster size of simultaneously I/O-busy worker units | Borrow directly | Patel SC'19 Figs. 11a/b (mean parallelism only 5.58 read / 5.93 write, >85% of cases use <10 OSTs out of 248 available); Table 1 (write parallelism 16%–240% higher than read in high-intensity phases) | Descriptive | ✅ Implemented. `parallelism.active_degree` now has `io_busy_workers`, computed from overlapping read/write-family syscall intervals and libc `fread/fwrite` probes when present. The previous semantic-event degree remains but is renamed **workflow concurrency (opportunity)** because it measures available overlap, not measured I/O concurrency. |
+| **I/O read/write autocorrelation (primary)** (1/5/25-minute windows, multiple lags) + read-write cross-correlation | Borrow directly | Patel SC'19 Figs. 9a–c (autocorrelation significant at ≥5-min windows, weak at 1-min; read-write cross-correlation weak throughout) | Descriptive, no oracle needed | ✅ Implemented. `compute_io_autocorrelation` produces read/write lag-1–3 autocorrelation at 1/5/25-min windows plus lag-0 read-write cross-correlation. Note: short traces (e.g. 16 min) leave too few bins in the 5/25-min windows to be stable; a longer run is needed. |
+| **High/low-intensity I/O phase segmentation (primary)** (top-25% / bottom-25% quantiles) + phase length and gaps | Borrow directly | Patel SC'19 Fig. 7 (read phases longer at 6.62 min but rarer; writes more frequent and shorter), Fig. 8 (low-intensity phases show the opposite correspondence); Patel FAST'20 Figs. 9a–c (3–5 am has the largest, most time-consuming volume; time strongly negatively correlated with CoV, Spearman −0.94) | Descriptive | ✅ Implemented. `compute_intensity_phases` bins I/O bytes into 60 s windows, thresholds at the 75th/25th percentile of non-empty bins, and segments consecutive high/low-intensity bins (count / mean length / max length). Measured on GenoMAS p5: 16 bins, 4 high-intensity phases (all single-bin bursts). |
+| **I/O time skew across concurrent ranks/agents (secondary)** (compute cycles wasted while fast waits for slow) | Borrow directly, change the attribution source | Patel FAST'20 Figs. 8a–c (OST load imbalance causes large I/O-time differences across concurrent ranks; fast ranks wait for slow, Finding 8) | Descriptive | ⚠️ Partially implemented. Done: `compute_self_intervals` computes de-nested per-worker self-time by role, `parallel_time_ratio`, observed-pid parallelism, `build_role_io_attribution` per-role bytes; supports GenoMAS fanout. Still missing: no dedicated "fast waits for slow" skew / wasted-cycle quantity. |
+| **Concurrent-write run count and system-level contention (secondary)** | Borrow directly | Patel FAST'20 Fig. 6c (write runs 25 GB each vs. read runs 17 GB, Finding 6, mitigation "limit concurrent write runs") | Descriptive | ⚠️ Weakly partially implemented. Done: fanout visualizations (`fanout_plot`, `fanout_input_sizes`) aggregate across multiple runs. Still missing: no system-level concurrent-write contention metric is computed. |
+| **Interference-source redefinition (secondary — conceptual work, not a new metric):** traditional interference comes from between MPI ranks / between concurrent applications; in the agent setting it comes from multiple independent LLM calls being unaware of each other's resource usage | Borrow all measurement tools, rewrite the story | Conceptual reference Bez survey Figs. 15/16 (two concurrent IOR instances interleave requests; clear inter-application interference) | Descriptive | ✅ Implemented (concept + tooling). This axis's redefinition is realized as "measure the time overlap among agent/LLM/tool + `role_io_attribution` for who concurrently consumes resources" rather than MPI ranks; the parallelism module is its operationalization. |

@@ -23,7 +23,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -460,156 +459,6 @@ def _build_process_info(data: StraceData) -> pd.DataFrame:
 
 
 
-def create_timeline_plotly(data: StraceData, output_path: Path) -> None:
-    """Create interactive timeline visualization with Plotly."""
-    tc_df = data.tool_calls_df
-    fs_df = data.fs_entries_df
-    
-    fig = go.Figure()
-    
-    # Add tool calls as horizontal bars
-    for idx, row in tc_df.iterrows():
-        color = color_for_tool(row["tool_name"])
-        
-        # Extract command preview for Bash tools
-        label = row["tool_name"]
-        if row["tool_name"] == "Bash" and isinstance(row["input_params"], dict):
-            cmd = row["input_params"].get("command", "")
-            label = f"Bash: {cmd[:40]}..." if len(cmd) > 40 else f"Bash: {cmd}"
-        elif isinstance(row["input_params"], dict) and "file_path" in row["input_params"]:
-            fp = row["input_params"]["file_path"]
-            label = f"{row['tool_name']}: {Path(fp).name}"
-        
-        fig.add_trace(go.Bar(
-            x=[row["end_rel"] - row["start_rel"]],
-            y=[idx],
-            base=[row["start_rel"]],
-            orientation='h',
-            name=row["tool_name"],
-            marker_color=color,
-            hovertemplate=(
-                f"<b>{label}</b><br>"
-                f"Start: {row['start_rel']:.3f}s<br>"
-                f"Duration: {row['duration_ms']:.1f}ms<br>"
-                f"Tool ID: {row['tool_id'][:20]}...<br>"
-                "<extra></extra>"
-            ),
-            showlegend=bool(idx == tc_df[tc_df["tool_name"] == row["tool_name"]].index[0]),
-            legendgroup=row["tool_name"],
-        ))
-    
-    # Add FS operations as a category-colored point cloud. Instead of randomly
-    # sampling 5000 of millions of points (lossy, non-deterministic), rasterize
-    # event TIMES to a sub-pixel grid and emit one marker per occupied
-    # (category, time-bucket): full coverage, deterministic, bounded count.
-    # Sub-pixel density and per-point hover are dropped (invisible / meaningless
-    # at this density).
-    span = data.duration_seconds
-    if len(fs_df) > 0 and span > 0:
-        bucket = span / _RASTER_PX
-        cat_series = _effective_category_series(fs_df)
-        bidx = (fs_df["time_rel"].to_numpy() / bucket).astype("int64")
-        xs: list[float] = []
-        colors: list[str] = []
-        for cat in cat_series.unique():
-            occ = np.unique(bidx[(cat_series == cat).to_numpy()])
-            xs.extend((occ * bucket).tolist())
-            colors.extend([SYSCALL_CATEGORY_COLORS.get(cat, "#95a5a6")] * len(occ))
-        if xs:
-            fig.add_trace(go.Scatter(
-                x=xs,
-                y=np.random.uniform(-0.8, len(tc_df) - 0.2, len(xs)),
-                mode='markers',
-                marker=dict(size=3, color=colors, opacity=0.5),
-                hovertemplate="time: %{x:.3f}s<extra></extra>",
-                name="FS Operations",
-                showlegend=True,
-            ))
-    
-    fig.update_layout(
-        title="Tool Calls and FS Operations Timeline (strace)",
-        xaxis_title="Time (seconds from start)",
-        yaxis_title="Tool Call Index",
-        barmode='overlay',
-        height=400 + len(tc_df) * 30,
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        hovermode="closest",
-    )
-    
-    fig.write_html(output_path)
-
-
-def create_timeline_matplotlib(data: StraceData, output_path: Path) -> None:
-    """Create static timeline visualization with Matplotlib."""
-    tc_df = data.tool_calls_df
-    fs_df = data.fs_entries_df
-    
-    fig, ax = plt.subplots(figsize=(14, max(6, 2 + len(tc_df) * 0.5)))
-    
-    # Plot tool calls as horizontal bars
-    for idx, row in tc_df.iterrows():
-        color = color_for_tool(row["tool_name"])
-        ax.barh(idx, row["end_rel"] - row["start_rel"], left=row["start_rel"],
-                color=color, alpha=0.8, height=0.6)
-        
-        # Add label
-        label = row["tool_name"]
-        if row["tool_name"] == "Bash" and isinstance(row["input_params"], dict):
-            cmd = row["input_params"].get("command", "")
-            cmd_short = cmd.split()[0] if cmd else ""
-            label = f"{row['tool_name']} ({cmd_short})"
-        ax.text(row["start_rel"], idx, f" {label}", va='center', fontsize=8)
-    
-    # Plot FS operations as a category-colored point cloud, rasterized to a
-    # sub-pixel time grid (one marker per occupied (category, bucket)) instead
-    # of a random sample — full coverage, deterministic, bounded. Colors come
-    # from SYSCALL_CATEGORY_COLORS (cool palette), distinct from the tool bars.
-    cat_series = _effective_category_series(fs_df) \
-        if len(fs_df) else pd.Series(dtype=object)
-    cats_in_data: list[str] = sorted(set(cat_series.unique())) if len(cat_series) else []
-    span = data.duration_seconds
-    if len(fs_df) > 0 and span > 0:
-        bucket = span / _RASTER_PX
-        bidx = (fs_df["time_rel"].to_numpy() / bucket).astype("int64")
-        xs: list[float] = []
-        colors_list: list[str] = []
-        for cat in cats_in_data:
-            occ = np.unique(bidx[(cat_series == cat).to_numpy()])
-            xs.extend((occ * bucket).tolist())
-            colors_list.extend([SYSCALL_CATEGORY_COLORS.get(cat, "#AAB7B8")] * len(occ))
-        if xs:
-            ax.scatter(
-                xs,
-                np.random.uniform(-0.5, len(tc_df) - 0.5, len(xs)),
-                c=colors_list, s=2, alpha=0.3,
-            )
-
-    # Legend: TWO blocks — tool bars (from tc_df, using actual per-tool colors
-    # including auto-assigned ones) AND syscall categories that actually
-    # appeared in fs_sample.  Fixes the prior bug where the legend listed
-    # TOOL_COLORS labels but the scatter dots were colored by syscall category.
-    tool_names_in_data = list(tc_df["tool_name"].unique()) if len(tc_df) else []
-    tool_patches = [
-        mpatches.Patch(color=color_for_tool(t), label=f"tool: {t}")
-        for t in tool_names_in_data
-    ]
-    cat_patches = [
-        mpatches.Patch(color=SYSCALL_CATEGORY_COLORS.get(c, "#AAB7B8"), label=f"syscall: {c}")
-        for c in cats_in_data
-    ]
-    ax.legend(handles=tool_patches + cat_patches, loc='upper right', fontsize=7,
-              ncol=2 if (len(tool_patches) + len(cat_patches)) > 8 else 1)
-    
-    ax.set_xlabel("Time (seconds from start)")
-    ax.set_ylabel("Tool Call Index")
-    ax.set_title("Tool Calls and FS Operations Timeline (strace)")
-    ax.set_xlim(-0.1, data.duration_seconds + 0.1)
-    ax.set_ylim(-1, len(tc_df))
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    plt.close()
 
 
 # =============================================================================
@@ -826,602 +675,139 @@ def create_io_rate_plotly(data: StraceData, output_path: Path) -> None:
     fig.write_html(output_path)
 
 
-def create_io_rate_matplotlib(data: StraceData, output_path: Path) -> None:
-    """Create I/O rate over time chart with Matplotlib."""
+def create_io_rate_matplotlib(trace_dir: Path, output_path: Path) -> None:
+    """Bytes/s read/write rate with inference intensity overlay."""
+    parsed_json = trace_dir / "parsed.json"
+    if not parsed_json.exists():
+        fig, ax = plt.subplots(figsize=(10, 4))
+        _no_data_placeholder(ax, "I/O rate — no data", "Missing parsed.json")
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        return
+    data = load_parsed_json(parsed_json)
     fs_df = data.fs_entries_df.copy()
-    tc_df = data.tool_calls_df
-    
-    # Ensure errno column exists
-    if "errno" not in fs_df.columns:
-        fs_df["errno"] = None
-    
-    fig, ax = plt.subplots(figsize=(14, 6))
-    ax2 = ax.twinx()  # Secondary y-axis for errors
-    
-    # Bin operations
-    bin_size = 0.1
-    bins = np.arange(0, data.duration_seconds + bin_size, bin_size)
-    counts, edges = np.histogram(fs_df["time_rel"], bins=bins)
-    centers = (edges[:-1] + edges[1:]) / 2
-    
-    # Bin errors
-    error_times = fs_df[fs_df["errno"].notna()]["time_rel"]
-    error_counts, _ = np.histogram(error_times, bins=bins)
-    
-    # Calculate max y for label positioning
-    y_max = counts.max() if len(counts) > 0 else 100
-    
-    # Plot rate
-    ax.fill_between(centers, counts, alpha=0.3, color='#2c3e50')
-    ax.plot(centers, counts, color='#2c3e50', linewidth=1.5, label='Syscalls')
-    
-    # Plot error markers
-    error_mask = error_counts > 0
-    if error_mask.any():
-        ax2.scatter(centers[error_mask], error_counts[error_mask], 
-                   color='#e74c3c', s=50, marker='x', label='Errors', zorder=5)
-    
-    # Compute label positions to avoid overlap
-    label_y_positions = _compute_label_positions(tc_df, y_max, min_gap=0.3)
-    
-    # Add tool call regions and labels
-    for i, (_, row) in enumerate(tc_df.iterrows()):
-        color = color_for_tool(row["tool_name"])
-        ax.axvspan(row["start_rel"], row["end_rel"], alpha=0.2, color=color)
-        
-        # Add label
-        label = _get_tool_label(row, max_len=25)
-        label_x = (row["start_rel"] + row["end_rel"]) / 2
-        label_y = label_y_positions[i]
-        
-        # Draw label with arrow pointing down, diagonal text to prevent overlap
-        ax.annotate(
-            label,
-            xy=(label_x, y_max * 0.1),  # Arrow points to bottom of chart
-            xytext=(label_x, label_y),
-            fontsize=7,
-            color=color,
-            ha='left',
-            va='bottom',
-            rotation=-30,  # Diagonal labels to prevent overlap
-            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor=color, alpha=0.9),
-            arrowprops=dict(arrowstyle='->', color=color, lw=0.8),
-        )
-    
-    ax.set_xlabel("Time (seconds from start)")
-    ax.set_ylabel("Syscalls per 100ms", color='#2c3e50')
-    ax2.set_ylabel("Errors per 100ms", color='#e74c3c')
-    ax.set_title("I/O Rate Over Time (with Error Markers)")
-    ax.set_xlim(0, data.duration_seconds)
-    ax.set_ylim(0, y_max * 1.15)  # Add headroom for labels
-    
-    # Combine legends
+    if fs_df.empty:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        _no_data_placeholder(ax, "I/O rate — no data", "No filesystem events")
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        return
+
+    syscalls = fs_df["syscall"].astype(str) if "syscall" in fs_df.columns else pd.Series([], dtype=str)
+    sizes = (
+        fs_df.get("bytes_transferred", 0).fillna(0)
+        if "bytes_transferred" in fs_df.columns else pd.Series(0, index=fs_df.index)
+    )
+    read_mask = syscalls.isin(["read", "pread64", "readv", "preadv", "preadv2"]) & (sizes > 0)
+    write_mask = syscalls.isin(["write", "pwrite64", "writev", "pwritev", "pwritev2"]) & (sizes > 0)
+
+    llm_intervals: list[tuple[float, float]] = []
+    llm_abs_intervals: list[tuple[float, float]] = []
+    # (start_ms, end_ms, output_tokens) for calls that reported usage. Every
+    # adapter's launcher records usage on message_end, so this works on every
+    # trace without streaming deltas (which litellm-based agents never emit).
+    llm_abs_tokens: list[tuple[float, float, float]] = []
+    try:
+        from agent_io_tracing.analysis.parallelism import _load_llm_events
+
+        llms, _, _ = _load_llm_events(trace_dir / "pi_events.jsonl")
+        llm_abs_intervals = [
+            (ev.start_ms, ev.end_ms)
+            for ev in llms
+            if ev.end_ms > ev.start_ms
+        ]
+        for ev in llms:
+            if ev.end_ms <= ev.start_ms:
+                continue
+            out = (ev.usage or {}).get("output")
+            if isinstance(out, (int, float)) and out > 0:
+                llm_abs_tokens.append((ev.start_ms, ev.end_ms, float(out)))
+    except Exception:
+        llm_abs_intervals = []
+        llm_abs_tokens = []
+
+    if "ts_ms" in fs_df.columns and fs_df["ts_ms"].notna().any():
+        fs_abs_ms = fs_df["ts_ms"].astype(float)
+        abs_candidates = [float(fs_abs_ms.min()), float(fs_abs_ms.max())]
+        abs_candidates.extend(t for iv in llm_abs_intervals for t in iv)
+        t0_ms = min(abs_candidates)
+        t1_ms = max(abs_candidates)
+        fs_time_rel = (fs_abs_ms - t0_ms) / 1000.0
+        llm_intervals = [((s - t0_ms) / 1000.0, (e - t0_ms) / 1000.0) for s, e in llm_abs_intervals]
+        duration_seconds = max((t1_ms - t0_ms) / 1000.0, 0.0)
+    else:
+        t0_ms = data.start_time.timestamp() * 1000.0
+        fs_abs_start = float(fs_df["time_rel"].min()) * 1000.0 + t0_ms
+        fs_abs_end = float(fs_df["time_rel"].max()) * 1000.0 + t0_ms
+        if llm_abs_intervals:
+            ev_start = min(s for s, _ in llm_abs_intervals)
+            ev_end = max(e for _, e in llm_abs_intervals)
+            if min(fs_abs_end, ev_end) - max(fs_abs_start, ev_start) < -1000.0:
+                raise RuntimeError(
+                    "Cannot overlay LLM intensity on I/O rate: parsed.json lacks absolute ts_ms "
+                    "and filesystem timestamps are skewed from LLM epoch timestamps. Re-parse "
+                    "ebpf_events.log with the current parser."
+                )
+        fs_time_rel = fs_df["time_rel"]
+        llm_intervals = [((s - t0_ms) / 1000.0, (e - t0_ms) / 1000.0) for s, e in llm_abs_intervals]
+        duration_seconds = data.duration_seconds
+
+    bin_size = 1.0 if duration_seconds <= 1800 else 2.0 if duration_seconds <= 7200 else 5.0
+    bins = np.arange(0, max(duration_seconds, bin_size) + bin_size, bin_size)
+    centers = (bins[:-1] + bins[1:]) / 2
+    read_bytes, _ = np.histogram(fs_time_rel[read_mask], bins=bins, weights=sizes[read_mask])
+    write_bytes, _ = np.histogram(fs_time_rel[write_mask], bins=bins, weights=sizes[write_mask])
+    read_rate = read_bytes / bin_size
+    write_rate = write_bytes / bin_size
+    # Output-token rate: spread each call's output tokens uniformly over its
+    # own [start, end] and accumulate the overlap with each bin. Decoding is
+    # roughly steady within a call, so this is a good decode-intensity signal.
+    token_rate = np.zeros(len(centers))
+    token_rate_available = False
+    for s_ms, e_ms, tokens in llm_abs_tokens:
+        s = (s_ms - t0_ms) / 1000.0
+        e = (e_ms - t0_ms) / 1000.0
+        span = e - s
+        if span <= 0:
+            continue
+        tokens_per_s = tokens / span
+        lo = max(int(s / bin_size), 0)
+        hi = min(int(e / bin_size) + 1, len(centers))
+        for i in range(lo, hi):
+            overlap = min(e, bins[i + 1]) - max(s, bins[i])
+            if overlap > 0:
+                token_rate[i] += tokens_per_s * overlap / bin_size
+                token_rate_available = True
+
+    # Scale the I/O-rate axis to KB/s at minimum, stepping up to MB/s when the
+    # peak rate warrants it; raw bytes/s forces unreadable 1e7 tick labels.
+    peak_rate = float(max(read_rate.max(initial=0.0), write_rate.max(initial=0.0)))
+    if peak_rate >= 1024 ** 2:
+        rate_div, rate_unit = 1024 ** 2, "MB/s"
+    else:
+        rate_div, rate_unit = 1024, "KB/s"
+
+    fig, ax = plt.subplots(figsize=(12, 5.4))
+    ax2 = ax.twinx()
+    ax.plot(centers, read_rate / rate_div, color="#1f77b4", lw=1.6, label=f"read {rate_unit}")
+    ax.plot(centers, write_rate / rate_div, color="#ff7f0e", lw=1.6, label=f"write {rate_unit}")
+    if token_rate_available:
+        ax2.plot(centers, token_rate, color="#2ca02c", lw=1.3,
+                 drawstyle="steps-post", label="output tokens/s")
+        ax2.set_ylabel("output tokens/s")
+    ax.set_xlabel("Time (seconds from run start)")
+    ax.set_ylabel(rate_unit)
+    ax.set_xlim(0, duration_seconds)
+    ax.grid(alpha=0.25)
+    ax.set_title("I/O Rate Over Time")
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
-    
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
-
-
-# =============================================================================
-# Visualization: Tool Call Syscalls (per-tool breakdown)
-# =============================================================================
-
-# Category colors for syscall types
-CATEGORY_COLORS = {
-    "metadata": "#9b59b6",  # Purple
-    "data": "#3498db",      # Blue
-    "control": "#f39c12",   # Orange
-    "modify": "#e74c3c",    # Red
-    "process": "#2ecc71",   # Green
-    "blocking": "#e67e22",  # Dark Orange
-    "network": "#1abc9c",   # Teal
-    "other": "#95a5a6",     # Gray
-}
-
-
-def _limit_syscalls_per_type(
-    df: pd.DataFrame,
-    max_entries_per_type: int,
-    group_col: str = "operation",
-    sort_col: str = "duration_ms",
-) -> pd.DataFrame:
-    """Limit syscall rows independently per syscall type.
-
-    Keeps at most ``max_entries_per_type`` entries per ``group_col`` value.
-    When limiting is needed for a type, the longest-duration rows are kept.
-    """
-    if len(df) == 0:
-        return df
-    if max_entries_per_type <= 0:
-        return df.iloc[0:0].copy()
-
-    limited_dfs: list[pd.DataFrame] = []
-    for _, type_df in df.groupby(group_col, sort=False):
-        if len(type_df) <= max_entries_per_type:
-            limited_dfs.append(type_df)
-        else:
-            limited_dfs.append(type_df.nlargest(max_entries_per_type, sort_col))
-
-    if not limited_dfs:
-        return df.iloc[0:0].copy()
-    return pd.concat(limited_dfs, ignore_index=True)
-
-
-MAX_TOOL_CALL_SUBPLOTS = 100
-
-
-def _select_top_tool_calls(tc_df: pd.DataFrame, max_tools: int) -> pd.DataFrame:
-    """Select the top tool calls by duration when there are too many for subplots."""
-    if len(tc_df) <= max_tools:
-        return tc_df
-    return tc_df.nlargest(max_tools, "duration_ms").sort_values("start_time").reset_index(drop=True)
-
-
-def create_tool_syscalls_plotly(
-    data: StraceData,
-    output_path: Path,
-    max_syscalls_per_type: int = 5000,
-    max_tool_calls: int = MAX_TOOL_CALL_SUBPLOTS,
-) -> None:
-    """Create interactive visualization showing syscalls for each tool call.
-    
-    Each tool call gets its own subplot showing syscalls as horizontal bars
-    representing their duration. Y-axis = syscall type, X-axis = time.
-    Long syscalls are immediately visible as long bars.
-    """
-    tc_df = data.tool_calls_df
-    fs_df = data.fs_entries_df
-
-    if len(tc_df) == 0:
-        return
-
-    # Sort fs entries by timestamp ONCE so each tool's time window can be sliced
-    # with searchsorted (O(log n)) instead of a full-DataFrame boolean mask per
-    # tool (the old code scanned all millions of rows ~3× per tool). Selected
-    # rows are identical; only the cost changes.
-    fs_sorted = fs_df.sort_values("timestamp", kind="stable").reset_index(drop=True)
-    _ts_sorted = fs_sorted["timestamp"].to_numpy()
-
-    # Pre-aggregate matched syscall time per tool once (was a full scan per tool).
-    if len(fs_sorted) and "matched_tool_call" in fs_sorted.columns:
-        _matched_ms_by_tool = (
-            fs_sorted.groupby("matched_tool_call")["duration"].sum() * 1000.0
-        )
-    else:
-        _matched_ms_by_tool = pd.Series(dtype=float)
-
-    def _window_slice(tool_start, tool_end) -> pd.DataFrame:
-        lo = np.searchsorted(_ts_sorted, np.datetime64(tool_start), side="left")
-        hi = np.searchsorted(_ts_sorted, np.datetime64(tool_end), side="right")
-        return fs_sorted.iloc[lo:hi]
-
-    total_tool_calls = len(tc_df)
-    tc_df = _select_top_tool_calls(tc_df, max_tool_calls)
-    capped = total_tool_calls > len(tc_df)
-    
-    # Calculate grid dimensions (favor more columns as tool count grows)
-    n_tools = len(tc_df)
-    if n_tools <= 6:
-        n_cols = min(3, n_tools)
-    elif n_tools <= 20:
-        n_cols = 4
-    else:
-        n_cols = 5
-    n_rows = (n_tools + n_cols - 1) // n_cols
-    
-    # Create subplot titles with syscall time summary
-    subplot_titles = []
-    for _, row in tc_df.iterrows():
-        tool_id = row["tool_id"]
-        tool_start = row["start_time"]
-        tool_end = row["end_time"]
-        
-        # Count syscalls in time window
-        tool_syscalls = _window_slice(tool_start, tool_end)
-        n_syscalls = len(tool_syscalls)
-
-        total_syscall_ms = float(_matched_ms_by_tool.get(tool_id, 0.0))
-        
-        label = _get_tool_label(row, max_len=40)
-        if label.startswith("Bash: "):
-            label = label[len("Bash: "):]
-        duration_ms = row["duration_ms"]
-        
-        # Show sampling indicator only when any syscall type exceeds the per-type limit
-        per_type_counts = tool_syscalls["operation"].value_counts()
-        has_per_type_sampling = (per_type_counts > max_syscalls_per_type).any()
-        metadata = f"{duration_ms:.0f}ms wall | {total_syscall_ms:.1f}ms syscall | {n_syscalls} calls"
-        if has_per_type_sampling:
-            metadata += " | sampled"
-        subplot_titles.append(f"{label}<br><span style='font-size:10px;color:#666'>{metadata}</span>")
-    
-    v_spacing = min(0.06, 0.8 / max(n_rows - 1, 1))
-    h_spacing = min(0.06, 0.8 / max(n_cols - 1, 1))
-    fig = make_subplots(
-        rows=n_rows, cols=n_cols,
-        subplot_titles=subplot_titles,
-        vertical_spacing=v_spacing,
-        horizontal_spacing=h_spacing,
-    )
-    
-    # Process each tool call
-    for idx, (_, tc_row) in enumerate(tc_df.iterrows()):
-        row_num = idx // n_cols + 1
-        col_num = idx % n_cols + 1
-        
-        tool_id = tc_row["tool_id"]
-        tool_start = tc_row["start_time"]
-        tool_end = tc_row["end_time"]
-        
-        # Filter fs entries to this tool's time window (searchsorted slice)
-        tool_fs = _window_slice(tool_start, tool_end).copy()
-        
-        if len(tool_fs) == 0:
-            continue
-        
-        # Calculate relative time (ms from tool start)
-        tool_fs["time_rel_ms"] = (tool_fs["timestamp"] - tool_start).dt.total_seconds() * 1000
-        tool_fs["duration_ms"] = tool_fs["duration"] * 1000  # Convert to ms
-        
-        # Classify syscalls and determine match status (vectorized map)
-        tool_fs["category"] = tool_fs["operation"].map(_SYSCALL_TO_CATEGORY).fillna("other")
-        tool_fs["is_matched"] = tool_fs["matched_tool_call"] == tool_id
-        
-        # Store FULL stats before sampling (for summary display)
-        full_syscall_counts = tool_fs.groupby("operation").size()
-        full_syscall_durations = tool_fs.groupby("operation")["duration_ms"].sum()
-        total_syscalls_before_sample = len(tool_fs)
-        
-        # Limit independently per syscall type (not as one total budget).
-        has_per_type_sampling = (full_syscall_counts > max_syscalls_per_type).any()
-        if has_per_type_sampling:
-            tool_fs = _limit_syscalls_per_type(
-                tool_fs,
-                max_entries_per_type=max_syscalls_per_type,
-                group_col="operation",
-                sort_col="duration_ms",
-            )
-        
-        # Track how many were sampled per type
-        sampled_syscall_counts = tool_fs.groupby("operation").size()
-        
-        # Get unique syscall types for y-axis ordering (sorted by FULL total duration)
-        syscall_types = list(full_syscall_durations.sort_values(ascending=False).index)
-        # Only include types that appear in sampled data
-        syscall_types = [s for s in syscall_types if s in tool_fs["operation"].values]
-        syscall_to_y = {s: i for i, s in enumerate(syscall_types)}
-        tool_fs["y_pos"] = tool_fs["operation"].map(syscall_to_y)
-        
-        # Add small jitter to y position for overlapping syscalls
-        tool_fs["y_pos_jitter"] = tool_fs["y_pos"] + np.random.uniform(-0.35, 0.35, len(tool_fs))
-        
-        # Plot syscalls using batched line segments (much faster than individual shapes)
-        # Each category gets one trace with line segments separated by None
-        # 
-        # Minimum visual width: Most syscalls are <0.1ms (93%+ typically), which would be
-        # invisible on a multi-second plot. Use 0.5% of tool duration as minimum width
-        # so every syscall is at least visible as a small mark.
-        tool_duration_ms = tc_row["duration_ms"]
-        min_visual_width = max(tool_duration_ms * 0.005, 0.1)  # 0.5% of tool duration, min 0.1ms
-        
-        for is_matched in [True, False]:
-            subset = tool_fs[tool_fs["is_matched"] == is_matched]
-            if len(subset) == 0:
-                continue
-            
-            line_width = 4 if is_matched else 2
-            opacity = 0.9 if is_matched else 0.3
-            match_label = "matched" if is_matched else "unmatched"
-            
-            for category in subset["category"].unique():
-                cat_df = subset[subset["category"] == category]
-                color = CATEGORY_COLORS.get(category, "#95a5a6")
-                
-                # Build batched line coordinates with None separators
-                x_coords = []
-                y_coords = []
-                hover_texts = []
-                
-                for _, entry in cat_df.iterrows():
-                    x_start = entry["time_rel_ms"]
-                    x_end = x_start + max(entry["duration_ms"], min_visual_width)
-                    y_val = entry["y_pos_jitter"]
-                    size_hover = _syscall_size_hover_fragment(entry)
-                    access_mode_hover = _syscall_access_mode_hover_fragment(entry)
-                    
-                    # Line segment: start -> end -> None (separator)
-                    x_coords.extend([x_start, x_end, None])
-                    y_coords.extend([y_val, y_val, None])
-                    
-                    # Hover text for the midpoint
-                    path_str = str(entry["path"])[:50] if entry["path"] else "N/A"
-                    hover_texts.extend([
-                        f"<b>{entry['operation']}</b><br>"
-                        f"PID: {entry['pid']}<br>"
-                        f"Duration: {entry['duration_ms']:.3f}ms<br>"
-                        f"{access_mode_hover}"
-                        f"{size_hover}"
-                        f"Start: {x_start:.2f}ms<br>"
-                        f"Path: {path_str}",
-                        None,  # End point doesn't need hover
-                        None,  # Separator
-                    ])
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=x_coords,
-                        y=y_coords,
-                        mode='lines',
-                        line=dict(color=color, width=line_width),
-                        opacity=opacity,
-                        name=f"{category} ({match_label})",
-                        hoverinfo='text',
-                        hovertext=hover_texts,
-                        showlegend=(idx == 0),
-                        legendgroup=f"{match_label}_{category}",
-                    ),
-                    row=row_num, col=col_num
-                )
-        
-        # Update y-axis to show syscall names with counts (sampled/total)
-        y_labels = []
-        for syscall in syscall_types:
-            sampled = sampled_syscall_counts.get(syscall, 0)
-            total = full_syscall_counts.get(syscall, 0)
-            if sampled < total:
-                y_labels.append(f"{syscall} ({sampled}/{total})")
-            else:
-                y_labels.append(f"{syscall} ({total})")
-        
-        fig.update_yaxes(
-            tickmode='array',
-            tickvals=list(range(len(syscall_types))),
-            ticktext=y_labels,
-            tickfont=dict(size=8),
-            row=row_num, col=col_num
-        )
-        
-        # Set explicit x-axis range to tool call duration (syscall durations can extend beyond)
-        fig.update_xaxes(
-            title_text="Time (ms)" if row_num == n_rows else "",
-            tickfont=dict(size=8),
-            range=[0, tool_duration_ms],
-            row=row_num, col=col_num
-        )
-    
-    # Determine main process PID (first/lowest from summary, or most common in data)
-    main_pid = None
-    pids = data.summary.get("pids", [])
-    if pids:
-        main_pid = pids[0]
-    elif len(fs_df) > 0 and "pid" in fs_df.columns:
-        main_pid = fs_df["pid"].mode().iloc[0]
-    
-    title = "Syscalls Per Tool Call (bar length = duration, thick = matched)"
-    if capped:
-        title += f" — top {len(tc_df)} of {total_tool_calls} by duration"
-    if main_pid is not None:
-        title += f" — main PID: {main_pid}"
-    
-    fig.update_layout(
-        title=title,
-        height=max(500, 320 * n_rows),
-        showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.06,
-            xanchor="center",
-            x=0.5,
-            font=dict(size=9),
-        ),
-        hovermode="closest",
-        margin=dict(t=130, b=50, l=40, r=30),
-    )
-    
-    fig.write_html(output_path)
-
-
-def create_tool_syscall_durations_plotly(
-    data: StraceData,
-    output_path: Path,
-    max_syscalls_per_type: int = 5000,
-    max_tool_calls: int = MAX_TOOL_CALL_SUBPLOTS,
-) -> None:
-    """Create per-tool violin plots of syscall duration distributions."""
-    tc_df = data.tool_calls_df
-    fs_df = data.fs_entries_df
-
-    if len(tc_df) == 0:
-        return
-
-    # Sort once + searchsorted per tool instead of a full-DataFrame mask per tool.
-    fs_sorted = fs_df.sort_values("timestamp", kind="stable").reset_index(drop=True)
-    _ts_sorted = fs_sorted["timestamp"].to_numpy()
-
-    def _window_slice(tool_start, tool_end) -> pd.DataFrame:
-        lo = np.searchsorted(_ts_sorted, np.datetime64(tool_start), side="left")
-        hi = np.searchsorted(_ts_sorted, np.datetime64(tool_end), side="right")
-        return fs_sorted.iloc[lo:hi]
-
-    total_tool_calls = len(tc_df)
-    tc_df = _select_top_tool_calls(tc_df, max_tool_calls)
-    capped = total_tool_calls > len(tc_df)
-
-    # Calculate grid dimensions (match tool_syscalls layout)
-    n_tools = len(tc_df)
-    if n_tools <= 6:
-        n_cols = min(3, n_tools)
-    elif n_tools <= 20:
-        n_cols = 4
-    else:
-        n_cols = 5
-    n_rows = (n_tools + n_cols - 1) // n_cols
-
-    subplot_titles = []
-    for _, row in tc_df.iterrows():
-        tool_start = row["start_time"]
-        tool_end = row["end_time"]
-
-        tool_syscalls = _window_slice(tool_start, tool_end)
-        n_syscalls = len(tool_syscalls)
-
-        per_type_counts = tool_syscalls["operation"].value_counts()
-        has_per_type_sampling = (per_type_counts > max_syscalls_per_type).any()
-
-        label = _get_tool_label(row, max_len=35)
-        if label.startswith("Bash: "):
-            label = label[len("Bash: "):]
-        duration_ms = row["duration_ms"]
-
-        metadata = f"{duration_ms:.0f}ms wall | {n_syscalls} calls"
-        if has_per_type_sampling:
-            metadata += " | sampled"
-        subplot_titles.append(
-            f"{label}<br><span style='font-size:10px;color:#666'>{metadata}</span>"
-        )
-
-    v_spacing = min(0.06, 0.8 / max(n_rows - 1, 1))
-    h_spacing = min(0.06, 0.8 / max(n_cols - 1, 1))
-    fig = make_subplots(
-        rows=n_rows,
-        cols=n_cols,
-        subplot_titles=subplot_titles,
-        vertical_spacing=v_spacing,
-        horizontal_spacing=h_spacing,
-    )
-
-    legend_categories_shown: set[str] = set()
-
-    for idx, (_, tc_row) in enumerate(tc_df.iterrows()):
-        row_num = idx // n_cols + 1
-        col_num = idx % n_cols + 1
-
-        tool_start = tc_row["start_time"]
-        tool_end = tc_row["end_time"]
-
-        tool_fs = _window_slice(tool_start, tool_end).copy()
-        if len(tool_fs) == 0:
-            continue
-
-        tool_fs["duration_ms"] = tool_fs["duration"] * 1000
-        full_syscall_counts = tool_fs.groupby("operation").size()
-        full_syscall_durations = tool_fs.groupby("operation")["duration_ms"].sum()
-
-        if (full_syscall_counts > max_syscalls_per_type).any():
-            tool_fs = _limit_syscalls_per_type(
-                tool_fs,
-                max_entries_per_type=max_syscalls_per_type,
-                group_col="operation",
-                sort_col="duration_ms",
-            )
-
-        if len(tool_fs) == 0:
-            continue
-
-        # Log axes require strictly positive values.
-        tool_fs["duration_plot_ms"] = np.maximum(tool_fs["duration_ms"], 1e-4)
-        syscall_types = list(full_syscall_durations.sort_values(ascending=False).index)
-        syscall_types = [s for s in syscall_types if s in tool_fs["operation"].values]
-
-        for syscall in syscall_types:
-            syscall_df = tool_fs[tool_fs["operation"] == syscall]
-            if len(syscall_df) == 0:
-                continue
-
-            category = classify_syscall(syscall)
-            color = CATEGORY_COLORS.get(category, "#95a5a6")
-            show_legend = idx == 0 and category not in legend_categories_shown
-            if show_legend:
-                legend_categories_shown.add(category)
-
-            fig.add_trace(
-                go.Violin(
-                    x=[syscall] * len(syscall_df),
-                    y=syscall_df["duration_plot_ms"],
-                    customdata=np.stack(
-                        [
-                            syscall_df["duration_ms"],
-                            syscall_df["pid"].astype(str),
-                            syscall_df["path"].fillna("N/A").astype(str),
-                            syscall_df.apply(_syscall_size_hover_fragment, axis=1),
-                            syscall_df.apply(_syscall_access_mode_hover_fragment, axis=1),
-                        ],
-                        axis=1,
-                    ),
-                    name=category,
-                    legendgroup=category,
-                    showlegend=show_legend,
-                    line_color=color,
-                    fillcolor=color,
-                    opacity=0.65,
-                    box_visible=True,
-                    meanline_visible=True,
-                    points="outliers",
-                    pointpos=0,
-                    spanmode="hard",
-                    hovertemplate=(
-                        "<b>" + syscall + "</b><br>"
-                        "Duration: %{customdata[0]:.4f}ms<br>"
-                        "%{customdata[4]}"
-                        "%{customdata[3]}"
-                        "PID: %{customdata[1]}<br>"
-                        "Path: %{customdata[2]}<extra></extra>"
-                    ),
-                ),
-                row=row_num,
-                col=col_num,
-            )
-
-        fig.update_xaxes(
-            title_text="Syscall type" if row_num == n_rows else "",
-            tickangle=45,
-            tickfont=dict(size=8),
-            type="category",
-            categoryorder="array",
-            categoryarray=syscall_types,
-            row=row_num,
-            col=col_num,
-        )
-        fig.update_yaxes(
-            title_text="Duration (ms)" if col_num == 1 else "",
-            type="log",
-            tickfont=dict(size=8),
-            row=row_num,
-            col=col_num,
-        )
-
-    title = "Syscall Duration Distributions Per Tool Call (violin)"
-    if capped:
-        title += f" — top {len(tc_df)} of {total_tool_calls} by duration"
-    fig.update_layout(
-        title=title,
-        height=max(500, 360 * n_rows),
-        showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="center",
-            x=0.5,
-            font=dict(size=9),
-        ),
-        hovermode="closest",
-        margin=dict(t=90, b=80, l=40, r=30),
-        violinmode="group",
-    )
-
-    fig.write_html(output_path)
-
-
-# Phase colors
-PHASE_COLORS = {
-    "tool_execution": "#3498db",      # Blue
-    "model_completion": "#e74c3c",    # Red
-}
 
 
 # =============================================================================
@@ -1617,76 +1003,59 @@ _IO_LAYER_COLORS = {
 _IO_LAYER_ORDER = ["stdio", "posix_raw", "structured", "mpiio", "vector_index"]
 
 
-def create_interface_mix_matplotlib(trace_dir: Path, output_path: Path) -> None:
-    """I/O-abstraction mix (H1) — how many code-exec calls used each I/O layer.
-
-    Source: phase1_metrics.json['interface_mix'], itself an aggregate of
-    generated_code.jsonl produced by io_api_classifier. If no code was captured
-    (interface_mix.total_execs == 0) we draw an explicit placeholder rather than
-    a blank, so a missing-capture run is obvious at a glance.
-    """
+def create_measured_interface_layers_matplotlib(trace_dir: Path, output_path: Path) -> None:
+    """Measured I/O interface layers from eBPF syscalls and uprobes."""
     try:
         p1 = json.loads((trace_dir / "phase1_metrics.json").read_text())
     except Exception:
         p1 = {}
-    mix = (p1.get("interface_mix") or {})
-    total = mix.get("total_execs") or 0
+    measured = p1.get("measured_interface_layers") or {}
+    layers = measured.get("layers") or {}
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-    if not total:
-        ax.axis("off")
-        ax.text(
-            0.5, 0.5,
-            "No generated code captured\n(interface_mix.total_execs = 0)\n\n"
-            "io_api_classifier did not run for this cell — re-run with "
-            "io_api_classifier.py on sys.path.",
-            ha="center", va="center", fontsize=12, color="#7f8c8d",
+    order = ["STDIO", "POSIX", "MMAP", "HDF5", "MPI-IO"]
+    names = list(order)
+    vals = [int((layers.get(name) or {}).get("ops") or 0) for name in names]
+    if not any(vals):
+        _no_data_placeholder(
+            ax,
+            "Measured I/O interface mix (uprobe/syscall) — no data",
+            "No measured interface-layer events.\n"
+            "Older traces lack HDF5/MPI uprobes; workloads without HDF5/MPI will show zero.",
         )
-        ax.set_title("I/O-abstraction mix (H1) — no data", fontsize=13)
         plt.tight_layout()
         plt.savefig(output_path, dpi=150)
         plt.close()
         return
 
-    counts = mix.get("layer_exec_counts") or {}
-    io_execs = mix.get("execs_with_file_io") or 0
-    if not io_execs or not counts:
-        ax.axis("off")
-        ax.text(
-            0.5, 0.5,
-            f"Generated code captured: {total} execution(s)\n"
-            "File-I/O API usage in generated code: 0\n\n"
-            "This means the captured SciLink dynamic-analysis code ran in memory. "
-            "Any disk writes in this run were performed by SciLink/framework "
-            "controllers rather than by the generated snippet itself.",
-            ha="center", va="center", fontsize=12, color="#7f8c8d", wrap=True,
-        )
-        ax.set_title("Generated-code I/O API mix (H1) — no snippet file I/O", fontsize=13)
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150)
-        plt.close()
-        return
-
-    layers = [l for l in _IO_LAYER_ORDER if l in counts] + \
-             [l for l in counts if l not in _IO_LAYER_ORDER]
-    vals = [counts[l] for l in layers]
-    colors = [_IO_LAYER_COLORS.get(l, "#7f8c8d") for l in layers]
-
-    y = np.arange(len(layers))
-    ax.barh(y, vals, color=colors, edgecolor="black", linewidth=0.3)
+    colors = {
+        "STDIO": _IO_LAYER_COLORS["stdio"],
+        "POSIX": _IO_LAYER_COLORS["posix_raw"],
+        "MMAP": _IO_LAYER_COLORS.get("vector_index", "#8c564b"),
+        "HDF5": _IO_LAYER_COLORS["structured"],
+        "MPI-IO": _IO_LAYER_COLORS["mpiio"],
+    }
+    y = np.arange(len(names))
+    ax.barh(y, vals, color=[colors.get(n, "#7f8c8d") for n in names],
+            edgecolor="black", linewidth=0.3)
     ax.set_yticks(y)
-    ax.set_yticklabels(layers, fontsize=10)
+    ax.set_yticklabels(names, fontsize=10)
     ax.invert_yaxis()
-    ax.set_xlabel("# code-exec calls using this I/O layer", fontsize=10)
-    for yi, v in zip(y, vals):
-        ax.text(v, yi, f" {v}", va="center", fontsize=9)
-
-    pct_stdio = mix.get("pct_stdio_only")
-    pct_struct = mix.get("pct_structured_any")
-    sub = (f"{total} execs · {io_execs} with file I/O · "
-           f"stdio-only {pct_stdio if pct_stdio is not None else 'n/a'}% · "
-           f"structured-any {pct_struct if pct_struct is not None else 'n/a'}%")
-    ax.set_title("Generated-code I/O API mix (H1) — interface choice\n" + sub, fontsize=12)
+    ax.set_xlabel("# measured calls", fontsize=10)
+    for yi, name, val in zip(y, names, vals):
+        layer = layers.get(name) or {}
+        suffix = ""
+        if val == 0:
+            suffix = ""
+        elif layer.get("bytes_resolved") and layer.get("bytes") is not None:
+            suffix = f" · {_fmt_bytes_short(layer.get('bytes'))}"
+        elif name == "MMAP":
+            mapped = layer.get("mapped_bytes_upper_bound")
+            suffix = f" · ≤{_fmt_bytes_short(mapped)} mapped" if mapped else " · bytes unresolved"
+        elif name in {"HDF5", "MPI-IO"}:
+            suffix = " · bytes unresolved"
+        ax.text(val, yi, f" {val}{suffix}", va="center", fontsize=9)
+    ax.set_title("Measured I/O interface mix (uprobe/syscall)", fontsize=13)
     ax.grid(axis="x", alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
@@ -1775,109 +1144,6 @@ def create_io_autocorrelation_matplotlib(trace_dir: Path, output_path: Path) -> 
     plt.close()
 
 
-def create_intensity_phases_matplotlib(trace_dir: Path, output_path: Path) -> None:
-    """I/O intensity phases over 60-second windows.
-
-    The byte series is recomputed from parsed.json via phase1_metrics._binned_series
-    with READ ∪ WRITE syscalls, matching the metric computation path.
-    """
-    try:
-        parsed = json.loads((trace_dir / "parsed.json").read_text())
-    except Exception:
-        parsed = {}
-    try:
-        from agent_io_tracing.analysis.phase1_metrics import (
-            READ_SYSCALLS_STRICT,
-            WRITE_SYSCALLS_STRICT,
-            _binned_series,
-            percentile,
-        )
-        series = _binned_series(parsed, 60.0, READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT)
-    except Exception:
-        series = []
-
-    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
-    nonzero = [x for x in series if x > 0]
-    if len(nonzero) < 4:
-        _no_data_placeholder(
-            ax,
-            "I/O intensity phases — no data",
-            "Too few active 60-second bins to segment\n(need at least 4 non-empty bins)",
-        )
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150)
-        plt.close()
-        return
-
-    hi = percentile(nonzero, 75)
-    lo = percentile(nonzero, 25)
-    if hi is None or lo is None:
-        _no_data_placeholder(
-            ax,
-            "I/O intensity phases — no data",
-            "Could not compute intensity thresholds",
-        )
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150)
-        plt.close()
-        return
-
-    high_mask = [x >= hi for x in series]
-    low_mask = [0 < x <= lo for x in series]
-
-    def _segments(mask: list[bool]) -> list[int]:
-        segs, run = [], 0
-        for matched in mask:
-            if matched:
-                run += 1
-            elif run:
-                segs.append(run)
-                run = 0
-        if run:
-            segs.append(run)
-        return segs
-
-    hi_segs = _segments(high_mask)
-    lo_segs = _segments(low_mask)
-    hi_mean = (sum(hi_segs) / len(hi_segs)) if hi_segs else 0.0
-    lo_mean = (sum(lo_segs) / len(lo_segs)) if lo_segs else 0.0
-
-    colors = [
-        "#d62728" if high else "#1f77b4" if low else "#9aa0a6"
-        for high, low in zip(high_mask, low_mask)
-    ]
-    x = np.arange(len(series))
-    ax.bar(x, series, color=colors, edgecolor="black", linewidth=0.2)
-    ax.axhline(
-        hi, color="#d62728", linestyle="--", linewidth=1.2,
-        label=f"75th pct ({_fmt_bytes_short(hi)})",
-    )
-    ax.axhline(
-        lo, color="#1f77b4", linestyle="--", linewidth=1.2,
-        label=f"25th pct ({_fmt_bytes_short(lo)})",
-    )
-    ax.set_yscale("log")
-    ax.set_xlabel("60-second time-window index")
-    ax.set_ylabel("bytes per window (log scale)")
-    ax.set_title(
-        f"{len(hi_segs)} high phases (mean len {hi_mean:.1f} bins) · "
-        f"{len(lo_segs)} low phases (mean len {lo_mean:.1f} bins)",
-        fontsize=12,
-    )
-    ax.grid(axis="y", alpha=0.25, which="both")
-    ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-
-    legend_handles = [
-        mpatches.Patch(color="#d62728", label="high intensity"),
-        mpatches.Patch(color="#1f77b4", label="low intensity"),
-        mpatches.Patch(color="#9aa0a6", label="middle"),
-    ]
-    ax.legend(handles=legend_handles + ax.get_legend_handles_labels()[0], frameon=False, loc="best")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-
-
 def create_reread_attribution_matplotlib(trace_dir: Path, output_path: Path) -> None:
     """Reread attribution (Overview.md §5 three-bucket scheme) — how much of
     the observed file rereading is agent-induced vs. residual (a different
@@ -1938,18 +1204,13 @@ def create_reread_attribution_matplotlib(trace_dir: Path, output_path: Path) -> 
 
 
 def create_directory_scan_matplotlib(trace_dir: Path, output_path: Path) -> None:
-    """Directory scan (getdents64) count and rescan pattern — how many
-    directories the agent's code re-listed via os.listdir()-style calls
-    instead of caching the result once.
-
-    Source: phase1_metrics.json['directory_scan'].
-    """
+    """Directory scan count histogram from phase1_metrics.json."""
     try:
         p1 = json.loads((trace_dir / "phase1_metrics.json").read_text())
     except Exception:
         p1 = {}
     ds = p1.get("directory_scan") or {}
-    top = ds.get("top_rescanned") or []
+    hist = ds.get("scans_per_dir_hist") or {}
 
     fig, ax = plt.subplots(1, 1, figsize=(9, 5))
     if not ds.get("total_scans"):
@@ -1962,73 +1223,36 @@ def create_directory_scan_matplotlib(trace_dir: Path, output_path: Path) -> None
         plt.close()
         return
 
-    if not top:
-        total_scans = ds.get("total_scans", 0)
-        unique_dirs = ds.get("unique_directories_scanned", 0)
-        avg = (total_scans / unique_dirs) if unique_dirs else None
-        _no_data_placeholder(
-            ax, "Directory scans — no rescans",
-            f"{total_scans} scans over {unique_dirs} dirs"
-            + (f" (avg {avg:.1f}x),\n" if avg is not None else ",\n")
-            + "0 directories rescanned >=2x",
-        )
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150)
-        plt.close()
-        return
-
-    paths = [p for p, _ in top]
-    counts = [c for _, c in top]
-    short_paths = [p if len(p) <= 46 else "…" + p[-45:] for p in paths]
-
-    y = np.arange(len(short_paths))
-    ax.barh(y, counts, color="#8e44ad", edgecolor="black", linewidth=0.3)
-    ax.set_yticks(y)
-    ax.set_yticklabels(short_paths, fontsize=8)
-    ax.invert_yaxis()
-    ax.set_xlabel("# times scanned (getdents64 calls)", fontsize=10)
-    for yi, c in zip(y, counts):
-        ax.text(c, yi, f" {c}", va="center", fontsize=9)
-
-    total_scans = ds.get("total_scans", 0)
-    unique_dirs = ds.get("unique_directories_scanned", 0)
-    rescanned_dirs = ds.get("rescanned_directories", 0)
-    avg = (total_scans / unique_dirs) if unique_dirs else None
-    ax.set_title(
-        "Directory rescans (top offenders)\n"
-        f"{total_scans} scans over {unique_dirs} dirs"
-        + (f" (avg {avg:.1f}x)" if avg is not None else "")
-        + f" · {rescanned_dirs}/{unique_dirs} rescanned >=2x",
-        fontsize=12,
-    )
-    ax.grid(axis="x", alpha=0.3)
+    labels = [*(str(i) for i in range(1, 10)), ">=10"]
+    counts = [int(hist.get(label, 0) or 0) for label in labels]
+    x = np.arange(len(labels))
+    ax.bar(x, counts, color="#8e44ad", edgecolor="black", linewidth=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("# scans of one directory (getdents calls)", fontsize=10)
+    ax.set_ylabel("# directories", fontsize=10)
+    for xi, c in zip(x, counts):
+        if c:
+            ax.text(xi, c, f" {c}", ha="center", va="bottom", fontsize=9)
+    ax.set_title("Directory Re-scans (getdents64)", fontsize=12)
+    ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
 
 
 def create_inter_arrival_cdf_matplotlib(trace_dir: Path, output_path: Path) -> None:
-    """Axis 2: CDF of the time gap between successive accesses to the same file.
-    A summary table only shows p50/p95/p99; this shows the full shape and the
-    long tail. The 1-second line makes the "amnesiac reread" story visceral:
-    the fraction of re-accesses that recur near-instantly.
-
-    Source: recomputed from parsed.json via
-    phase1_metrics.inter_arrival_deltas (shared with the metric).
-    """
+    """Axis 1: histogram of gaps between successive accesses to the same file."""
     try:
-        parsed = json.loads((trace_dir / "parsed.json").read_text())
+        p1 = json.loads((trace_dir / "phase1_metrics.json").read_text())
     except Exception:
-        parsed = {}
-    try:
-        from agent_io_tracing.analysis.phase1_metrics import inter_arrival_deltas
-        deltas, n_files = inter_arrival_deltas(parsed)
-    except Exception:
-        deltas, n_files = [], 0
-
-    pos = [d for d in deltas if d > 0]
+        p1 = {}
+    ia = p1.get("inter_arrival") or {}
+    hist = ia.get("hist") or {}
+    labels = ia.get("hist_bins") or ["<1s", "1-30s", "30s-5min", "5-30min", ">30min"]
+    counts = [int(hist.get(label, 0) or 0) for label in labels]
     fig, ax = plt.subplots(1, 1, figsize=(9, 5))
-    if len(pos) < 2:
+    if not any(counts):
         _no_data_placeholder(
             ax, "Inter-arrival time — no data",
             "Fewer than 2 repeat accesses to any file were observed",
@@ -2038,37 +1262,113 @@ def create_inter_arrival_cdf_matplotlib(trace_dir: Path, output_path: Path) -> N
         plt.close()
         return
 
-    def _fmt_secs(s: float) -> str:
-        if s < 1e-3:
-            return f"{s * 1e6:.0f}µs"
-        if s < 1.0:
-            return f"{s * 1e3:.0f}ms"
-        return f"{s:.1f}s"
+    x = np.arange(len(labels))
+    ax.bar(x, counts, color="#1f77b4", edgecolor="black", linewidth=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_xlabel("gap between successive accesses to the same file", fontsize=10)
+    ax.set_ylabel("# inter-arrival intervals", fontsize=10)
+    ax.set_title("Inter-arrival Time", fontsize=12)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
 
-    arr = np.sort(np.asarray(pos))
-    ys = np.arange(1, len(arr) + 1) / len(arr)
-    frac_lt_1s = float(np.mean(arr < 1.0))
-    p50, p95, p99 = (float(np.percentile(arr, q)) for q in (50, 95, 99))
 
-    ax.plot(arr, ys, color="#1f77b4", lw=2)
-    ax.set_xscale("log")
-    ax.set_ylim(0, 1.02)
-    ax.axvline(1.0, color="#d62728", ls="--", lw=1)
-    ax.annotate(
-        f"{frac_lt_1s * 100:.1f}% recur < 1s",
-        xy=(1.0, frac_lt_1s), xytext=(6, -14), textcoords="offset points",
-        fontsize=9, fontweight="bold", color="#d62728",
-        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#d62728", lw=0.6, alpha=0.9),
-    )
-    ax.set_xlabel("inter-arrival time between successive accesses to the same file", fontsize=10)
-    ax.set_ylabel("cumulative fraction of re-accesses", fontsize=10)
-    ax.set_title(
-        "Repeat-access inter-arrival CDF\n"
-        f"{len(pos)} intervals across {n_files} re-accessed files · "
-        f"p50={_fmt_secs(p50)}  p95={_fmt_secs(p95)}  p99={_fmt_secs(p99)}",
-        fontsize=12,
-    )
-    ax.grid(alpha=0.3, which="both")
+def create_effective_bandwidth_matplotlib(trace_dir: Path, output_path: Path) -> None:
+    try:
+        p1 = json.loads((trace_dir / "phase1_metrics.json").read_text())
+    except Exception:
+        p1 = {}
+    ebw = p1.get("effective_bandwidth") or {}
+    by_phase = ebw.get("by_phase") or {}
+    rows = []
+    for phase, vals in by_phase.items():
+        read = vals.get("read") or {}
+        write = vals.get("write") or {}
+        total_bytes = (read.get("bytes") or 0) + (write.get("bytes") or 0)
+        has_reliable_bw = isinstance(read.get("effective_Bps"), (int, float)) or isinstance(write.get("effective_Bps"), (int, float))
+        if total_bytes > 0 and has_reliable_bw:
+            rows.append((phase, read, write, total_bytes))
+    rows.sort(key=lambda r: r[3], reverse=True)
+    rows = rows[:12]
+
+    fig, ax = plt.subplots(figsize=(12, max(4.5, 0.45 * len(rows) + 1.8)))
+    if not rows:
+        _no_data_placeholder(ax, "Effective bandwidth — no data", "No reliable workload read/write bandwidth samples")
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        return
+
+    y = np.arange(len(rows))
+
+    def mbps(stat: dict) -> float:
+        v = stat.get("effective_Bps")
+        return float(v) / (1024 * 1024) if isinstance(v, (int, float)) else 0.0
+
+    read_vals = [mbps(r[1]) for r in rows]
+    write_vals = [mbps(r[2]) for r in rows]
+    height = 0.36
+    ax.barh(y - height / 2, read_vals, height, color="#1f77b4", label="read")
+    ax.barh(y + height / 2, write_vals, height, color="#ff7f0e", label="write")
+    ax.set_yticks(y)
+    ax.set_yticklabels([r[0] for r in rows], fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("effective bandwidth (MiB/s)")
+    ax.grid(axis="x", alpha=0.25)
+    ax.set_title("Effective Bandwidth by Phase")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def create_access_pattern_matplotlib(trace_dir: Path, output_path: Path) -> None:
+    try:
+        p1 = json.loads((trace_dir / "phase1_metrics.json").read_text())
+    except Exception:
+        p1 = {}
+    seq = p1.get("sequentiality") or {}
+    four = seq.get("four_cell") or {}
+    vals = [
+        int(four.get("seq_read") or 0),
+        int(four.get("rand_read") or 0),
+        int(four.get("seq_write") or 0),
+        int(four.get("rand_write") or 0),
+    ]
+
+    fig, ax0 = plt.subplots(1, 1, figsize=(8.5, 4.6))
+    total_plotted = sum(vals)
+    if not total_plotted:
+        note = seq.get("note") or "No offset-bearing workload data operations"
+        _no_data_placeholder(ax0, "Access pattern — no classified transitions", note)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        return
+
+    labels = ["Seq R", "Rand R", "Seq W", "Rand W"]
+    colors = ["#2ca02c", "#d62728", "#1f77b4", "#ff7f0e"]
+    xs = np.arange(len(labels))
+    ax0.bar(xs, vals, color=colors, edgecolor="black", linewidth=0.3)
+    ax0.set_xticks(xs)
+    ax0.set_xticklabels(labels)
+    ax0.set_ylabel("# classified transitions / append ops")
+    ax0.grid(axis="y", alpha=0.25)
+    ax0.set_title("Access Pattern")
+    # A stream is classified Seq/Rand only when it has a *transition* (>=2 ops on
+    # the same fd/open-generation) or is an append. Single-write outputs (open ->
+    # write once -> close, no O_APPEND) produce no transition, so writes can be
+    # present in the trace yet show 0 here.
+    wr_by_kind = (seq.get("ops_with_offset_by_kind") or {})
+    if vals[2] == 0 and vals[3] == 0 and int(wr_by_kind.get("write") or 0) > 0:
+        fig.text(
+            0.5, -0.02,
+            f"note: {int(wr_by_kind.get('write'))} write ops occurred but none formed a "
+            "seq/rand transition (single-write streams, no O_APPEND) -> Seq/Rand W = 0",
+            ha="center", va="top", fontsize=8, color="#a55",
+        )
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
@@ -2290,252 +1590,7 @@ def _dominant_lane_segments(llm_iv, fileio_iv, tool_iv, span_s, px=_RASTER_PX):
     ]
 
 
-def _agent_concurrency_data(trace_dir: Path) -> dict | None:
-    """
-    Per-agent lane data for the agent concurrency chart.
 
-    Lane = one agent (genomas_role; traces without roles collapse to a single
-    "agent" lane).  Bars are resource segments: LLM windows, syscall-latency
-    resources, and residual CPU/orchestration self-time.  Blank space is
-    explicit lane idle.
-
-    Returns dict with:
-      lanes: [{role, label, segments, busy, busy_s, pct}]  (sorted by first start)
-      wall_s, t0_s, max_concurrent, parallel_s, parallel_pct
-    """
-    from agent_io_tracing.analysis.parallelism import (
-        build_children,
-        compute_self_intervals,
-        load_events,
-    )
-
-    try:
-        events = load_events(trace_dir)
-    except FileNotFoundError as exc:
-        print(f"  agent_concurrency: {exc}", file=sys.stderr)
-        return None
-    if not events:
-        return None
-
-    t0 = min(ev.start_ms for ev in events.values())
-    wall_ms = max(ev.end_ms for ev in events.values()) - t0
-
-    children = build_children(events)
-    self_iv_by_id = compute_self_intervals(events, children)
-    event_role = {rid: (ev.role or "agent") for rid, ev in events.items()}
-    wall_s = wall_ms / 1000.0
-    FILE_IO_CATS = {"metadata", "data", "control", "modify"}
-
-    # Per-role interval sets: LLM windows, tool self-time, file-IO within tools.
-    # Everything in a tool that is NOT file-IO (compute, framework, waiting,
-    # process-mgmt) is lumped into "Tool-other" — we do not claim to separate
-    # compute from wait (not possible from syscall latency alone).
-    llm_iv_by_role: dict[str, list[tuple[float, float]]] = {}
-    tool_iv_by_role: dict[str, list[tuple[float, float]]] = {}
-    fileio_iv_by_role: dict[str, list[tuple[float, float]]] = {}
-
-    for rid, ev in events.items():
-        role = event_role[rid]
-        if ev.kind == "llm":
-            llm_iv_by_role.setdefault(role, []).append(
-                ((ev.start_ms - t0) / 1000.0, (ev.end_ms - t0) / 1000.0))
-        elif ev.kind == "tool":
-            for s, e in self_iv_by_id.get(rid, []):
-                if e > s:
-                    tool_iv_by_role.setdefault(role, []).append(
-                        ((s - t0) / 1000.0, (e - t0) / 1000.0))
-
-    parsed_json = trace_dir / "parsed.json"
-    if parsed_json.exists():
-        fs_df = load_parsed_json(parsed_json).fs_entries_df
-        t0_dt = datetime.fromtimestamp(t0 / 1000.0)
-        if len(fs_df) and "timestamp" in fs_df.columns:
-            cols = ["matched_tool_call", "syscall", "timestamp", "duration"]
-            if "path" in fs_df.columns:
-                cols.append("path")
-            df = fs_df[cols].copy()
-            df = df[df["matched_tool_call"].isin(event_role.keys())]
-            df["cat"] = _effective_category_series(df.rename(columns={"syscall": "operation"}))
-            df = df[df["cat"].isin(FILE_IO_CATS)]
-        else:
-            df = None
-        if df is not None and len(df):
-            t0_ts = pd.Timestamp(t0_dt)
-            t0_midnight = pd.Timestamp(t0_dt.date())
-            ts = df["timestamp"]
-            aligned = t0_midnight + (ts - ts.dt.normalize())
-            shift_s = 0
-            gap_s = (aligned.min() - t0_ts).total_seconds()
-            if abs(gap_s) >= 1800:
-                shift_s = round(gap_s / 900) * 900
-            end_rel = (aligned - t0_ts).dt.total_seconds() - shift_s
-            duration_s = pd.to_numeric(df["duration"], errors="coerce").fillna(0.0)
-            start_rel = end_rel - duration_s
-            keep = (end_rel >= -1.0) & (start_rel <= wall_s + 1.0)
-            for tid, s, e in zip(
-                df["matched_tool_call"][keep], start_rel[keep], end_rel[keep]
-            ):
-                fileio_iv_by_role.setdefault(event_role[tid], []).append(
-                    (max(0.0, float(s)), max(0.0, float(e))))
-
-    roles = set(llm_iv_by_role) | set(tool_iv_by_role) | set(fileio_iv_by_role)
-    lanes = []
-    for role in roles:
-        llm_iv = _merge_intervals(llm_iv_by_role.get(role, []))
-        tool_iv = _merge_intervals(tool_iv_by_role.get(role, []))
-        fileio_iv = _intersect_intervals(
-            tool_iv, _merge_intervals(fileio_iv_by_role.get(role, [])))
-        busy = _merge_intervals(llm_iv + tool_iv)
-        busy_s = sum(e - s for s, e in busy)
-        # Per-bucket dominant (Tool-other derived as tool−fileio inside the
-        # bucketizer — no O(n^2) interval subtraction).
-        display = _dominant_lane_segments(llm_iv, fileio_iv, tool_iv, wall_s)
-        lanes.append({
-            "role": role, "label": role,
-            "segments": display, "busy": busy, "busy_s": busy_s,
-        })
-    lanes.sort(key=lambda lane: lane["busy"][0][0] if lane["busy"] else 0.0)
-
-    # Sweep over per-agent unions: max simultaneous agents + time at >=2.
-    points: list[tuple[float, int]] = []
-    for lane in lanes:
-        for s, e in lane["busy"]:
-            points.append((s, 1))
-            points.append((e, -1))
-    points.sort()
-    active = 0
-    last: float | None = None
-    parallel_s = 0.0
-    max_concurrent = 0
-    for t, delta in points:
-        if last is not None and t > last and active >= 2:
-            parallel_s += t - last
-        active += delta
-        max_concurrent = max(max_concurrent, active)
-        last = t
-
-    return {
-        "lanes": lanes,
-        "wall_s": wall_s,
-        "max_concurrent": max_concurrent,
-        "parallel_s": parallel_s,
-        "parallel_pct": (parallel_s / wall_s * 100.0) if wall_s > 0 else 0.0,
-    }
-
-
-# Deterministic lane colors (tab10-like, reused in order of first activity).
-AGENT_LANE_COLORS = [
-    "#2ca02c", "#ff7f0e", "#1f77b4", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-]
-
-
-def create_agent_concurrency_matplotlib(trace_dir: Path, output_path: Path) -> None:
-    """Agent activity timeline — one lane per agent, colored by resource."""
-    data = _agent_concurrency_data(trace_dir)
-    if data is None or not data["lanes"]:
-        print(f"  agent_concurrency: no data found in {trace_dir}", file=sys.stderr)
-        return
-
-    lanes = data["lanes"]
-    n = len(lanes)
-    fig, ax = plt.subplots(figsize=(14, max(2.6, 0.85 * n + 1.6)))
-
-    for i, lane in enumerate(lanes):
-        y = n - 1 - i  # first-active agent on top
-        for seg in lane["segments"]:
-            color = RESOURCE_COLORS.get(seg["resource"], "#95A5A6")
-            ax.broken_barh(
-                [(seg["start"], seg["end"] - seg["start"])],
-                (y - 0.36, 0.72),
-                facecolors=color,
-                edgecolors="white",
-                linewidth=0.3,
-            )
-
-    ax.set_yticks([n - 1 - i for i in range(n)])
-    ax.set_yticklabels([lane["label"] for lane in lanes], fontsize=10)
-    ax.set_ylim(-0.7, n - 0.3)
-    ax.set_xlim(0, data["wall_s"] * 1.005)
-    ax.set_xlabel("time (s)")
-    ax.grid(axis="x", alpha=0.3)
-    ax.set_title(
-        f"max {data['max_concurrent']} agents concurrent · "
-        f"agents in parallel (≥2 active): {data['parallel_s']:.0f}s "
-        f"({data['parallel_pct']:.0f}% of wall)",
-        fontsize=10, color="#555555",
-    )
-
-    legend_handles = [
-        mpatches.Patch(facecolor=RESOURCE_COLORS.get(label, "#95A5A6"), label=label)
-        for label in ["LLM", "File-IO", "Tool-other"]
-    ]
-    fig.legend(handles=legend_handles, loc="lower center",
-               ncol=3, frameon=False, fontsize=9)
-
-    fig.suptitle("Agent activity timeline", fontsize=13)
-    plt.tight_layout(rect=[0, 0.10, 1, 0.97])
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-
-
-def create_agent_concurrency_plotly(trace_dir: Path, output_path: Path) -> None:
-    """Interactive twin of create_agent_concurrency_matplotlib."""
-    data = _agent_concurrency_data(trace_dir)
-    if data is None or not data["lanes"]:
-        print(f"  agent_concurrency: no data found in {trace_dir}", file=sys.stderr)
-        return
-
-    lanes = data["lanes"]
-    n = len(lanes)
-    fig = go.Figure()
-    shown_resources: set[str] = set()
-    for _i, lane in enumerate(lanes):
-        y = lane["label"]
-        for seg in lane["segments"]:
-            resource = seg["resource"]
-            showlegend = resource not in shown_resources
-            shown_resources.add(resource)
-            fig.add_trace(go.Bar(
-                y=[y],
-                x=[seg["end"] - seg["start"]],
-                base=[seg["start"]],
-                orientation="h",
-                marker=dict(
-                    color=RESOURCE_COLORS.get(resource, "#95A5A6"),
-                    line=dict(width=0.3, color="white"),
-                ),
-                name=resource,
-                legendgroup=resource,
-                showlegend=showlegend,
-                customdata=[[seg["end"], seg.get("label", "")]],
-                hovertemplate=(
-                    f"<b>{lane['role']}</b><br>"
-                    f"{resource}<br>"
-                    "start: %{base:.3f}s<br>"
-                    "end: %{customdata[0]:.3f}s<br>"
-                    "detail: %{customdata[1]}<extra></extra>"
-                ),
-            ))
-
-    fig.update_layout(
-        title=(
-            f"<b>Agent activity timeline</b> — "
-            f"max {data['max_concurrent']} agents concurrent · "
-            f"in parallel (≥2 active): {data['parallel_s']:.0f}s "
-            f"({data['parallel_pct']:.0f}% of wall)"
-        ),
-        barmode="overlay",
-        height=max(300, 90 * n + 160),
-        width=1400,
-        xaxis=dict(title="time (s)", range=[0, data["wall_s"] * 1.005]),
-        yaxis=dict(categoryorder="array",
-                   categoryarray=[lane["label"] for lane in reversed(lanes)]),
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        margin=dict(l=30, r=30, t=70, b=50),
-    )
-    fig.write_html(output_path)
 
 
 # =============================================================================
@@ -2732,7 +1787,7 @@ def _datetime_from_ms(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000.0)
 
 
-# Bundle cache: phase_breakdown, agent_timeline and agent_concurrency all call
+# Bundle cache: phase_breakdown and agent_timeline both call
 # _load_agent_timeline_data(trace_dir) with the same argument and consume the
 # result read-only. Without caching, each recomputes the full alignment AND
 # reloads/​copies the millions of fs_entries. Cache the bundle per trace_dir so
@@ -3763,6 +2818,11 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
             x /= 1024.0
         return f"{x:.1f} TB"
 
+    def fmt_seconds(value) -> str:
+        if value is None or value == "":
+            return "not resolved"
+        return fmt_num(value) + "s"
+
     def esc(text) -> str:
         return html.escape(str(text), quote=True)
 
@@ -3774,10 +2834,11 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
     io_summary = jload(lineage_dir / "io_summary.json") or jload(trace_dir / "io_summary.json")
     artifact_rows = load_artifact_rows()
     ratios = p1.get("metadata_data_ratio") or {}
-    fsz = p1.get("file_size_cdf") or {}
+    req = p1.get("request_size_cdf") or {}
     files_per_tool = ((p1.get("namespace") or {}).get("files_per_tool_call") or {})
     fs_non_llm = p1.get("fs_io_non_llm") or {}
     amp = p1.get("analytical_optimum_amplification") or {}
+    seq = p1.get("sequentiality") or {}
     wl = (io_summary.get("workload") or {})
 
     # Setup / Global only — descriptive aggregates that belong to no single
@@ -3837,94 +2898,7 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         )
         return f"<table class='compact'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
-    iface = p1.get("interface_mix") or {}
-    iface_bytes = p1.get("interface_byte_mix") or {}
-    iface_total = iface.get("total_execs") or 0
-    iface_io_execs = iface.get("execs_with_file_io") or 0
-    observed_read_ops = amp.get("actual_read_ops")
-    observed_write_ops = amp.get("actual_write_ops")
-    observed_io_note = (
-        f"Observed by eBPF: {fmt_num(observed_read_ops, 0)} read-family syscalls and "
-        f"{fmt_num(observed_write_ops, 0)} write-family syscalls across the process. "
-        "These are different layers: generated-code API choice vs kernel-level I/O."
-    )
-    iface_note = (
-        f"{fmt_num(iface_total, 0)} generated-code execution(s); "
-        f"{fmt_num(iface_io_execs, 0)} used file-I/O APIs in the generated snippet. "
-        "(static, from generated source — not measured syscall bytes). "
-        f"{observed_io_note}"
-        if iface_total else (
-            "No generated code captured for this cell. "
-            "(static generated-source mix unavailable — not measured syscall bytes). "
-            f"{observed_io_note}"
-        )
-    )
-    iface_byte_table = kv_table(["interface byte mix", "value"], [
-        ["STDIO bytes (fread/fwrite)", fmt_bytes(iface_bytes.get("stdio_bytes"))],
-        ["POSIX observed bytes (read/write syscalls)", fmt_bytes(iface_bytes.get("posix_observed_bytes"))],
-        ["direct POSIX bytes est.", fmt_bytes(iface_bytes.get("posix_direct_bytes_est"))],
-        ["STDIO / direct POSIX est.", f"{fmt_num(iface_bytes.get('stdio_pct_deoverlapped'))}% / {fmt_num(iface_bytes.get('posix_direct_pct_deoverlapped'))}%"],
-    ])
-    iface_byte_note = iface_bytes.get("note") or (
-        "Requires new traces with libc fread/fwrite uprobes; older traces show zeros."
-    )
-    generated_code_records = []
-    generated_code_path = trace_dir / "generated_code.jsonl"
-    if generated_code_path.is_file():
-        for line in generated_code_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            generated_code_records.append(rec)
-
-    saved_generated_scripts = sorted((trace_dir / "scilink_session").glob("results/**/*.py"))
-
-    def rel_from_output(path: Path) -> str:
-        try:
-            return "../" + path.relative_to(trace_dir).as_posix()
-        except ValueError:
-            return str(path)
-
-    def generated_code_evidence_table() -> str:
-        rows = []
-        for rec in generated_code_records[:8]:
-            rid = str(rec.get("run_id") or "")[:8] or "?"
-            imports = ", ".join(rec.get("imports") or []) or "(none)"
-            layers = ", ".join(rec.get("io_layers") or []) or "(no file-I/O API)"
-            rows.append(
-                "<tr>"
-                f"<td>{esc(rid)}</td>"
-                f"<td>{esc(fmt_num(rec.get('code_len'), 0))}</td>"
-                f"<td>{esc(imports)}</td>"
-                f"<td>{esc(layers)}</td>"
-                "</tr>"
-            )
-        if not rows:
-            rows.append("<tr><td colspan='4' class='muted'>No generated_code.jsonl records.</td></tr>")
-        source_links = []
-        if generated_code_path.is_file():
-            source_links.append(
-                f"<a href='../generated_code.jsonl'>generated_code.jsonl</a>"
-            )
-        for script in saved_generated_scripts[:4]:
-            source_links.append(
-                f"<a href='{esc(rel_from_output(script))}'>{esc(script.name)}</a>"
-            )
-        links_html = (
-            "<p class='muted'>Evidence: " + " · ".join(source_links) + "</p>"
-            if source_links else ""
-        )
-        return (
-            "<table class='compact'><thead><tr>"
-            "<th>run id</th><th>code len</th><th>imports</th><th>classified I/O API layer</th>"
-            "</tr></thead><tbody>"
-            + "".join(rows)
-            + "</tbody></table>"
-            + links_html
-        )
+    measured_iface = p1.get("measured_interface_layers") or {}
 
     state = p1.get("state_file_rewrite_frequency") or {}
     state_rows = [
@@ -3935,20 +2909,18 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
     state_table = kv_table(["state file", "n_writes", "n_reads", "write bytes"], state_rows)
     state_note = "matches: " + " · ".join(state.get("path_hints") or [])
 
-    ds = p1.get("directory_scan") or {}
-    total_scans = ds.get("total_scans") or 0
-    unique_dirs = ds.get("unique_directories_scanned") or 0
-    rescanned_dirs = ds.get("rescanned_directories") or 0
-    avg_scans_per_dir = (total_scans / unique_dirs) if unique_dirs else None
-    ds_note = (
-        f"{fmt_num(total_scans, 0)} scans over {fmt_num(unique_dirs, 0)} dirs"
-        + (f" (avg {fmt_num(avg_scans_per_dir)}×)" if avg_scans_per_dir is not None else "")
-        + f" · {fmt_num(rescanned_dirs, 0)}/{fmt_num(unique_dirs, 0)} rescanned ≥2×"
-    )
-
     fos = p1.get("failed_open_stat") or {}
     fos_rows = [[syscall, fmt_num(count, 0)] for syscall, count in (fos.get("by_syscall") or {}).items()]
+    if not fos_rows and "total_failed" in fos:
+        fos_rows = [["all tracked open/stat syscalls", "0 failures"]]
     fos_table = kv_table(["failed syscall", "# failures"], fos_rows)
+    _fr = fos.get("failed_rate")
+    fos_note = (
+        f"{fmt_num(fos.get('total_failed'), 0)} agent-level failed probe(s)"
+        + (f", {fmt_num(_fr * 100)}% of agent open/stat attempts" if _fr is not None else "")
+        + f" · excluded {fmt_num(fos.get('import_probe_failed_excluded'), 0)} CPython import probe(s)"
+        f" of {fmt_num(fos.get('total_failed_raw'), 0)} raw failures"
+    )
 
     elr = p1.get("error_log_reads") or {}
     elr_note = (
@@ -3989,41 +2961,44 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         ["total data bytes", fmt_bytes(eo.get("total_data_bytes"))],
     ])
 
-    req = p1.get("request_size_cdf") or {}
-    req_table = kv_table(["request size", "value"], [
-        ["p50 / p95 / p99", " / ".join(fmt_bytes(req.get(k)) for k in ("p50_bytes", "p95_bytes", "p99_bytes"))],
-        ["% <4KB", fmt_num(req.get("pct_lt_4kb")) + "%"],
-        ["% <10MB", fmt_num(req.get("pct_lt_10mb")) + "%"],
-    ])
-    req_note = "one request = one read/write-family syscall (metadata calls excluded)"
-
-    rca = amp.get("read_call_amplification")
-    wca = amp.get("write_call_amplification")
+    merge = seq.get("mergeability") or {}
     amp_table = kv_table(["I/O batching efficiency", "value"], [
-        ["read call amplification", (fmt_num(rca) + "×") if rca is not None else "n/a"],
-        ["write call amplification", (fmt_num(wca) + "×") if wca is not None else "n/a"],
-        ["actual / optimum read ops", f"{fmt_num(amp.get('actual_read_ops'), 0)} / {fmt_num(amp.get('optimum_read_ops'), 0)}"],
+        ["mergeable ops saved", f"{fmt_num(merge.get('saved_ops'), 0)} / {fmt_num(merge.get('actual_ops_with_offset'), 0)}"],
+        ["saved ops share", f"{fmt_num(merge.get('saved_ops_pct_of_actual_ops'))}%"],
+        ["bytes in consecutive runs", f"{fmt_bytes(merge.get('bytes_in_consecutive_runs'))} / {fmt_bytes(merge.get('bytes_total_with_offset'))}"],
+        ["consecutive-run byte share", f"{fmt_num(merge.get('bytes_in_consecutive_runs_pct'))}%"],
     ])
-    amp_note = "amplification = actual ops / ceil(bytes / 4MB baseline)"
+    if not merge.get("actual_ops_with_offset"):
+        amp_note = seq.get("note") or (
+            "Offset coverage unavailable; old traces need VFS offset capture before mergeability can be computed."
+        )
+    else:
+        amp_note = merge.get("note") or ""
 
-    fsz_table = kv_table(["file size", "value"], [
-        ["p50 / p95 / p99", " / ".join(fmt_bytes(fsz.get(k)) for k in ("p50_bytes", "p95_bytes", "p99_bytes"))],
-        ["% <1MB", fmt_num(fsz.get("pct_lt_1mb")) + "%"],
-        ["% <1GB", fmt_num(fsz.get("pct_lt_1gb")) + "%"],
-    ])
-
-    seq_note = (
-        "Planned categories: consecutive / backward / gap-random. Not measurable here: "
-        "plain read/write syscalls carry no offset argument, and offset-bearing variants "
-        "(pread64/pwrite64/preadv/pwritev) had zero occurrences in every trace so far."
-    )
-
-    fca = amp.get("file_count_amplification")
-    moa = amp.get("metadata_op_amplification")
-    logphys_table = kv_table(["logical→physical", "value"], [
-        ["file count amplification", (fmt_num(fca) + "×") if fca is not None else "n/a"],
-        ["metadata op amplification", (fmt_num(moa) + "×") if moa is not None else "n/a"],
-    ])
+    pc_counts = {"1-1": 0, "1-n": 0, "n-1": 0, "n-n": 0}
+    pc_total = 0
+    for _key, _n in ((io_summary.get("fanout") or {}).get("reader_writer_joint") or {}).items():
+        try:
+            _w, _r = (int(x) for x in str(_key).split(",", 1))
+            _n = int(_n)
+        except (TypeError, ValueError):
+            continue
+        pc_total += _n
+        if _w <= 1 and _r <= 1:
+            pc_counts["1-1"] += _n
+        elif _w <= 1:
+            pc_counts["1-n"] += _n
+        elif _r <= 1:
+            pc_counts["n-1"] += _n
+        else:
+            pc_counts["n-n"] += _n
+    pc_table = kv_table(
+        ["producer-consumer", "files", "share"],
+        [
+            [label, fmt_num(pc_counts[label], 0), f"{fmt_num(100.0 * pc_counts[label] / pc_total)}%"]
+            for label in ["1-1", "1-n", "n-1", "n-n"]
+        ],
+    ) if pc_total else ""
 
     pdeg = (par.get("parallel_degree") or {}).get("semantic_events") or {}
     pardeg_table = kv_table(["workflow concurrency", "value"], [
@@ -4054,13 +3029,17 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         if not links and (not img_rel or not (output_dir / img_rel).exists()):
             return ""
         img = f"<img src='{esc(img_rel)}' alt='{esc(title)}'>" if img_rel else ""
-        caption_html = f"<p class='muted'>{esc(caption)}</p>" if caption else ""
+        caption_html = (
+            "<p class='muted'>"
+            + "<br>".join(esc(line) for line in caption.split("\n") if line.strip())
+            + "</p>"
+        ) if caption else ""
         return f"<article class='card'>{img}<div><h3>{esc(title)}</h3>{caption_html}<nav>{links}</nav></div></article>"
 
-    def viz_card(viz: str, title: str) -> str:
+    def viz_card(viz: str, title: str, caption: str = "") -> str:
         links = links_for(viz)
         img_rel = f"{viz}.png" if (output_dir / f"{viz}.png").exists() else None
-        return figure_card(title, img_rel, links)
+        return figure_card(title, img_rel, links, caption)
 
     def lineage_card(fname: str, title: str, caption: str = "") -> str:
         path = lineage_dir / fname
@@ -4088,8 +3067,6 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
 
     def artifact_summary_from_rows() -> dict:
         unknown = [r for r in artifact_rows if (r.get("size_source") or "") == "unknown"]
-        stale_vals = [as_float(r.get("staleness_s")) for r in artifact_rows]
-        stale_vals = [v for v in stale_vals if v is not None]
         generated = [r for r in artifact_rows if as_float(r.get("total_write_bytes")) and as_float(r.get("total_write_bytes")) > 0]
         write_once_leaf = [r for r in generated if (r.get("lifecycle_class") or "") == "ephemeral_leaf"]
         reclaimable = [
@@ -4100,10 +3077,6 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
             "artifact_sizes": {
                 "has_unknown_size": bool(unknown),
                 "unknown_size_files": len(unknown),
-            },
-            "staleness": {
-                "n": len(stale_vals),
-                "median_s": median(stale_vals),
             },
             "lifecycle": {
                 "generated_files": len(generated),
@@ -4126,7 +3099,7 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
 
     row_summary = artifact_summary_from_rows() if artifact_rows else {}
     artifact_size_summary = io_summary.get("artifact_sizes") or row_summary.get("artifact_sizes") or {}
-    staleness_summary = io_summary.get("staleness") or row_summary.get("staleness") or {}
+    write_read_gap = io_summary.get("write_read_gap_s") or {}
     lifecycle_summary = {
         **(row_summary.get("lifecycle") or {}),
         **(io_summary.get("lifecycle") or {}),
@@ -4142,15 +3115,11 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
             / float(lifecycle_summary["generated_files"])
         )
 
-    reader_fanout_caption = (
-        "(?) = size unknown — read-only input not stat-able after the run "
-        "(not recorded in artifact_sizes.json)"
-        if artifact_size_summary.get("has_unknown_size")
-        else ""
-    )
-    staleness_title = "Write→First-Read Staleness"
-    if staleness_summary.get("median_s") is not None:
-        staleness_title += f" (median={fmt_num(staleness_summary.get('median_s'))}s)"
+    # The reader/writer fan-out figure is a histogram of fan-out k; it draws no
+    # per-file size markers, so there is no "(?)" glyph to annotate anymore.
+    # (The old caption explained a size marker from a prior per-bar version.)
+    reader_fanout_caption = ""
+    staleness_title = "Write→Read Gap"
 
     lifecycle_title = "Artifact Lifecycle"
     lifecycle_bits = []
@@ -4184,43 +3153,139 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         lifecycle_bits.append(
             f"reclaimable median dead {fmt_num(lifecycle_summary.get('reclaimable_median_dead_s'))}s"
         )
-    if lifecycle_bits:
-        lifecycle_title += " (" + " · ".join(lifecycle_bits) + ")"
+    def caption_join(parts: list[str]) -> str:
+        return "\n".join(part for part in parts if part)
+
+    lifecycle_caption = caption_join(lifecycle_bits)
+
+    def write_read_gap_caption() -> str:
+        return caption_join([
+            f"n={fmt_num(write_read_gap.get('n_pairs'), 0)} write→read pairs",
+            f"p50={fmt_seconds(write_read_gap.get('p50_s'))}",
+            f"p95={fmt_seconds(write_read_gap.get('p95_s'))}",
+            f"<1s={fmt_num(write_read_gap.get('pct_lt_1s'))}%",
+        ])
+
+    def inter_arrival_caption() -> str:
+        ia = p1.get("inter_arrival") or {}
+        return caption_join([
+            f"n={fmt_num(ia.get('n_intervals'), 0)} re-access intervals",
+            f"p50={fmt_seconds(ia.get('p50_s'))}",
+            f"p95={fmt_seconds(ia.get('p95_s'))}",
+            f"<1s={fmt_num(ia.get('pct_lt_1s'))}%",
+        ])
+
+    def directory_caption() -> str:
+        ds = p1.get("directory_scan") or {}
+        return caption_join([
+            f"{fmt_num(ds.get('total_scans'), 0)} scans over {fmt_num(ds.get('unique_directories_scanned'), 0)} workload directories",
+            f"{fmt_num(ds.get('rescanned_directories'), 0)} rescanned",
+            f"p95 scans/dir={fmt_num(ds.get('p95_scans_per_dir'))}",
+        ])
+
+    def file_size_caption() -> str:
+        return caption_join([
+            f"Requests: <4KB={fmt_num(req.get('pct_lt_4kb'))}%",
+            f"<64KB={fmt_num(req.get('pct_lt_64kb'))}%",
+            f"bytes-weighted mean request={fmt_bytes(req.get('bytes_weighted_mean_request_bytes'))}",
+        ])
+
+    def access_pattern_caption() -> str:
+        pct = seq.get("four_cell_pct") or {}
+        cov = seq.get("pct_ops_with_offset")
+        by_kind = seq.get("ops_with_offset_by_kind") or {}
+        tid_streams = seq.get("by_stream_tid_fd_open_generation") or {}
+        read_transitions = ((tid_streams.get("read") or {}).get("transitions") or 0)
+        write_transitions = ((tid_streams.get("write") or {}).get("transitions") or 0)
+        return caption_join([
+            "Seq = consecutive/gap or append; Rand = backward/random.",
+            f"read={fmt_num(by_kind.get('read'), 0)} ops / {fmt_num(read_transitions, 0)} transitions",
+            f"write={fmt_num(by_kind.get('write'), 0)} ops / {fmt_num(write_transitions, 0)} transitions",
+            f"Seq R={fmt_num(pct.get('seq_read'))}%",
+            f"Rand R={fmt_num(pct.get('rand_read'))}%",
+            f"Seq W={fmt_num(pct.get('seq_write'))}%",
+            f"Rand W={fmt_num(pct.get('rand_write'))}%",
+            f"offset coverage={fmt_num(cov)}%" if cov is not None else "",
+        ])
+
+    def io_rate_caption() -> str:
+        return (
+            "output tokens/s = each LLM call's API-reported output-token count "
+            "spread evenly over the call's wall-clock duration."
+        )
+
+    def effective_bw_caption() -> str:
+        eff = p1.get("effective_bandwidth") or {}
+        glob = eff.get("global") or {}
+        gread = glob.get("read") or {}
+        gwrite = glob.get("write") or {}
+        return caption_join([
+            f"Global read={fmt_bytes(gread.get('effective_Bps'))}/s",
+            f"global write={fmt_bytes(gwrite.get('effective_Bps'))}/s",
+            "effective bandwidth = bytes / sum(syscall duration; guarded by min ops and min I/O time).",
+        ])
+
+    def measured_interface_caption() -> str:
+        stdio = ((measured_iface.get("layers") or {}).get("STDIO") or {})
+        pt_ops = stdio.get("process_tree_ops")
+        pt_bytes = stdio.get("process_tree_bytes")
+        return caption_join([
+            (
+                f"pathless STDIO process-tree context: {fmt_num(pt_ops, 0)} ops / {fmt_bytes(pt_bytes)}"
+                if pt_ops else ""
+            ),
+        ])
+
+    def io_volume_caption() -> str:
+        cov = io_summary.get("coverage_pct") or {}
+        return caption_join([
+            f"R:W bytes={fmt_num(wl.get('rw_byte_ratio'))}:1" if wl.get("rw_byte_ratio") else "",
+            f"coverage read/write={fmt_num(cov.get('read'))}%/{fmt_num(cov.get('write'))}%" if cov else "",
+        ])
 
     # --- Figures grouped by axis ------------------------------------------
     setup_figs = "".join([
-        lineage_card("fig0_io_volume_summary.png", "I/O Volume Summary"),
+        lineage_card("fig0_io_volume_summary.png", "I/O Volume Summary", io_volume_caption()),
         viz_card("agent_timeline", "Agent Timeline"),
         viz_card("phase_breakdown", "Time Accounting"),
         external_card("../call_dag.html", "Call DAG with I/O"),
+        # Per-run I/O characterization (paper Fig 2 / Fig 3 analogs), computed
+        # from this run's own workload files by
+        # agent_io_tracing.analysis.per_run_io_char.
+        viz_card("file_access_volume", "File Access Frequency x Volume",
+                 "Per-run workload files grouped by access frequency and data volume."),
+        viz_card("rw_asymmetry", "Read/Write Asymmetry",
+                 "Per-run workload-file classes and per-file read/write byte skew."),
     ])
-    ax1_figs = ""
-    ax2_figs = "".join([
-        viz_card("directory_scan", "Directory Rescans"),
-        viz_card("inter_arrival_cdf", "Inter-arrival CDF"),
+    ax1_figs = "".join([
+        viz_card("directory_scan", "Directory Re-scans (getdents64)", directory_caption()),
+        viz_card("inter_arrival_cdf", "Inter-arrival Histogram", inter_arrival_caption()),
         viz_card("reread_attribution", "Reread Attribution"),
         lineage_card(
-            "fig2_reader_fanout.png", "Reader Fan-out",
+            "fig2_fanout.png", "Reader & Writer Fan-out",
             reader_fanout_caption,
         ),
-        lineage_card("fig3_staleness_cdf.png", staleness_title),
-        lineage_card("fig6_reuse_pattern.png", "Reuse Pattern"),
+        lineage_card("fig3_staleness_cdf.png", staleness_title, write_read_gap_caption()),
     ])
-    _iface_card = viz_card("interface_mix", "Generated-Code I/O API Mix")
-    ax3_figs = _iface_card + (f"<p class='muted'>{esc(iface_note)}</p>" if _iface_card else "")
-    ax4_figs = lineage_card("fig4_lifecycle.png", lifecycle_title)
-    ax5_figs = lineage_card("fig1_size_distribution.png", "File Size Distribution")
-    ax6_figs = "".join([
-        viz_card("agent_concurrency", "Agent Activity Timeline"),
-        lineage_card("fig7_role_io_attribution.png", "Who Does the I/O"),
-        viz_card("io_rate", "I/O Rate Over Time"),
+    ax2_figs = viz_card("measured_interface_layers", "Measured I/O Interface Mix",
+                        measured_interface_caption())
+    ax3_figs = lineage_card("fig4_lifecycle.png", lifecycle_title, lifecycle_caption)
+    ax4_figs = "".join([
+        lineage_card("fig1_size_distribution.png", "File and Request Size", file_size_caption()),
+        viz_card("access_pattern", "Access Pattern", access_pattern_caption()),
+    ])
+    ax5_figs = "".join([
+        viz_card("io_rate", "I/O Rate Over Time", io_rate_caption()),
+        viz_card("effective_bandwidth", "Effective BW by Phase", effective_bw_caption()),
         viz_card("io_autocorrelation", "I/O Autocorrelation"),
-        viz_card("intensity_phases", "Intensity Phases"),
     ])
 
     # --- Per-axis table grids ---------------------------------------------
     def panel(title: str, table: str, note: str = "") -> str:
-        note_html = f'<p class="muted">{esc(note)}</p>' if note else ""
+        lines = [seg.strip() for seg in note.replace("\n", " · ").split(" · ") if seg.strip()]
+        note_html = (
+            '<p class="muted">' + "<br>".join(esc(seg) for seg in lines) + "</p>"
+        ) if lines else ""
         return f"<div><h3>{esc(title)}</h3>{note_html}{table}</div>"
 
     def grid(*cells: str) -> str:
@@ -4228,51 +3293,29 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         return f'<div class="attr-grid">{inner}</div>' if inner else ""
 
     ax1_tables = grid(
-    )
-    ax2_tables = grid(
-        panel("Directory rescans", "", ds_note),
         panel("Access type RH/WH/RW", rh_table, rh_note),
-    )
-    ax3_tables = grid(
-        panel("Generated-code evidence", generated_code_evidence_table(), iface_note),
-        panel("Measured STDIO/POSIX byte mix", iface_byte_table, iface_byte_note),
         panel("State file rewrite frequency", state_table, state_note),
-        panel("Logical→physical amplification", logphys_table),
+        panel("Producer-consumer classes", pc_table) if pc_table else "",
     )
-    ax4_tables = grid(
-        panel("Failed open/stat", fos_table),
+    ax2_tables = ""
+    ax3_tables = grid(
+        panel("Failed open/stat", fos_table, fos_note),
         panel("Error-log reads", "", elr_note),
         panel("Bytes/ops by phase", bop_table),
     )
-    ax5_tables = grid(
-        panel("Request size", req_table, req_note),
+    ax4_tables = grid(
         panel("I/O Batching Efficiency", amp_table, amp_note),
-        panel("File size", fsz_table),
-        panel("Access pattern", "", seq_note),
     )
-    ax6_tables = grid(
+    ax5_tables = grid(
         panel(
             "Workflow concurrency (opportunity)",
             pardeg_table,
-            "time-weighted active semantic events; busy time excludes idle gaps, "
-            "parallel time ratio = time with >=2 active events / busy time",
         ),
         panel(
             "I/O concurrency",
             io_pardeg_table,
-            "time-weighted overlap of worker I/O-busy intervals from read/write-family syscalls "
-            "and libc fread/fwrite probes when available",
         ),
     )
-    detail_links = []
-    for viz, title in [
-        ("timeline", "Timeline View"),
-        ("tool_syscalls", "Syscalls Per Tool Call"),
-        ("tool_syscall_durations", "Syscall Duration Distributions"),
-    ]:
-        links = links_for(viz)
-        if links:
-            detail_links.append(f"<div class='linkrow'><span>{esc(title)}</span><nav>{links}</nav></div>")
 
     data_links = [
         ("phase1_metrics.json", "../phase1_metrics.json"),
@@ -4402,26 +3445,21 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
   <main class="wrap">
     <h2>Global</h2>
     <section class="zone">{setup_figs or '<p class="muted">No setup figures found.</p>'}</section>
-    <h2>Axis 1 · Runtime Decision Timing</h2>
+    <h2>Axis 1 · Context-Limited State Persistence</h2>
     <section class="zone">{ax1_figs}</section>
     <section class="attr-summary">{ax1_tables}</section>
-    <h2>Axis 2 · Context-Limited State Persistence</h2>
+    <h2>Axis 2 · Measured I/O Interface Layer</h2>
     <section class="zone">{ax2_figs}</section>
     <section class="attr-summary">{ax2_tables}</section>
-    <h2>Axis 3 · Generated-Code I/O Interface Layer</h2>
+    <h2>Axis 3 · Exploratory Branching and Backtracking</h2>
     <section class="zone">{ax3_figs}</section>
     <section class="attr-summary">{ax3_tables}</section>
-    <h2>Axis 4 · Exploratory Branching and Backtracking</h2>
+    <h2>Axis 4 · Reasoning-Step/Data-Granularity Alignment</h2>
     <section class="zone">{ax4_figs}</section>
     <section class="attr-summary">{ax4_tables}</section>
-    <h2>Axis 5 · Reasoning-Step/Data-Granularity Alignment</h2>
+    <h2>Axis 5 · Uncoordinated Agent Concurrency</h2>
     <section class="zone">{ax5_figs}</section>
     <section class="attr-summary">{ax5_tables}</section>
-    <h2>Axis 6 · Uncoordinated Agent Concurrency</h2>
-    <section class="zone">{ax6_figs}</section>
-    <section class="attr-summary">{ax6_tables}</section>
-    <h2>Detail</h2>
-    <section>{''.join(detail_links) or '<p>No detail views found.</p>'}</section>
     <h2>Data & Artifacts</h2>
     <section class="data">{''.join(data_html) or '<p>No data artifacts found.</p>'}</section>
   </main>
@@ -4436,17 +3474,9 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
 # Main Visualization Runner
 # =============================================================================
 
-# Visualizations that use StraceData (from parsed.json)
-STRACE_VISUALIZATIONS = {
-    "timeline": (create_timeline_plotly, create_timeline_matplotlib),
-    # io_rate (syscalls/100ms with tool-call overlays) re-enabled: it is the
-    # per-cell "storage rate over time" view and is wanted for the high-
-    # concurrency runs later. process_timeline stays disabled (redundant with
-    # agent_timeline).
-    "io_rate": (create_io_rate_plotly, create_io_rate_matplotlib),
-    "tool_syscalls": (create_tool_syscalls_plotly, None),
-    "tool_syscall_durations": (create_tool_syscall_durations_plotly, None),
-}
+# Visualizations that use StraceData (from parsed.json). The old detail-only
+# strace views were retired from the cleaned dashboard.
+STRACE_VISUALIZATIONS = {}
 
 # Visualizations that use PhaseAnalysis (from tool_calls.log) — empty now,
 # kept for backwards compat and as an extension point.  Time Accounting
@@ -4460,17 +3490,55 @@ PHASE_VISUALIZATIONS: dict = {}
 AGENT_VISUALIZATIONS = {
     "agent_timeline": (create_agent_timeline_plotly, create_agent_timeline_matplotlib),
     "phase_breakdown": (create_phase_breakdown_plotly, create_phase_breakdown_matplotlib),
-    "agent_concurrency": (create_agent_concurrency_plotly, create_agent_concurrency_matplotlib),
-    "interface_mix": (None, create_interface_mix_matplotlib),
+    "measured_interface_layers": (None, create_measured_interface_layers_matplotlib),
     "inter_arrival_cdf": (None, create_inter_arrival_cdf_matplotlib),
     "reread_attribution": (None, create_reread_attribution_matplotlib),
     "directory_scan": (None, create_directory_scan_matplotlib),
+    "io_rate": (None, create_io_rate_matplotlib),
+    "effective_bandwidth": (None, create_effective_bandwidth_matplotlib),
+    "access_pattern": (None, create_access_pattern_matplotlib),
     "io_autocorrelation": (None, create_io_autocorrelation_matplotlib),
-    "intensity_phases": (None, create_intensity_phases_matplotlib),
 }
 
 # Combined for CLI help and validation
 VISUALIZATIONS = {**STRACE_VISUALIZATIONS, **PHASE_VISUALIZATIONS, **AGENT_VISUALIZATIONS}
+
+RETIRED_VISUALIZATION_STEMS = {
+    "timeline",
+    "tool_syscalls",
+    "tool_syscall_durations",
+    "agent_concurrency",
+    "intensity_phases",
+    "interface_mix",
+}
+
+EXTRA_VISUALIZATION_STEMS = {
+    "index",
+    "file_access_volume",
+    "rw_asymmetry",
+}
+
+
+def cleanup_retired_visualizations(output_dir: Path) -> None:
+    """Remove stale PNG/HTML files for visualizations no longer generated."""
+    if not output_dir.exists():
+        return
+    allowed = set(VISUALIZATIONS) | EXTRA_VISUALIZATION_STEMS
+    for path in output_dir.iterdir():
+        if path.suffix not in {".png", ".html"}:
+            continue
+        remove = path.stem in RETIRED_VISUALIZATION_STEMS or path.stem not in allowed
+        if not remove and path.stem in VISUALIZATIONS:
+            plotly_fn, matplotlib_fn = VISUALIZATIONS[path.stem]
+            remove = (path.suffix == ".html" and plotly_fn is None) or (
+                path.suffix == ".png" and matplotlib_fn is None
+            )
+        if not remove:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def generate_visualizations(
@@ -4478,14 +3546,13 @@ def generate_visualizations(
     only: list[str] | None = None,
     html_only: bool = False,
     png_only: bool = False,
-    max_syscalls_per_type: int = 5000,
-    max_tool_calls: int = MAX_TOOL_CALL_SUBPLOTS,
 ) -> None:
     """Generate all or selected visualizations."""
     
     # Create output directory
     output_dir = trace_dir / "visualizations"
     output_dir.mkdir(exist_ok=True)
+    cleanup_retired_visualizations(output_dir)
     
     generated = []
     
@@ -4541,15 +3608,7 @@ def generate_visualizations(
             html_path = output_dir / f"{viz_name}.html"
             print(f"Generating {html_path.name}...", file=sys.stderr)
             try:
-                if viz_name in {"tool_syscalls", "tool_syscall_durations"}:
-                    plotly_fn(
-                        strace_data,
-                        html_path,
-                        max_syscalls_per_type=max_syscalls_per_type,
-                        max_tool_calls=max_tool_calls,
-                    )
-                else:
-                    plotly_fn(strace_data, html_path)
+                plotly_fn(strace_data, html_path)
                 generated.append(viz_name)
             except Exception as e:
                 print(f"  Error: {e}", file=sys.stderr)
@@ -4558,14 +3617,7 @@ def generate_visualizations(
             png_path = output_dir / f"{viz_name}.png"
             print(f"Generating {png_path.name}...", file=sys.stderr)
             try:
-                if viz_name in {"tool_syscalls", "tool_syscall_durations"}:
-                    matplotlib_fn(
-                        strace_data,
-                        png_path,
-                        max_syscalls_per_type=max_syscalls_per_type,
-                    )
-                else:
-                    matplotlib_fn(strace_data, png_path)
+                matplotlib_fn(strace_data, png_path)
                 if viz_name not in generated:
                     generated.append(viz_name)
             except Exception as e:
@@ -4636,7 +3688,7 @@ def main():
         epilog="""
 Examples:
   %(prog)s traces/20260115_190208/terraform-main/
-  %(prog)s traces/20260115_190208/terraform-main/ --only timeline,operations
+  %(prog)s traces/20260115_190208/terraform-main/ --only agent_timeline,io_rate
   %(prog)s traces/20260115_190208/terraform-main/ --html-only
         """
     )
@@ -4661,18 +3713,6 @@ Examples:
         "--png-only",
         action="store_true",
         help="Generate only static PNG visualizations"
-    )
-    parser.add_argument(
-        "--max-syscalls-per-type",
-        type=int,
-        default=5000,
-        help="Maximum syscalls to show per syscall type per tool call (default: 5000)"
-    )
-    parser.add_argument(
-        "--max-tool-calls",
-        type=int,
-        default=MAX_TOOL_CALL_SUBPLOTS,
-        help=f"Maximum tool calls to show in per-tool subplot charts (default: {MAX_TOOL_CALL_SUBPLOTS})"
     )
     
     args = parser.parse_args()
@@ -4704,8 +3744,6 @@ Examples:
         only=only,
         html_only=args.html_only,
         png_only=args.png_only,
-        max_syscalls_per_type=args.max_syscalls_per_type,
-        max_tool_calls=args.max_tool_calls,
     )
 
 

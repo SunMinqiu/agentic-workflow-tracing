@@ -42,3 +42,50 @@ require_lustre_base_out() {
         exit 1
     fi
 }
+
+# Stop the bcc tracer started as `sudo -E env ... bcc_tracer ... &`.
+#
+# $1 is the PID of the *sudo wrapper*, not of the tracer itself. sudo does not
+# reliably relay a signal to its child when the signal comes from a process in
+# its own process group, so `sudo kill -INT $TRACER_PID` can be swallowed and
+# the following `wait` then blocks forever. Signal the python child directly,
+# and escalate INT -> TERM -> KILL on a bounded timer so a stuck tracer can
+# never hang the run. SIGINT first: the tracer drains its perf buffer and
+# flushes ebpf_events.log on that path, so KILL would truncate the trace.
+stop_tracer() {
+    local sudo_pid="$1"
+    local grace="${2:-30}"
+    [ -n "$sudo_pid" ] || return 0
+
+    # Capture the children before signalling: they are gone once INT lands.
+    local kids
+    kids="$(pgrep -P "$sudo_pid" 2>/dev/null || true)"
+
+    # "Alive" means the wrapper OR the tracer itself: if sudo were reaped first
+    # we would otherwise return while the tracer is still writing the log.
+    _stop_tracer_alive() {
+        local p
+        for p in "$sudo_pid" $kids; do
+            kill -0 "$p" >/dev/null 2>&1 && return 0
+        done
+        return 1
+    }
+
+    local sig p waited
+    for sig in INT TERM KILL; do
+        _stop_tracer_alive || break
+        for p in $kids "$sudo_pid"; do
+            kill -"$sig" "$p" >/dev/null 2>&1 || true
+        done
+        waited=0
+        while _stop_tracer_alive && [ "$waited" -lt "$grace" ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        _stop_tracer_alive || break
+        echo "  Warning: tracer still alive ${waited}s after SIG$sig; escalating" >&2
+        grace=5
+    done
+
+    wait "$sudo_pid" >/dev/null 2>&1 || true
+}

@@ -2,19 +2,17 @@
 
 Computes 4 metrics from parsed.json + pi_events.jsonl:
   1. File size distribution (read vs write)
-  2. Reader fan-out per artifact
-  3. Write→first-read staleness
-  4. Lineage depth (number of distinct CodeExec calls touching each artifact)
+  2. Reader/writer fan-out distribution
+  3. Adjacent write→read gap distribution
+  4. Artifact lifecycle distribution
 
 Outputs to <trace_dir>/lineage/:
   - artifacts.csv              one row per data artifact
   - tool_call_attribution.csv  one row per tool_call run_id
-  - fig1_size_distribution.png log-x histogram of read/write sizes
-  - fig2_reader_fanout.png     P(fan-out = k) per CodeExec / per role
-  - fig3_staleness_cdf.png     CDF of write→first-read latency
-  - fig4_lifecycle.png         per-artifact reclaimable window over time
-  - fig6_reuse_pattern.png     dead-write % and read-reuse factor
-  - fig7_role_io_attribution.png read/write bytes per agent role
+  - fig1_size_distribution.png Darshan-bin histogram of request/file sizes
+  - fig2_fanout.png            reader/writer fan-out histograms
+  - fig3_staleness_cdf.png     adjacent write→read gap histogram
+  - fig4_lifecycle.png         dead-fraction histogram
 
 Usage:
     python3 lineage_analyzer.py <trace_dir>
@@ -36,6 +34,12 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+from agent_io_tracing.analysis.size_bins import (
+    DARSHAN_SIZE_LABELS,
+    darshan_hist,
+)
+from agent_io_tracing.analysis.labels import role_for_entry
 
 # --- Configuration -------------------------------------------------
 
@@ -156,6 +160,46 @@ def _load_manifest_paths(trace_dir: Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
+def _lineage_config_path(trace_dir: Path) -> Path:
+    return trace_dir / "lineage" / "config.json"
+
+
+def _load_saved_lineage_config(trace_dir: Path) -> bool:
+    global DATA_PATH_PREFIXES, EXCLUDE_PATH_SUBSTRINGS, RAW_INPUT_PREFIXES, METADATA_PREFIXES
+    path = _lineage_config_path(trace_dir)
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    prefixes = data.get("data_path_prefixes")
+    excludes = data.get("exclude_path_substrings")
+    raw_inputs = data.get("raw_input_prefixes")
+    metadata = data.get("metadata_prefixes")
+    if isinstance(prefixes, list) and prefixes:
+        DATA_PATH_PREFIXES = tuple(str(p) for p in prefixes if str(p))
+    if isinstance(excludes, list):
+        EXCLUDE_PATH_SUBSTRINGS = tuple(str(p) for p in excludes if str(p))
+    if isinstance(raw_inputs, list):
+        RAW_INPUT_PREFIXES = tuple(str(p) for p in raw_inputs if str(p))
+    if isinstance(metadata, list):
+        METADATA_PREFIXES = tuple(str(p) for p in metadata if str(p))
+    return True
+
+
+def write_lineage_config(trace_dir: Path) -> None:
+    path = _lineage_config_path(trace_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "data_path_prefixes": list(DATA_PATH_PREFIXES),
+        "exclude_path_substrings": list(EXCLUDE_PATH_SUBSTRINGS),
+        "raw_input_prefixes": list(RAW_INPUT_PREFIXES),
+        "metadata_prefixes": list(METADATA_PREFIXES),
+    }
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def configure_paths_from_manifest(trace_dir: Path) -> None:
     """Broaden path filters using manifest.json when available.
 
@@ -165,6 +209,8 @@ def configure_paths_from_manifest(trace_dir: Path) -> None:
     """
     global DATA_PATH_PREFIXES, RAW_INPUT_PREFIXES, METADATA_PREFIXES
     if os.environ.get("LINEAGE_DATA_PATH_PREFIXES"):
+        return
+    if _load_saved_lineage_config(trace_dir):
         return
     manifest_paths = _load_manifest_paths(trace_dir)
     if not manifest_paths:
@@ -659,17 +705,73 @@ def build_artifact_size_summary(per_artifact: dict) -> dict:
     }
 
 
-def build_staleness_summary(per_artifact: dict) -> dict:
-    vals = []
-    for rec in per_artifact.values():
-        first_write = rec.get("first_write_ts")
-        first_read_after = rec.get("first_read_after_write_ts")
-        if first_write is None or first_read_after is None:
-            continue
-        vals.append(max(float(first_read_after) - float(first_write), 0.0))
+WRITE_READ_GAP_BINS = [
+    (0.0, 1.0, "<1s"),
+    (1.0, 30.0, "1-30s"),
+    (30.0, 5 * 60.0, "30s-5min"),
+    (5 * 60.0, 30 * 60.0, "5-30min"),
+    (30 * 60.0, float("inf"), ">30min"),
+]
+
+
+def _write_read_gap_hist(vals: list[float]) -> dict[str, int]:
+    hist = {label: 0 for _, _, label in WRITE_READ_GAP_BINS}
+    for v in vals:
+        for lo, hi, label in WRITE_READ_GAP_BINS:
+            if lo <= v < hi:
+                hist[label] += 1
+                break
+    return hist
+
+
+def build_write_read_gap_summary(io_events: list[dict]) -> dict:
+    vals: list[float] = []
+    last_write_by_path: dict[str, float] = {}
+    for e in sorted(io_events, key=lambda item: item["ts"]):
+        path = e["path"]
+        if e["kind"] == "W":
+            last_write_by_path[path] = e["ts"]
+        elif path in last_write_by_path and e["ts"] >= last_write_by_path[path]:
+            vals.append(e["ts"] - last_write_by_path[path])
     return {
-        "n": len(vals),
-        "median_s": _median_or_none(vals),
+        "n_pairs": len(vals),
+        "hist": _write_read_gap_hist(vals),
+        "hist_note": (
+            "Time bins are chosen for page-cache/writeback semantics, not from "
+            "the cited inter-arrival literature."
+        ),
+        "p50_s": float(np.percentile(vals, 50)) if vals else None,
+        "p95_s": float(np.percentile(vals, 95)) if vals else None,
+        "max_s": max(vals) if vals else None,
+        "pct_lt_1s": (100.0 * sum(1 for v in vals if v < 1.0) / len(vals)) if vals else None,
+    }
+
+
+def build_fanout_summary(per_artifact: dict) -> dict:
+    def one(side: str) -> dict:
+        key = "reader_tool_ids" if side == "reader" else "writer_tool_ids"
+        vals = [len(rec[key]) for rec in per_artifact.values() if rec.get(key)]
+        hist = Counter(vals)
+        return {
+            "mean": float(np.mean(vals)) if vals else 0.0,
+            "p50": float(np.percentile(vals, 50)) if vals else 0.0,
+            "p95": float(np.percentile(vals, 95)) if vals else 0.0,
+            "max": max(vals) if vals else 0,
+            "pct_ge_2": (100.0 * sum(1 for v in vals if v >= 2) / len(vals)) if vals else None,
+            "hist": {str(k): int(v) for k, v in sorted(hist.items())},
+        }
+
+    joint = Counter(
+        (len(rec["writer_tool_ids"]), len(rec["reader_tool_ids"]))
+        for rec in per_artifact.values()
+        if rec.get("writer_tool_ids") or rec.get("reader_tool_ids")
+    )
+    return {
+        "reader": one("reader"),
+        "writer": one("writer"),
+        "reader_writer_joint": {
+            f"{w},{r}": int(n) for (w, r), n in sorted(joint.items())
+        },
     }
 
 
@@ -714,9 +816,14 @@ def build_role_io_attribution(io_events: list[dict], codeexec_index: dict,
         "write_by_category": defaultdict(int),
     })
     tot_r = tot_w = 0
+    role_tool_calls = {
+        tid: {"role": info.get("role")}
+        for tid, info in codeexec_index.items()
+        if isinstance(tid, str) and isinstance(info, dict)
+    }
     for e in io_events:
         tid = e["tool_call_id"]
-        role = (codeexec_index.get(tid, {}).get("role") if tid else None) or "(unattributed)"
+        role = role_for_entry(e, role_tool_calls, {}) if tid else "(unattributed)"
         cat = per_artifact.get(e["path"], {}).get("category", "scratch")
         d = roles[role]
         if e["kind"] == "R":
@@ -806,7 +913,6 @@ def per_artifact_summary(io_events: list[dict],
         "reads": [], "writes": [],
         "reader_tool_ids": set(), "writer_tool_ids": set(),
         "reader_roles": Counter(), "writer_roles": Counter(),
-        "first_write_ts": None, "first_read_after_write_ts": None,
         "all_tool_ids": set(),
     })
     for e in io_events:
@@ -820,10 +926,6 @@ def per_artifact_summary(io_events: list[dict],
                 rec["all_tool_ids"].add(tid)
             if role:
                 rec["reader_roles"][role] += 1
-            # staleness: only count first read AFTER first write
-            if rec["first_write_ts"] is not None and rec["first_read_after_write_ts"] is None:
-                if e["ts"] > rec["first_write_ts"]:
-                    rec["first_read_after_write_ts"] = e["ts"]
         else:  # write
             rec["writes"].append((e["ts"], e["size"]))
             if tid:
@@ -831,8 +933,6 @@ def per_artifact_summary(io_events: list[dict],
                 rec["all_tool_ids"].add(tid)
             if role:
                 rec["writer_roles"][role] += 1
-            if rec["first_write_ts"] is None:
-                rec["first_write_ts"] = e["ts"]
     return dict(by_path)
 
 
@@ -977,18 +1077,12 @@ def write_csvs(per_artifact: dict, codeexec_index: dict, out_dir: Path,
             "n_reads", "n_writes", "total_read_bytes", "total_write_bytes",
             "fanout_codeexec", "fanout_roles",
             "reader_roles", "writer_roles",
-            "first_write_ts", "first_read_after_write_ts", "staleness_s",
             "lineage_depth_generations", "n_touching_calls",
             "lifecycle_class", "t_create", "t_last_read",
             "dead_seconds", "waste_byte_seconds",
             "reuse_class", "true_size", "size_source", "read_amplification",
         ])
         for path, r in per_artifact.items():
-            staleness = (
-                r["first_read_after_write_ts"] - r["first_write_ts"]
-                if r["first_write_ts"] is not None and r["first_read_after_write_ts"] is not None
-                else ""
-            )
             w.writerow([
                 path,
                 r.get("category", ""),
@@ -1001,9 +1095,6 @@ def write_csvs(per_artifact: dict, codeexec_index: dict, out_dir: Path,
                 len(set(r["reader_roles"]) | set(r["writer_roles"])),
                 ";".join(f"{k}:{v}" for k, v in r["reader_roles"].items()),
                 ";".join(f"{k}:{v}" for k, v in r["writer_roles"].items()),
-                r["first_write_ts"] or "",
-                r["first_read_after_write_ts"] or "",
-                staleness,
                 r.get("generation", ""),
                 len(r["all_tool_ids"]),
                 r.get("lifecycle_class", ""),
@@ -1034,77 +1125,41 @@ def write_csvs(per_artifact: dict, codeexec_index: dict, out_dir: Path,
 
 
 def fig_io_volume_summary(summary: dict, out_path: Path):
-    """fig0 — the headline. Big total READ / WRITE numbers + R:W ratio on top,
-    a per-category stacked byte bar (read & write rows) below, and an explicit
-    coverage / scope caption so the totals can't be misread."""
+    """fig0 — workload read/write bytes split by storage-placement category."""
     wl = summary["workload"]
-    cov = summary["coverage_pct"]
-    rw = wl["rw_byte_ratio"]
-    rw_str = f"{rw:.1f} : 1" if rw else "n/a"
 
-    # one-line shape read-off: contrast read vs write granularity
-    mr, mw = wl["mean_read_bytes"], wl["mean_write_bytes"]
-    if mr > 0 and mw > 0:
-        if mr >= 4 * mw:
-            shape = "reads few-and-large, writes many-and-small"
-        elif mw >= 4 * mr:
-            shape = "writes few-and-large, reads many-and-small"
-        else:
-            shape = "read and write request sizes comparable"
+    # Bytes are unreadable on a raw x-axis; scale to KB at minimum, stepping up
+    # to MB/GB when the larger of the two rows warrants it.
+    peak = max(wl.get("read_bytes") or 0, wl.get("write_bytes") or 0, 1)
+    if peak >= 1024 ** 3:
+        div, unit = 1024 ** 3, "GB"
+    elif peak >= 1024 ** 2:
+        div, unit = 1024 ** 2, "MB"
     else:
-        shape = ""
+        div, unit = 1024, "KB"
 
-    fig = plt.figure(figsize=(10, 6))
-    gs = fig.add_gridspec(2, 1, height_ratios=[1.05, 1.0], hspace=0.5)
-
-    # --- top: headline text ---
-    axt = fig.add_subplot(gs[0])
-    axt.set_axis_off()
-    axt.text(0.0, 1.0, "IO Volume — workload data artifacts",
-             transform=axt.transAxes, fontsize=15, fontweight="bold",
-             va="top")
-    big = (
-        f"READ   {human_bytes1(wl['read_bytes']):>10}   ({wl['n_reads']:,} syscalls)\n"
-        f"WRITE  {human_bytes1(wl['write_bytes']):>10}   ({wl['n_writes']:,} syscalls)"
-    )
-    axt.text(0.0, 0.74, big, transform=axt.transAxes, fontsize=16,
-             family="monospace", va="top")
-    sub = f"R:W bytes = {rw_str}"
-    if shape:
-        sub += f"   ·   {shape}"
-    sub += f"\ndistinct files: {wl['distinct_files']}"
-    axt.text(0.0, 0.30, sub, transform=axt.transAxes, fontsize=11,
-             family="monospace", va="top", color="#333333")
-
-    cov_r = f"{cov['read']:.1f}%" if cov["read"] is not None else "n/a"
-    cov_w = f"{cov['write']:.1f}%" if cov["write"] is not None else "n/a"
-    caption = (
-        f"Scope: workload data only (read/write families, size>0; excludes "
-        f"Python imports / .venv / logger / trace output).\n"
-        f"Covers {cov_r} of read / {cov_w} of write bytes of the whole agent "
-        f"process tree (remainder = interpreter imports)."
-    )
-    axt.text(0.0, -0.02, caption, transform=axt.transAxes, fontsize=8.5,
-             va="top", color="#888888")
-
-    # --- bottom: per-category stacked bytes, READ row + WRITE row ---
-    axb = fig.add_subplot(gs[1])
+    fig, axb = plt.subplots(figsize=(10, 3.2))
     cats = [c for c in CATEGORY_ORDER if c in wl["bytes_by_category"]]
-    rows = [("WRITE", "write_bytes"), ("READ", "read_bytes")]  # READ on top
-    for i, (_, key) in enumerate(rows):
+    rows = [("WRITE", "write_bytes", "n_writes"), ("READ", "read_bytes", "n_reads")]  # READ on top
+    for i, (_, key, _n) in enumerate(rows):
         left = 0.0
         for c in cats:
             v = wl["bytes_by_category"][c][key]
             if v <= 0:
                 continue
-            axb.barh(i, v, left=left, color=CATEGORY_COLORS[c],
+            axb.barh(i, v / div, left=left, color=CATEGORY_COLORS[c],
                      edgecolor="black", linewidth=0.3)
-            left += v
+            left += v / div
+        total = (wl.get(key) or 0) / div
+        n_ops = wl.get(_n) or 0
+        axb.text(left, i, f"  {total:.1f} {unit} ({n_ops} syscalls)",
+                 va="center", ha="left", fontsize=9, fontweight="bold")
     axb.set_yticks(range(len(rows)))
     axb.set_yticklabels([r[0] for r in rows], fontweight="bold")
-    axb.set_xlabel("bytes (by storage-placement category)")
-    axb.set_title("Where the bytes live")
+    axb.set_xlabel(f"{unit} (by storage-placement category)")
+    axb.set_title("I/O Volume by Category")
     axb.grid(axis="x", alpha=0.3)
+    axb.margins(x=0.18)
     cats_present = [c for c in cats
                     if any(wl["bytes_by_category"][c][k] > 0
                            for k in ("read_bytes", "write_bytes"))]
@@ -1116,223 +1171,52 @@ def fig_io_volume_summary(summary: dict, out_path: Path):
     plt.close(fig)
 
 
-def fig_reuse_pattern(summary: dict, out_path: Path):
-    """fig6 — reuse pattern. Two stacked bars (by file count, by bytes) split
-    into the reuse classes, with the headline waste number in the title:
-    'X% of written bytes are never read back'."""
-    reuse = summary["reuse"]
-    bc = reuse["by_class"]
-    cats = [c for c in REUSE_CLASSES
-            if bc[c]["files"] > 0 or bc[c]["read_bytes"] > 0 or bc[c]["write_bytes"] > 0]
-
-    # row 1 = file count, row 2 = bytes (read+write touched)
-    counts = {c: bc[c]["files"] for c in cats}
-    bytes_touched = {c: bc[c]["read_bytes"] + bc[c]["write_bytes"] for c in cats}
-    tot_files = sum(counts.values()) or 1
-    tot_bytes = sum(bytes_touched.values()) or 1
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 4.2))
-
-    def stacked(ax, values, total, unit):
-        left = 0.0
-        for c in cats:
-            v = values[c]
-            if v <= 0:
-                continue
-            ax.barh(0, v, left=left, color=REUSE_COLORS[c],
-                    edgecolor="black", linewidth=0.3)
-            if v / total > 0.06:
-                ax.text(left + v / 2, 0, f"{100*v/total:.0f}%",
-                        ha="center", va="center", fontsize=9,
-                        color="white", fontweight="bold")
-            left += v
-        ax.set_xlim(0, total)
-        ax.set_yticks([])
-        ax.set_xlabel(unit)
-
-    stacked(ax1, counts, tot_files, f"# files (n={tot_files})")
-    stacked(ax2, bytes_touched, tot_bytes, "bytes touched (read+write)")
-
-    dead_pct = reuse["dead_write_pct_of_write"]
-    title = "Reuse pattern"
-    if dead_pct is not None:
-        title += f"  —  {dead_pct:.0f}% of written bytes are NEVER read back (waste)"
-    rf = reuse["read_reuse_factor"]
-    sub = ""
-    if rf is not None:
-        sub = (f"\nread reuse factor = {rf:.1f}× "
-               f"(total read bytes / unique bytes; >1 ⇒ re-reads a cache could save)")
-    if reuse["n_inputs_size_unknown"]:
-        sub += (f"\n⚠ {reuse['n_inputs_size_unknown']} input file(s) had no true size "
-                f"(not statted) — their reuse is shown by read COUNT only, not amplification")
-    ax1.set_title(title + sub, fontsize=10)
-
-    from matplotlib.patches import Patch
-    handles = [Patch(facecolor=REUSE_COLORS[c], label=REUSE_LABELS[c]) for c in cats]
-    ax2.legend(handles=handles, fontsize=8, loc="upper center",
-               bbox_to_anchor=(0.5, -0.35), ncol=3)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def fig_role_io_attribution(role_attr: dict, out_path: Path):
-    """fig7 — who does the IO. Two panels (READ | WRITE), one horizontal bar
-    per agent role, each segmented by file category. Title names the dominant
-    reader and writer so the producer/consumer split is read off instantly."""
-    by = role_attr["by_role"]
-    roles = sorted(by, key=lambda r: -(by[r]["read_bytes"] + by[r]["write_bytes"]))
-    if not roles:
-        return
-    y = np.arange(len(roles))
-    fig, (axr, axw) = plt.subplots(1, 2, figsize=(13, max(2.5, len(roles) * 0.7)),
-                                   sharey=True)
-
-    def draw(ax, key):
-        for i, role in enumerate(roles):
-            left = 0.0
-            for c in CATEGORY_ORDER:
-                v = by[role][key].get(c, 0)
-                if v <= 0:
-                    continue
-                ax.barh(i, v, left=left, color=CATEGORY_COLORS[c],
-                        edgecolor="black", linewidth=0.3)
-                left += v
-        ax.set_yticks(y)
-        ax.set_yticklabels(roles, fontsize=9)
-        ax.grid(axis="x", alpha=0.3)
-
-    draw(axr, "read_by_category")
-    axr.set_xlabel("read bytes")
-    axr.set_title("READ by agent")
-    draw(axw, "write_by_category")
-    axw.set_xlabel("write bytes")
-    axw.set_title("WRITE by agent")
-    axr.invert_yaxis()
-
-    tr, tw = role_attr["top_reader"], role_attr["top_writer"]
-    trp = by[tr]["read_pct"] if tr else None
-    twp = by[tw]["write_pct"] if tw else None
-    head = "Who does the IO"
-    if tr and trp is not None:
-        head += f"   —   reads: {tr} {trp:.0f}%"
-    if tw and twp is not None:
-        head += f"   ·   writes: {tw} {twp:.0f}%"
-    fig.suptitle(head, fontsize=13, fontweight="bold")
-
-    cats = [c for c in CATEGORY_ORDER
-            if any(by[r]["read_by_category"].get(c, 0)
-                   + by[r]["write_by_category"].get(c, 0) > 0 for r in roles)]
-    from matplotlib.patches import Patch
-    handles = [Patch(facecolor=CATEGORY_COLORS[c], label=c) for c in cats]
-    axw.legend(handles=handles, fontsize=8, loc="lower right", title="file category")
-
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-_SIZE_TICKS = [1, 1024, 1024**2, 10 * 1024**2, 100 * 1024**2, 1024**3]
-
-
-def _apply_size_xaxis(ax):
-    """Log x-axis with human-readable byte ticks (1 B / 1 KB / 1 MB ...)."""
-    ax.set_xscale("log")
-    ticks = [t for t in _SIZE_TICKS]
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([human_bytes(t) for t in ticks])
-
 
 def fig_size_distribution(io_events: list[dict], per_artifact: dict, out_path: Path):
-    """Two panels: per-syscall I/O request sizes (top) and per-FILE artifact
-    sizes by category (bottom). The first informs block size / read-ahead;
-    the second informs capacity and storage tier — which is goal #1."""
-    bins = np.logspace(0, np.log10(1024**3), 40)  # 1 B → 1 GB
+    """Darshan-bin request-size and per-file size distributions."""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
 
-    # --- top: per-syscall ---
     reads = [e["size"] for e in io_events if e["kind"] == "R"]
     writes = [e["size"] for e in io_events if e["kind"] == "W"]
-    n_r, _, _ = ax1.hist(reads, bins=bins, alpha=0.6, label=f"read (n={len(reads)})", color="#2ca02c")
-    n_w, _, _ = ax1.hist(writes, bins=bins, alpha=0.6, label=f"write (n={len(writes)})", color="#d62728")
-
-    _ymax = max([*n_r, *n_w, 1])
-
-    def _annotate_peak(counts, color, label):
-        """Label the tallest bar with its size bucket (x) and syscall count (y).
-        Tall bars (near the axis top) get a side label so it never collides
-        with the title."""
-        if len(counts) == 0 or max(counts) == 0:
-            return
-        i = int(np.argmax(counts))
-        cnt = int(counts[i])
-        lo, hi = bins[i], bins[i + 1]
-        xc = (lo * hi) ** 0.5  # geometric center (log x-axis)
-        txt = f"{label} peak: {human_bytes(lo)}–{human_bytes(hi)}, n={cnt}"
-        if cnt > 0.75 * _ymax:               # near the top → label to the side
-            off, ha, va = (10, -4), "left", "top"
-        else:                                # room above → label above the bar
-            off, ha, va = (0, 10), "center", "bottom"
-        ax1.annotate(
-            txt, xy=(xc, cnt), xytext=off, textcoords="offset points",
-            ha=ha, va=va, fontsize=8, fontweight="bold", color=color,
-            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, lw=0.6, alpha=0.85),
-            arrowprops=dict(arrowstyle="-", color=color, lw=0.8),
-        )
-
-    _annotate_peak(n_r, "#2ca02c", "read")
-    _annotate_peak(n_w, "#d62728", "write")
-    ax1.set_ylim(top=_ymax * 1.15)
-    _apply_size_xaxis(ax1)
-    ax1.set_xlabel("I/O request size (per syscall)")
+    rh = darshan_hist(reads)
+    wh = darshan_hist(writes)
+    x = np.arange(len(DARSHAN_SIZE_LABELS))
+    width = 0.42
+    ax1.bar(x - width / 2, [rh[l] for l in DARSHAN_SIZE_LABELS], width,
+            color="#2ca02c", label=f"read (n={len(reads)})")
+    ax1.bar(x + width / 2, [wh[l] for l in DARSHAN_SIZE_LABELS], width,
+            color="#d62728", label=f"write (n={len(writes)})")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(DARSHAN_SIZE_LABELS, rotation=30, ha="right")
     ax1.set_ylabel("# syscalls")
-    ax1.set_title(
-        f"Per-syscall I/O request size  (informs block size / read-ahead)\n"
-        f"total: READ {human_bytes1(sum(reads))} / WRITE {human_bytes1(sum(writes))}"
-        f"  ·  workload data only",
-        fontsize=10,
-    )
-    ax1.legend()
+    ax1.set_title("Per-syscall I/O Request Size", fontsize=10)
+    ax1.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     ax1.grid(axis="y", alpha=0.3)
 
-    # --- bottom: per-file, stacked by category ---
-    # Use the true on-disk size when known (set by load_true_sizes): for
-    # read-only inputs size_bytes is total READ bytes, which re-reads inflate
-    # far past the real file size. true_size = stat size for inputs, write
-    # bytes for generated files; fall back to size_bytes only when unknown.
-    by_cat = defaultdict(list)
+    file_sizes = []
     n_skipped = 0
     for rec in per_artifact.values():
         size = rec.get("true_size")
         if size is None:
-            # Read-only input we couldn't stat. Its size_bytes is inflated
-            # read bytes, so plotting it would mislead — skip instead.
             n_skipped += 1
             continue
         if size > 0:
-            by_cat[rec["category"]].append(size)
-    cats = [c for c in CATEGORY_ORDER if c in by_cat]
-    if cats:
-        ax2.hist(
-            [by_cat[c] for c in cats],
-            bins=bins, stacked=True,
-            color=[CATEGORY_COLORS[c] for c in cats],
-            label=[f"{c} (n={len(by_cat[c])})" for c in cats],
-        )
-        ax2.legend(fontsize=8)
+            file_sizes.append(size)
+    fh = darshan_hist(file_sizes)
+    vals = [fh[l] for l in DARSHAN_SIZE_LABELS]
+    if any(vals):
+        ax2.bar(x, vals, color="#4c78a8", edgecolor="black", linewidth=0.3)
     else:
         ax2.text(0.5, 0.5, "No workload artifacts with size > 0",
                  transform=ax2.transAxes, ha="center", va="center",
                  color="#7f8c8d")
-    _apply_size_xaxis(ax2)
-    ax2.set_xlabel("per-file TRUE on-disk size (stat for inputs, write bytes for generated) — NOT total read/write")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(DARSHAN_SIZE_LABELS, rotation=30, ha="right")
+    ax2.set_xlabel("per-file true on-disk size")
     ax2.set_ylabel("# artifacts")
     _skip_note = (f"  ·  {n_skipped} input(s) skipped (size un-statted)"
                   if n_skipped else "")
-    ax2.set_title("Per-file artifact size by category  (informs capacity / tier)\n"
-                  "true file size — for I/O volume (with re-reads) see fig0 / io_summary.json"
-                  + _skip_note,
-                  fontsize=10)
+    ax2.set_title("Per-file Artifact Size", fontsize=10)
     ax2.grid(axis="y", alpha=0.3)
 
     fig.tight_layout()
@@ -1351,82 +1235,69 @@ def _category_legend(ax, cats):
 
 
 def fig_reader_fanout(per_artifact: dict, out_path: Path):
-    """One bar per artifact (named), length = #distinct CodeExec calls that
-    read it, colored by category. Answers 'which file has high fan-out, and
-    is it raw input or intermediate' — goal #2."""
-    items = [(p, r) for p, r in per_artifact.items()
-             if r["reads"] and len(r["reader_tool_ids"]) > 0]
-    if not items:
+    """Reader and writer fan-out histograms, one file per sample."""
+    reader = [len(r["reader_tool_ids"]) for r in per_artifact.values() if r["reader_tool_ids"]]
+    writer = [len(r["writer_tool_ids"]) for r in per_artifact.values() if r["writer_tool_ids"]]
+    if not reader and not writer:
         fig, ax = plt.subplots(figsize=(8, 4))
-        ax.text(0.5, 0.5, "No artifacts had any attributed read events.",
+        ax.text(0.5, 0.5, "No artifacts had attributed read or write events.",
                 ha="center", va="center", transform=ax.transAxes, fontsize=12, color="#888")
         ax.set_axis_off()
         fig.savefig(out_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         return
 
-    items.sort(key=lambda kv: len(kv[1]["reader_tool_ids"]))
-    labels = [
-        f"{_short(p)} ({human_bytes(r['true_size']) if r.get('true_size') is not None else '?'})"
-        for p, r in items
-    ]
-    values = [len(r["reader_tool_ids"]) for _, r in items]
-    colors = [CATEGORY_COLORS[r["category"]] for _, r in items]
-    cats_present = [c for c in CATEGORY_ORDER
-                    if any(r["category"] == c for _, r in items)]
+    def capped_hist(vals: list[int]) -> list[int]:
+        c = Counter(10 if v >= 10 else v for v in vals)
+        return [c.get(k, 0) for k in range(1, 11)]
 
-    fig, ax = plt.subplots(figsize=(10, max(4, len(items) * 0.32)))
-    y = np.arange(len(items))
-    ax.barh(y, values, color=colors, edgecolor="black", linewidth=0.3)
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=7, family="monospace")
-    ax.set_xlabel("reader fan-out = # distinct CodeExec calls that read this file")
-    ax.set_title("Reader fan-out per artifact (colored by category)")
-    ax.grid(axis="x", alpha=0.3)
-    _category_legend(ax, cats_present)
+    labels = [str(i) for i in range(1, 10)] + [">=10"]
+    x = np.arange(len(labels))
+    fig, (axr, axw) = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+    for ax, vals, color, title in (
+        (axr, reader, "#4c78a8", "Reader fan-out"),
+        (axw, writer, "#f58518", "Writer fan-out"),
+    ):
+        counts = capped_hist(vals)
+        ax.bar(x, counts, color=color, edgecolor="black", linewidth=0.3)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.set_xlabel("fan-out k (# distinct tool calls)")
+        ax.grid(axis="y", alpha=0.3)
+        ax.set_title(title)
+    axr.set_ylabel("# files")
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
-def fig_staleness_cdf(per_artifact: dict, out_path: Path):
-    """One dot per artifact (named): write→first-read gap, colored by
-    category. With only a handful of artifacts a CDF is misleading, so we
-    show each file directly — goal #3."""
-    items = [
-        (p, r, r["first_read_after_write_ts"] - r["first_write_ts"])
-        for p, r in per_artifact.items()
-        if r["first_write_ts"] is not None and r["first_read_after_write_ts"] is not None
-    ]
-    fig, ax = plt.subplots(figsize=(10, max(3, len(items) * 0.4)))
-    if not items:
+
+def fig_staleness_cdf(write_read_gap: dict, out_path: Path):
+    """Adjacent write→read gap histogram over read events."""
+    hist = write_read_gap.get("hist") or {}
+    labels = [label for _, _, label in WRITE_READ_GAP_BINS]
+    counts = [int(hist.get(label, 0) or 0) for label in labels]
+    fig, ax = plt.subplots(figsize=(9, 4.8))
+    if not any(counts):
         ax.text(0.5, 0.5,
-                "No artifact had both a write and a subsequent read in this trace.\n"
-                "This is expected for runs that only read inputs and write final\n"
-                "leaf outputs such as reports, images, checkpoints, or logs.\n\n"
-                "To populate this metric, the workload must write an intermediate\n"
-                "artifact and later read that same artifact within the same trace.",
+                "No read event had a preceding write to the same path.",
                 ha="center", va="center", transform=ax.transAxes, fontsize=11, color="#888")
         ax.set_axis_off()
         fig.savefig(out_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         return
 
-    items.sort(key=lambda t: t[2])
-    y = np.arange(len(items))
-    # clamp to a small floor so sub-ms gaps still render on a log axis
-    xs = [max(s, 1e-3) for _, _, s in items]
-    colors = [CATEGORY_COLORS[r["category"]] for _, r, _ in items]
-    ax.scatter(xs, y, c=colors, s=80, edgecolor="black", linewidth=0.4, zorder=3)
-    ax.hlines(y, 1e-3, xs, color="#cccccc", linewidth=0.8, zorder=1)
-    ax.set_yticks(y)
-    ax.set_yticklabels([_short(p) for p, _, _ in items], fontsize=7, family="monospace")
-    ax.set_xscale("log")
-    ax.set_xlabel("write → first-read staleness (seconds, log scale)")
-    ax.set_title(f"Write→first-read staleness per artifact (n={len(items)})")
-    ax.grid(axis="x", alpha=0.3)
-    cats_present = [c for c in CATEGORY_ORDER if any(r["category"] == c for _, r, _ in items)]
-    _category_legend(ax, cats_present)
+    x = np.arange(len(labels))
+    ax.bar(x, counts, color="#7f3c8d", edgecolor="black", linewidth=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
+    ax.set_ylabel("# read events")
+    ax.set_xlabel("gap from immediately preceding write to this read")
+    for xi, c in zip(x, counts):
+        if c:
+            ax.text(xi, c, f" {c}", ha="center", va="bottom", fontsize=8)
+    ax.set_title("Write→Read Gap")
+    ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -1434,74 +1305,38 @@ def fig_staleness_cdf(per_artifact: dict, out_path: Path):
 
 def fig_lifecycle_spans(per_artifact: dict, run_start: float, run_end: float,
                         out_path: Path, top_n: int = 25):
-    """Per-artifact live/reclaimable window — answers WHEN each file can be
-    cleaned up (goal #4, lifecycle framing).
-
-    One row per artifact (top-N by file size, since cleanup payoff scales
-    with bytes), x = seconds from run start:
-      - solid bar  t_create → t_reclaimable : still needed, colored by category
-      - gray hatch t_reclaimable → run_end  : dead weight, reclaimable
-      - read-only inputs: solid access span only (we don't delete inputs)
-      - write-once leaves (never read): red ▽ at write + full gray bar
-    Each row is labeled with the file's size so the selection is explicit."""
-    items = [(p, r) for p, r in per_artifact.items() if r["size_bytes"] > 0]
-    if not items:
+    """Histogram of generated-file dead fraction."""
+    run_span = max(run_end - run_start, 1e-9)
+    generated = [r for r in per_artifact.values() if r.get("writes")]
+    if not generated:
         fig, ax = plt.subplots(figsize=(8, 4))
-        ax.text(0.5, 0.5, "No artifacts in trace.",
+        ax.text(0.5, 0.5, "No generated artifacts in trace.",
                 ha="center", va="center", transform=ax.transAxes, fontsize=12, color="#888")
         ax.set_axis_off()
         fig.savefig(out_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         return
 
-    items.sort(key=lambda kv: kv[1]["size_bytes"], reverse=True)
-    items = items[:top_n]
-    items.reverse()  # biggest at top after invert
-
-    t0 = run_start
-    end = run_end - t0
-    fig, ax = plt.subplots(figsize=(12, max(4, len(items) * 0.34)))
-    for y, (path, r) in enumerate(items):
-        cat = r["category"]
-        color = CATEGORY_COLORS[cat]
-        create = r["t_create"] - t0
-        if r["lifecycle_class"] == "input":
-            # read-only: just the access span, no reclaim tail
-            last = (r["t_last_read"] or r["t_create"]) - t0
-            ax.barh(y, max(last - create, end * 0.002), left=create, height=0.6,
-                    color=color, edgecolor="black", linewidth=0.3, zorder=3)
-        elif r["lifecycle_class"] == "ephemeral_leaf":
-            # dead on arrival: full gray reclaimable bar + write marker
-            ax.barh(y, end - create, left=create, height=0.6,
-                    color="#dddddd", hatch="///", edgecolor="#999999",
-                    linewidth=0.3, zorder=2)
-            ax.scatter(create, y, marker="v", s=55, color="#d62728",
-                       edgecolor="black", linewidth=0.4, zorder=4)
-        else:
-            # transient / live_to_end: needed window + reclaimable tail
-            reclaim = r["t_reclaimable"] - t0
-            ax.barh(y, max(reclaim - create, end * 0.002), left=create, height=0.6,
-                    color=color, edgecolor="black", linewidth=0.3, zorder=3)
-            if end - reclaim > 0:
-                ax.barh(y, end - reclaim, left=reclaim, height=0.6,
-                        color="#dddddd", hatch="///", edgecolor="#999999",
-                        linewidth=0.3, zorder=2)
-
-    labels = [f"{human_bytes(r['size_bytes']):>8}  {_short(p, 42)}" for p, r in items]
-    ax.set_yticks(range(len(items)))
-    ax.set_yticklabels(labels, fontsize=7, family="monospace")
-    ax.set_ylim(-0.7, len(items) - 0.3)
-    ax.set_xlim(0, end * 1.02)
-    ax.set_xlabel("time from run start (s)   —   solid = needed, gray ▨ = reclaimable, ▽ = write-once leaf")
-    ax.set_title(f"Artifact lifecycle / reclaimable window (top {len(items)} by size)")
-    ax.grid(axis="x", alpha=0.3)
-
-    cats_present = [c for c in CATEGORY_ORDER if any(r["category"] == c for _, r in items)]
-    from matplotlib.patches import Patch
-    handles = [Patch(facecolor=CATEGORY_COLORS[c], label=c) for c in cats_present]
-    handles.append(Patch(facecolor="#dddddd", hatch="///", edgecolor="#999999",
-                         label="reclaimable (dead weight)"))
-    ax.legend(handles=handles, fontsize=8, loc="lower right", ncol=2)
+    fractions = [
+        max(0.0, min(1.0, float(r.get("dead_seconds") or 0.0) / max(run_end - float(r.get("t_create") or run_start), 1e-9)))
+        for r in generated
+    ]
+    bins = np.linspace(0, 1, 11)
+    counts, edges = np.histogram(fractions, bins=bins)
+    fig, ax = plt.subplots(figsize=(8.5, 4.8))
+    ax.bar(np.arange(10), counts, color="#4c78a8", edgecolor="black", linewidth=0.3)
+    ax.set_xticks(np.arange(10))
+    ax.set_xticklabels([f"{edges[i]:.1f}-{edges[i+1]:.1f}" for i in range(10)], rotation=25, ha="right")
+    ax.set_xlabel("dead time share")
+    ax.set_ylabel("# generated files")
+    ax.set_title("Artifact Lifecycle")
+    ax.grid(axis="y", alpha=0.3)
+    fig.text(
+        0.5, -0.02,
+        r"dead time share = dead_seconds / (run_end $-$ t_create);   "
+        r"dead_seconds = run_end $-$ last_read  (= run_end $-$ t_create if never read)",
+        ha="center", va="top", fontsize=8, color="#555",
+    )
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -1534,9 +1369,13 @@ def print_summary(per_artifact: dict, io_events: list[dict], io_summary: dict | 
             tr, tw = br.get("top_reader"), br.get("top_writer")
             print(f"  WHO:")
             if tr:
-                print(f"    top reader: {tr} ({br['by_role'][tr]['read_pct']:.0f}% of read bytes)")
+                rp = br["by_role"][tr].get("read_pct")
+                rp_text = f"{rp:.0f}%" if rp is not None else "n/a"
+                print(f"    top reader: {tr} ({rp_text} of read bytes)")
             if tw:
-                print(f"    top writer: {tw} ({br['by_role'][tw]['write_pct']:.0f}% of write bytes)")
+                wp = br["by_role"][tw].get("write_pct")
+                wp_text = f"{wp:.0f}%" if wp is not None else "n/a"
+                print(f"    top writer: {tw} ({wp_text} of write bytes)")
         print("-" * 64)
     print(f"  Artifacts identified : {len(per_artifact)}")
     print(f"  I/O events on data   : {len(io_events)}")
@@ -1585,6 +1424,15 @@ def main():
     parsed_entries = load_parsed_entries(trace_dir)
     io_events = load_data_io_events(trace_dir)
     per_artifact = per_artifact_summary(io_events, codeexec_index)
+    if not per_artifact:
+        print(
+            "ERROR: lineage found 0 workload artifacts; refusing to write empty artifacts.csv. "
+            f"data_path_prefixes={list(DATA_PATH_PREFIXES)} "
+            f"exclude_path_substrings={list(EXCLUDE_PATH_SUBSTRINGS)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    write_lineage_config(trace_dir)
     annotate_categories(per_artifact)
     compute_generations(per_artifact)
     run_start = min((e["ts"] for e in io_events), default=0.0)
@@ -1598,25 +1446,27 @@ def main():
     io_summary["by_role"] = build_role_io_attribution(io_events, codeexec_index, per_artifact)
     io_summary["namespace"] = build_namespace_summary(parsed_entries, per_artifact)
     io_summary["artifact_sizes"] = build_artifact_size_summary(per_artifact)
-    io_summary["staleness"] = build_staleness_summary(per_artifact)
+    io_summary["fanout"] = build_fanout_summary(per_artifact)
+    io_summary["write_read_gap_s"] = build_write_read_gap_summary(io_events)
     io_summary["lifecycle"] = build_lifecycle_summary(per_artifact)
 
     write_csvs(per_artifact, codeexec_index, out_dir, io_events, parsed_entries)
     write_io_summary_json(io_summary, out_dir)
     fig_io_volume_summary(io_summary, out_dir / "fig0_io_volume_summary.png")
-    fig_reuse_pattern(io_summary, out_dir / "fig6_reuse_pattern.png")
-    fig_role_io_attribution(io_summary["by_role"], out_dir / "fig7_role_io_attribution.png")
     fig_size_distribution(io_events, per_artifact, out_dir / "fig1_size_distribution.png")
-    fig_reader_fanout    (per_artifact,    out_dir / "fig2_reader_fanout.png")
-    fig_staleness_cdf    (per_artifact,    out_dir / "fig3_staleness_cdf.png")
+    fig_reader_fanout    (per_artifact,    out_dir / "fig2_fanout.png")
+    fig_staleness_cdf    (io_summary["write_read_gap_s"], out_dir / "fig3_staleness_cdf.png")
     fig_lifecycle_spans  (per_artifact, run_start, run_end, out_dir / "fig4_lifecycle.png")
 
-    # Retired figures: remove stale files if present so the index never shows a
-    # deprecated chart. (fig4_lineage_depth = old generational-depth figure;
-    # fig5_artifact_lifecycle = top-N lifecycle, dropped in favour of fig4.)
-    for stale in ("fig4_lineage_depth.png", "fig5_artifact_lifecycle.png"):
-        p = out_dir / stale
-        if p.exists():
+    current_figures = {
+        "fig0_io_volume_summary.png",
+        "fig1_size_distribution.png",
+        "fig2_fanout.png",
+        "fig3_staleness_cdf.png",
+        "fig4_lifecycle.png",
+    }
+    for p in out_dir.glob("fig*.png"):
+        if p.name not in current_figures:
             p.unlink()
 
     print_summary(per_artifact, io_events, io_summary)

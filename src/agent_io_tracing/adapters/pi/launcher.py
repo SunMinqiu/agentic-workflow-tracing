@@ -10,8 +10,10 @@ expected by parse_ebpf.py.
 from __future__ import annotations
 
 import argparse
+from collections import Counter, defaultdict
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -148,6 +150,7 @@ def build_pi_command(cwd: str, extension_path: str, skill_path: str, use_skill: 
         "pi",
         "--mode",
         "json",
+        "--print",  # non-interactive: process prompt and exit (pi >= 0.7x)
         "--no-session",
         "-e",
         extension_path,
@@ -164,13 +167,54 @@ def build_pi_command(cwd: str, extension_path: str, skill_path: str, use_skill: 
     if model:
         cmd.extend(["--model", model])
 
-    cmd.extend(["--", PROMPT])
+    thinking = os.getenv("PI_THINKING", "").strip()
+    if thinking:
+        cmd.extend(["--thinking", thinking])
+
+    # pi >= 0.7x takes the prompt positionally; the old "--" separator is
+    # rejected as an unknown option.
+    cmd.append(PROMPT)
     return cmd
 
 
 def _is_delta_event(event: dict) -> bool:
     ae = event.get("assistantMessageEvent")
     return isinstance(ae, dict) and ae.get("type", "").endswith("_delta")
+
+
+def _delta_payload_text(assistant_event: dict) -> str | None:
+    for key in ("delta", "text", "content", "value"):
+        value = assistant_event.get(key)
+        if isinstance(value, str):
+            return value
+    delta = assistant_event.get("delta")
+    if isinstance(delta, dict):
+        for key in ("text", "content", "value"):
+            value = delta.get(key)
+            if isinstance(value, str):
+                return value
+    return None
+
+
+def _estimate_delta_tokens(text: str | None) -> int:
+    """Cheap tokenizer-free estimate for plotting decode intensity.
+
+    This is deliberately named *_est in pi_events.jsonl; it is not a model
+    tokenizer count.
+    """
+    if not text:
+        return 0
+    return max(1, len(re.findall(r"\S+", text)))
+
+
+def _delta_event_timestamp_ms(event: dict) -> float | None:
+    msg = event.get("message")
+    if isinstance(msg, dict):
+        ts = msg.get("timestamp")
+        if isinstance(ts, (int, float)):
+            return float(ts)
+    ts = event.get("timestamp")
+    return float(ts) if isinstance(ts, (int, float)) else None
 
 
 def _extract_text_delta(event: dict) -> str | None:
@@ -186,8 +230,31 @@ def _extract_text_delta(event: dict) -> str | None:
     if assistant_event.get("type") != "text_delta":
         return None
 
-    delta = assistant_event.get("delta")
-    return delta if isinstance(delta, str) else None
+    return _delta_payload_text(assistant_event)
+
+
+def _event_run_id(event: dict, active_run_id: str | None) -> str | None:
+    rid = event.get("run_id")
+    if isinstance(rid, str):
+        return rid
+    message = event.get("message")
+    if isinstance(message, dict):
+        for key in ("run_id", "id"):
+            rid = message.get(key)
+            if isinstance(rid, str):
+                return rid
+    assistant_event = event.get("assistantMessageEvent")
+    if isinstance(assistant_event, dict):
+        for key in ("run_id", "id"):
+            rid = assistant_event.get(key)
+            if isinstance(rid, str):
+                return rid
+    return active_run_id
+
+
+def _thinking_delta_types() -> set[str]:
+    raw = os.getenv("PI_THINKING_DELTA_TYPES", "thinking_delta,reasoning_delta")
+    return {part.strip() for part in raw.split(",") if part.strip()}
 
 
 def analyze(cwd: str, log_dir: str | None = None, use_skill: bool = True) -> int:
@@ -233,6 +300,16 @@ def analyze(cwd: str, log_dir: str | None = None, use_skill: bool = True) -> int
     assert proc.stdout is not None
     assert proc.stderr is not None
 
+    text_by_run: dict[str, list[str]] = defaultdict(list)
+    thinking_by_run: dict[str, list[str]] = defaultdict(list)
+    delta_type_counts_by_run: dict[str, Counter[str]] = defaultdict(Counter)
+    active_run_id: str | None = None
+    thinking_delta_types = _thinking_delta_types()
+    log_delta_events = os.getenv("PI_LOG_DELTA_EVENTS", "").lower() in {"1", "true", "yes"}
+    capture_unknown_thinking = (
+        os.getenv("PI_CAPTURE_UNKNOWN_DELTAS_AS_THINKING", "").lower() in {"1", "true", "yes"}
+    )
+
     while True:
         line = proc.stdout.readline()
         if line == "" and proc.poll() is not None:
@@ -250,13 +327,62 @@ def analyze(cwd: str, log_dir: str | None = None, use_skill: bool = True) -> int
             print(f"[warn] non-JSON stdout from pi: {stripped}", file=sys.stderr)
             continue
 
-        if events_log_path and not _is_delta_event(event):
-            with events_log_path.open("a", encoding="utf-8") as f:
-                f.write(stripped + "\n")
+        event_type = event.get("type")
+        rid = _event_run_id(event, active_run_id)
+        if event_type == "message_start" and isinstance(rid, str):
+            active_run_id = rid
+
+        assistant_event = event.get("assistantMessageEvent")
+        assistant_event_type = (
+            assistant_event.get("type") if isinstance(assistant_event, dict) else None
+        )
+        if (
+            isinstance(rid, str)
+            and isinstance(assistant_event_type, str)
+            and assistant_event_type.endswith("_delta")
+            and isinstance(assistant_event, dict)
+        ):
+            delta_type_counts_by_run[rid][assistant_event_type] += 1
+            payload = _delta_payload_text(assistant_event)
+            if events_log_path:
+                compact_delta = {
+                    "type": "message_delta",
+                    "run_id": rid,
+                    "timestamp": _delta_event_timestamp_ms(event),
+                    "delta_type": assistant_event_type,
+                    "delta_chars": len(payload or ""),
+                    "delta_tokens_est": _estimate_delta_tokens(payload),
+                }
+                with events_log_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(compact_delta, ensure_ascii=False) + "\n")
+            if payload:
+                if assistant_event_type == "text_delta":
+                    text_by_run[rid].append(payload)
+                elif assistant_event_type in thinking_delta_types:
+                    thinking_by_run[rid].append(payload)
+                elif capture_unknown_thinking:
+                    thinking_by_run[rid].append(payload)
 
         delta = _extract_text_delta(event)
         if delta:
             print(delta, end="", flush=True)
+
+        if event_type == "message_end" and isinstance(rid, str):
+            assistant_text = "".join(text_by_run.pop(rid, []))
+            assistant_thinking = "".join(thinking_by_run.pop(rid, []))
+            delta_type_counts = dict(delta_type_counts_by_run.pop(rid, Counter()))
+            if assistant_text:
+                event["assistant_text"] = assistant_text
+            if assistant_thinking:
+                event["assistant_thinking"] = assistant_thinking
+            if delta_type_counts:
+                event["assistant_delta_type_counts"] = delta_type_counts
+            if active_run_id == rid:
+                active_run_id = None
+
+        if events_log_path and (log_delta_events or not _is_delta_event(event)):
+            with events_log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     stderr_output = proc.stderr.read()
     if stderr_output:

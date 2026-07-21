@@ -166,7 +166,9 @@ class ToolCall:
 @dataclass
 class FsEntry:
     pid: int
+    tid: int
     timestamp: datetime
+    ts_ms: float
     syscall: str
     args: str
     return_value: int | None
@@ -182,13 +184,18 @@ class FsEntry:
     requested_size: int | None = None
     actual_size: int | None = None
     offset: int | None = None
+    offset_src: int | None = None
+    open_generation: int | None = None
+    append: bool = False
     flags: int | None = None
     dirfd: int | None = None
 
     def to_dict(self) -> dict:
         out = {
             "pid": self.pid,
+            "tid": self.tid,
             "timestamp": self.timestamp.isoformat(),
+            "ts_ms": self.ts_ms,
             "syscall": self.syscall,
             "args": self.args,
             "return_value": self.return_value,
@@ -212,10 +219,51 @@ class FsEntry:
             out["actual_size"] = self.actual_size
         if self.offset is not None:
             out["offset"] = self.offset
+        if self.offset_src is not None:
+            out["offset_src"] = self.offset_src
+        if self.open_generation is not None:
+            out["open_generation"] = self.open_generation
+        if self.append:
+            out["append"] = True
         if self.flags is not None:
             out["flags"] = self.flags
         if self.dirfd is not None:
             out["dirfd"] = self.dirfd
+        return out
+
+
+@dataclass
+class LibIoEntry:
+    pid: int
+    timestamp: datetime
+    ts_ms: float
+    library: str
+    function: str
+    function_id: int
+    return_value: int | None
+    duration: float
+    count: int | None = None
+    datatype_handle: int | None = None
+    bytes_resolved: bool = False
+    bytes_transferred: int = 0
+    matched_tool_call: str | None = None
+
+    def to_dict(self) -> dict:
+        out = {
+            "pid": self.pid,
+            "timestamp": self.timestamp.isoformat(),
+            "ts_ms": self.ts_ms,
+            "library": self.library,
+            "function": self.function,
+            "function_id": self.function_id,
+            "return_value": self.return_value,
+            "duration": self.duration,
+            "count": self.count,
+            "datatype_handle": self.datatype_handle,
+            "bytes_resolved": self.bytes_resolved,
+            "bytes_transferred": self.bytes_transferred,
+            "matched_tool_call": self.matched_tool_call,
+        }
         return out
 
 
@@ -254,6 +302,7 @@ class ToolSummary:
 class ParsedTrace:
     tool_calls: list[ToolCall] = field(default_factory=list)
     fs_entries: list[FsEntry] = field(default_factory=list)
+    lib_io_entries: list[LibIoEntry] = field(default_factory=list)
     tool_summaries: dict[str, ToolSummary] = field(default_factory=dict)
     summary: dict = field(default_factory=dict)
 
@@ -261,6 +310,7 @@ class ParsedTrace:
         out = {
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
             "fs_entries": [e.to_dict() for e in self.fs_entries],
+            "lib_io_entries": [e.to_dict() for e in self.lib_io_entries],
             "summary": self.summary,
         }
         if self.tool_summaries:
@@ -275,6 +325,8 @@ class FDInfo:
     path: str
     open_timestamp: datetime
     tool_id: str | None
+    open_generation: int
+    flags: str | None = None
 
 
 class FDTable:
@@ -283,6 +335,7 @@ class FDTable:
     def __init__(self) -> None:
         self._tables: dict[int, dict[int, FDInfo]] = {}
         self._cwd: dict[int, str] = {}
+        self._next_generation = 1
 
     def resolve_path(self, pid: int, path: str, dirfd: int) -> str:
         """Resolve a possibly-relative path using dirfd or CWD."""
@@ -315,13 +368,18 @@ class FDTable:
         path: str,
         timestamp: datetime,
         tool_id: str | None,
+        flags: str | None,
     ) -> None:
         if fd < 0:
             return
+        generation = self._next_generation
+        self._next_generation += 1
         self._tables.setdefault(pid, {})[fd] = FDInfo(
             path=path,
             open_timestamp=timestamp,
             tool_id=tool_id,
+            open_generation=generation,
+            flags=flags,
         )
 
     def handle_close(self, pid: int, fd: int) -> None:
@@ -486,6 +544,10 @@ def ns_to_datetime(ts_ns: int) -> datetime:
     return datetime.fromtimestamp(ts_ns / 1_000_000_000) - timedelta(seconds=_tz_offset_seconds)
 
 
+def ns_to_epoch_ms(ts_ns: int) -> float:
+    return ts_ns / 1_000_000.0
+
+
 def in_any_tool_window(ts: datetime, tool_calls: list[ToolCall]) -> bool:
     return any(tc.contains(ts) for tc in tool_calls)
 
@@ -547,11 +609,20 @@ def get_tool_window(tool_calls: list[ToolCall]) -> tuple[datetime | None, dateti
 FD_BASED_SYSCALLS = {
     "read",
     "write",
+    "readv",
+    "writev",
     "pread64",
     "pwrite64",
+    "preadv",
+    "pwritev",
+    "preadv2",
+    "pwritev2",
     "fstat",
+    "fsync",
+    "fdatasync",
     "getdents64",
     "ftruncate",
+    "sync_file_range",
     "close",
     "fchdir",
 }
@@ -672,12 +743,22 @@ def build_state_tables(events: list[dict], tool_calls: list[ToolCall]) -> tuple[
                 fd_table.copy_table_for_child(parent, child)
             continue
 
-        if etype != "syscall":
+        if etype not in {"syscall", "libc_io"}:
             continue
 
-        syscall = str(event.get("syscall", "unknown"))
+        syscall = str(event.get("syscall") or event.get("function") or "unknown")
         pid = int(event.get("pid", 0))
-        fd = int(event.get("arg0", -1)) if syscall in FD_BASED_SYSCALLS else None
+        if syscall == "mmap":
+            # mmap(addr, length, prot, flags, fd, offset): fd is arg4, not arg0.
+            fd = int(event.get("arg4", -1))
+        elif event.get("type") == "libc_io" and syscall in {"fread", "fwrite"}:
+            raw_fd = event.get("stdio_fd")
+            try:
+                fd = int(raw_fd) if raw_fd is not None else None
+            except (TypeError, ValueError):
+                fd = None
+        else:
+            fd = int(event.get("arg0", -1)) if syscall in FD_BASED_SYSCALLS else None
 
         # Enrich fd-based events before any table mutation (especially close).
         if fd is not None and fd >= 0:
@@ -686,6 +767,8 @@ def build_state_tables(events: list[dict], tool_calls: list[ToolCall]) -> tuple[
                 if not event.get("path"):
                     event["_resolved_path"] = info.path
                 event["_fd_tool_id"] = info.tool_id
+                event["_fd_generation"] = info.open_generation
+                event["_fd_open_flags"] = info.flags
 
         # Resolve relative paths for *at() syscalls using the dirfd (arg0).
         if syscall in DIRFD_BASED_SYSCALLS:
@@ -696,11 +779,21 @@ def build_state_tables(events: list[dict], tool_calls: list[ToolCall]) -> tuple[
                 if resolved != raw_path:
                     event["path"] = resolved
 
+        if etype != "syscall":
+            continue
+
         if syscall == "openat":
             ret = int(event.get("ret", -1))
             path = event.get("path")
             if ret >= 0 and isinstance(path, str) and path:
-                fd_table.handle_open(pid, ret, path, ts, tool_id)
+                fd_table.handle_open(
+                    pid,
+                    ret,
+                    path,
+                    ts,
+                    tool_id,
+                    decode_open_flags(int(event.get("arg2", 0))),
+                )
         elif syscall == "close" and fd is not None and fd >= 0:
             fd_table.handle_close(pid, fd)
         elif syscall == "chdir":
@@ -767,6 +860,26 @@ def match_event_to_tool(
     return max(active_tools, key=lambda tc: tc.start_time).tool_id
 
 
+def match_pid_event_to_tool(
+    pid: int,
+    syscall: str,
+    active_tools: list[ToolCall],
+    proc_tree: ProcessTree,
+) -> str | None:
+    if not active_tools:
+        return proc_tree.get_root_tool(pid)
+    if len(active_tools) == 1:
+        return active_tools[0].tool_id
+    root_tool = proc_tree.get_root_tool(pid)
+    if root_tool and any(tc.tool_id == root_tool for tc in active_tools):
+        return root_tool
+    if syscall in {"execve", "clone"}:
+        bash_tools = [tc for tc in active_tools if tc.tool_name == "Bash"]
+        if len(bash_tools) == 1:
+            return bash_tools[0].tool_id
+    return max(active_tools, key=lambda tc: tc.start_time).tool_id
+
+
 def is_enoent_noise(entry: FsEntry) -> bool:
     if entry.return_value != -2:
         return False
@@ -806,13 +919,21 @@ def make_fs_entry(event: dict) -> FsEntry:
         bytes_xfer = ret
 
     fd = None
-    if syscall in {
+    if syscall == "mmap":
+        # mmap(addr, length, prot, flags, fd, offset): fd is arg4.
+        fd = arg4
+    elif syscall in {
         "read", "write", "readv", "writev",
         "pread64", "pwrite64", "preadv", "pwritev", "preadv2", "pwritev2",
         "close", "fstat", "fsync", "fdatasync",
         "ftruncate", "sync_file_range",
     }:
         fd = arg0
+    elif syscall in {"fread", "fwrite"} and "stdio_fd" in event:
+        try:
+            fd = int(event.get("stdio_fd"))
+        except (TypeError, ValueError):
+            fd = None
 
     path = event.get("path")
     if not path:
@@ -830,8 +951,13 @@ def make_fs_entry(event: dict) -> FsEntry:
 
     requested_size = None
     offset = None
+    offset_src = None
     flags = None
     dirfd = None
+    event_offset_src = int(event.get("offset_src", 0) or 0)
+    if event_offset_src:
+        offset = int(event.get("file_offset", 0) or 0)
+        offset_src = event_offset_src
 
     if syscall in {"read", "write"}:
         requested_size = arg2
@@ -839,17 +965,27 @@ def make_fs_entry(event: dict) -> FsEntry:
         requested_size = arg1 * arg2 if arg1 > 0 and arg2 > 0 else None
     elif syscall in {"pread64", "pwrite64"}:
         requested_size = arg2
-        offset = arg3 if "arg3" in event else None
+        if offset_src is None:
+            offset = arg3 if "arg3" in event else None
+            offset_src = 2 if offset is not None else None
     elif syscall in {"readv", "writev", "preadv", "pwritev", "preadv2", "pwritev2"}:
         # arg2 is iovcnt, not bytes. The total requested byte count lives in
         # user iovec memory and is intentionally not read by the BPF program.
         requested_size = None
         if syscall in {"preadv", "pwritev", "preadv2", "pwritev2"}:
-            offset = arg3 if "arg3" in event else None
+            if offset_src is None:
+                offset = arg3 if "arg3" in event else None
+                offset_src = 2 if offset is not None else None
             if syscall in {"preadv2", "pwritev2"}:
                 flags = arg4 if "arg4" in event else None
     elif syscall == "openat":
         dirfd = arg0
+        flags = arg2
+    elif syscall == "mmap":
+        # length = mapped bytes (upper bound on readable/writable volume);
+        # prot (arg2) tells read vs write; anonymous maps have no resolved path
+        # and are excluded downstream by requiring a file-backed fd.
+        requested_size = arg1
         flags = arg2
     elif syscall == "sync_file_range":
         offset = arg1
@@ -859,10 +995,22 @@ def make_fs_entry(event: dict) -> FsEntry:
         dirfd = arg0
 
     actual_size = bytes_xfer if bytes_xfer > 0 else None
+    fd_generation = event.get("_fd_generation")
+    if syscall not in {"read", "write", "readv", "writev", "pread64", "pwrite64", "preadv", "pwritev", "preadv2", "pwritev2", "fread", "fwrite"}:
+        fd_generation = None
+    try:
+        fd_generation = int(fd_generation) if fd_generation is not None else None
+    except (TypeError, ValueError):
+        fd_generation = None
+    fd_flags = str(event.get("_fd_open_flags") or "")
+    append = syscall in {"write", "writev", "pwrite64", "pwritev", "pwritev2", "fwrite"} and "O_APPEND" in fd_flags
 
+    ts_ns = int(event["ts_ns"])
     return FsEntry(
         pid=int(event.get("pid", 0)),
-        timestamp=ns_to_datetime(int(event["ts_ns"])),
+        tid=int(event.get("tid", event.get("pid", 0)) or 0),
+        timestamp=ns_to_datetime(ts_ns),
+        ts_ms=ns_to_epoch_ms(ts_ns),
         syscall=syscall,
         args=f"arg0={arg0},arg1={arg1},arg2={arg2},arg3={arg3},arg4={arg4}",
         return_value=ret,
@@ -877,8 +1025,56 @@ def make_fs_entry(event: dict) -> FsEntry:
         requested_size=requested_size,
         actual_size=actual_size,
         offset=offset,
+        offset_src=offset_src,
+        open_generation=fd_generation,
+        append=append,
         flags=flags,
         dirfd=dirfd,
+    )
+
+
+def make_lib_io_entry(event: dict) -> LibIoEntry:
+    ret = event.get("ret")
+    if isinstance(ret, bool):
+        ret = int(ret)
+    elif ret is not None:
+        ret = int(ret)
+    count = event.get("count")
+    if isinstance(count, bool):
+        count = int(count)
+    elif count is not None:
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = None
+    datatype_handle = event.get("datatype_handle")
+    if isinstance(datatype_handle, bool):
+        datatype_handle = int(datatype_handle)
+    elif datatype_handle is not None:
+        try:
+            datatype_handle = int(datatype_handle)
+        except (TypeError, ValueError):
+            datatype_handle = None
+    bytes_resolved = bool(event.get("bytes_resolved", False))
+    bytes_xfer = event.get("bytes")
+    if isinstance(bytes_xfer, (int, float)) and bytes_xfer > 0:
+        bytes_transferred = int(bytes_xfer)
+    else:
+        bytes_transferred = 0
+    ts_ns = int(event["ts_ns"])
+    return LibIoEntry(
+        pid=int(event.get("pid", 0)),
+        timestamp=ns_to_datetime(ts_ns),
+        ts_ms=ns_to_epoch_ms(ts_ns),
+        library=str(event.get("library") or "unknown"),
+        function=str(event.get("function") or "unknown"),
+        function_id=int(event.get("function_id", 0) or 0),
+        return_value=ret,
+        duration=int(event.get("latency_ns", 0) or 0) / 1_000_000_000,
+        count=count,
+        datatype_handle=datatype_handle,
+        bytes_resolved=bytes_resolved,
+        bytes_transferred=bytes_transferred,
     )
 
 
@@ -894,9 +1090,12 @@ def make_lifecycle_entry(event: dict) -> FsEntry:
     else:
         args = ""
 
+    ts_ns = int(event["ts_ns"])
     return FsEntry(
         pid=pid,
-        timestamp=ns_to_datetime(int(event["ts_ns"])),
+        tid=int(event.get("tid", pid) or pid),
+        timestamp=ns_to_datetime(ts_ns),
+        ts_ms=ns_to_epoch_ms(ts_ns),
         syscall=etype,
         args=args,
         return_value=None,
@@ -1026,6 +1225,7 @@ def process_trace_dir(
     window_start, window_end = get_tool_window(tool_calls)
 
     fs_entries: list[FsEntry] = []
+    lib_io_entries: list[LibIoEntry] = []
     total_events = 0
     lifecycle_types = {"fork", "exec", "exit"}
     index = ActiveToolIndex(tool_calls)
@@ -1034,15 +1234,36 @@ def process_trace_dir(
         if etype in {"syscall", "libc_io"}:
             total_events += 1
             entry = make_fs_entry(event)
+            is_lib_io_entry = False
+        elif etype == "lib_io":
+            total_events += 1
+            lib_entry = make_lib_io_entry(event)
+            is_lib_io_entry = True
         elif etype in lifecycle_types:
             total_events += 1
             entry = make_lifecycle_entry(event)
+            is_lib_io_entry = False
         else:
             continue
 
-        if window_start and entry.timestamp < window_start:
+        event_ts = lib_entry.timestamp if is_lib_io_entry else entry.timestamp
+        if window_start and event_ts < window_start:
             continue
-        if window_end and entry.timestamp > window_end:
+        if window_end and event_ts > window_end:
+            continue
+
+        if is_lib_io_entry:
+            index.advance_to(lib_entry.timestamp)
+            active_tools = index.active()
+            lib_entry.matched_tool_call = match_pid_event_to_tool(
+                lib_entry.pid,
+                lib_entry.function,
+                active_tools,
+                proc_tree=proc_tree,
+            )
+            if lib_entry.matched_tool_call is None and active_tools:
+                lib_entry.matched_tool_call = "uncategorized"
+            lib_io_entries.append(lib_entry)
             continue
 
         # Keep pathless events; only filter when a path is known.
@@ -1075,13 +1296,16 @@ def process_trace_dir(
     result = ParsedTrace()
     result.tool_calls = tool_calls
     result.fs_entries = fs_entries
+    result.lib_io_entries = lib_io_entries
     result.tool_summaries = compute_tool_summaries(fs_entries, tool_calls)
     result.summary = {
         "total_entries": total_events,
         "filtered_entries": len(fs_entries),
+        "lib_io_entries": len(lib_io_entries),
         "matched_to_tools": matched,
         "uncategorized": uncategorized,
         "pids": sorted({e.pid for e in fs_entries}),
+        "tz_offset_seconds": _tz_offset_seconds,
         "attribution": {
             "process_tree_nodes": len(proc_tree._parents),
             "method": "multi_signal_fd_path_process_tree",

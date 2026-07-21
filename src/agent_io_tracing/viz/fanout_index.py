@@ -19,25 +19,23 @@ from pathlib import Path
 # (filename, display name). PNG -> thumbnail card; .html -> link button.
 FIGURE_ORDER = [
     # storage / I/O shape (lineage/)
-    ("lineage/fig1_size_distribution.png", "File Size Distribution"),
     ("lineage/fig0_io_volume_summary.png", "I/O Volume Summary"),
-    ("lineage/fig6_reuse_pattern.png", "Reuse Pattern"),
-    ("lineage/fig2_reader_fanout.png", "Reader Fan-out"),
-    ("lineage/fig3_staleness_cdf.png", "Write→First-Read Staleness"),
+    ("lineage/fig1_size_distribution.png", "File and Request Size"),
+    ("lineage/fig2_fanout.png", "Reader & Writer Fan-out"),
+    ("lineage/fig3_staleness_cdf.png", "Write→Read Gap"),
     ("lineage/fig4_lifecycle.png", "Artifact Lifecycle"),
-    ("lineage/fig7_role_io_attribution.png", "Who Does the I/O"),
     # time & attribution (visualizations/ + call_dag)
     ("visualizations/agent_timeline.png", "Agent Timeline"),
     ("visualizations/phase_breakdown.png", "Time Accounting"),
-    ("visualizations/interface_mix.png", "I/O-Abstraction Mix"),
+    ("visualizations/measured_interface_layers.png", "Measured I/O Interface Mix"),
+    ("visualizations/directory_scan.png", "Directory Re-scans (getdents64)"),
+    ("visualizations/inter_arrival_cdf.png", "Inter-arrival Histogram"),
+    ("visualizations/reread_attribution.png", "Reread Attribution"),
+    ("visualizations/access_pattern.png", "Access Pattern"),
     ("visualizations/io_rate.png", "I/O Rate Over Time"),
+    ("visualizations/effective_bandwidth.png", "Effective BW by Phase"),
+    ("visualizations/io_autocorrelation.png", "I/O Autocorrelation"),
     ("call_dag.html", "Call DAG with I/O"),
-    # concurrency
-    ("visualizations/agent_concurrency.png", "Agent Activity Timeline"),
-    # detail (link-only)
-    ("visualizations/timeline.png", "Timeline View"),
-    ("visualizations/tool_syscalls.html", "Syscalls Per Tool Call"),
-    ("visualizations/tool_syscall_durations.html", "Syscall Duration Distributions"),
 ]
 
 DATA_LINKS = [

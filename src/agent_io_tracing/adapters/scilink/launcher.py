@@ -105,9 +105,17 @@ def _stdin_for_scilink(
     lines: list[str] = []
     scilink_args = scilink_args or []
 
-    # Both `scilink analyze` and `scilink plan` ask for an optional
-    # FutureHouse key when the env var is absent. Send Enter so the workload
-    # prompt is not consumed as that optional key.
+    # SciLink's setup() runs several interactive key prompts BEFORE the
+    # pipeline/chat loop, each reading one line via input().  If stdin EOFs at
+    # any of them SciLink dies with EOFError.  Feed exactly one Enter per prompt
+    # that will actually appear, in SciLink's own order, so each is skipped
+    # (auto-detect / skip) without the workload prompt being consumed as a key:
+    #   1. Google Gemini key — asked when neither GEMINI_API_KEY nor
+    #      GOOGLE_API_KEY is set ("Enter to auto-detect").
+    #   2. Optional FutureHouse key — asked when FUTUREHOUSE_API_KEY is absent
+    #      ("Enter to skip").
+    if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+        lines.append("")
     if not os.getenv("FUTUREHOUSE_API_KEY"):
         lines.append("")
 

@@ -1,5 +1,166 @@
 # Overview: Characterizing I/O in Agentic Scientific Workflows
 
+# eBPF/BCC 追踪操作手册
+
+> `$SSH_USER` / `$CLIENT_NODE` / key / base URL / model 都来自 `cloudlab_env.sh`（本地、git-ignored）；换节点改那里。
+
+在 CloudLab 节点上跑 agentic workflow 并用 eBPF/BCC 采集 I/O。两个已接入系统的 env 命名/模型写法**不一样**，别混：
+
+
+| 系统          | 配置文件                        | 远端 env 文件                         | key 变量             | 模型写法（FreeInference）                  | 走什么           |
+| ----------- | --------------------------- | --------------------------------- | ------------------ | ------------------------------------ | ------------- |
+| **SciLink** | `config/config_scilink.env` | `.env.scilink`                    | `OPENAI_API_KEY`   | `openai/qwen3.6-35b`（**要** `openai/` 前缀） | litellm       |
+| **GenoMAS** | `config/config_genomas.env` | `.env.genomas` + `~/GenoMAS/.env` | `OPENAI_API_KEY_1` | `qwen3.6-35b`（**裸名**，加前缀会 404）           | openai SDK 直连 |
+
+
+Provider = FreeInference（OpenAI 兼容），base URL `https://freeinference.org/v1`，Bearer key 放 `OPENAI_API_KEY`。
+
+⚠ **FreeInference 的 `/v1/models` 目录虚标**：列出的模型不都真部署了。实测(2026-07-15)`glm-5.1` / `glm-5-turbo` / `minimax-m3` / `minimax-m2.5` 都 **404**，只有 **`qwen3.6-35b`**（标了「no concurrency limit」，最适合 agentic 多次调用）和 **`deepseek-v4-flash`** 返回 200。换模型前先 `curl .../v1/chat/completions` 实打一次确认,别信目录。SciLink `polycrystalline_grains_basic` 已用 `qwen3.6-35b` 端到端验证通过。
+
+🟥 换节点/首次才做一次 · 🟨 每开新终端一次 · 🟩 每个 run · 🔧 改了什么才做。以下命令除注明【节点】外都在 **Mac** 跑。
+
+---
+
+
+
+# 一、配环境
+
+
+
+## 🟨 每开新终端【Mac】
+
+```zsh
+source cloudlab_env.sh
+```
+
+✅ 打印 `[cloudlab_env] keys OK` + 当前 `CLIENT=…`。
+
+## 🔧 改了代码 → 推代码【Mac】
+
+`.env*` 被**故意排除**（只在远端、装着 key），推代码不碰 key。
+
+```zsh
+rsync -az --delete \
+  --exclude '.git/' --exclude '__pycache__/' --exclude '*.pyc' \
+  --exclude 'results/' --exclude '.venv/' --exclude '.env*' \
+  ./ "$SSH_USER@$CLIENT_NODE:pi-ebpf-tracing-handoff/"
+```
+
+
+
+## 🔧 改了 Provider / key / model → 推 env【Mac】
+
+rsync 不碰远端 `.env.*`，换 provider 必须单独推。`.env.*` 从上往下 source、**末尾行覆盖前面**，所以追加一个 override 块即可 —— **秒级、不重建 venv**。先在 `cloudlab_env.sh` 填好 FreeInference 块再 `source`。
+
+```zsh
+source cloudlab_env.sh
+# SciLink：一个文件，模型带 openai/ 前缀（$SCILINK_MODEL 应为 openai/qwen3.6-35b）
+ssh "$SSH_USER@$CLIENT_NODE" "cat >> pi-ebpf-tracing-handoff/.env.scilink" <<EOF
+
+export OPENAI_API_KEY="$OPENAI_API_KEY"
+export OPENAI_BASE_URL="$OPENAI_BASE_URL"
+export OPENAI_API_BASE="$OPENAI_API_BASE"
+export SCILINK_MODEL="$SCILINK_MODEL"
+EOF
+
+# GenoMAS：两个文件，key 变量带 _1，模型裸名（$GENOMAS_MODEL 应为 qwen3.6-35b）
+ssh "$SSH_USER@$CLIENT_NODE" "cat >> pi-ebpf-tracing-handoff/.env.genomas" <<EOF
+
+export OPENAI_API_KEY_1="$OPENAI_API_KEY"
+export OPENAI_BASE_URL="$OPENAI_BASE_URL"
+export OPENAI_API_BASE="$OPENAI_API_BASE"
+export GENOMAS_MODEL="$GENOMAS_MODEL"
+EOF
+ssh "$SSH_USER@$CLIENT_NODE" "cat >> GenoMAS/.env" <<EOF
+
+OPENAI_API_KEY_1=$OPENAI_API_KEY
+OPENAI_BASE_URL=$OPENAI_BASE_URL
+OPENAI_API_BASE=$OPENAI_API_BASE
+EOF
+```
+
+✅ 确认：`ssh "$SSH_USER@$CLIENT_NODE" "tail -6 pi-ebpf-tracing-handoff/.env.scilink"` 里有 FreeInference base URL + 带 `openai/` 的模型。
+
+## 🟥 首次 / 换节点 → 全量部署【Mac，慢】
+
+```zsh
+bash scripts/deploy_scilink_to_client.sh    # 或 deploy_genomas_to_client.sh
+```
+
+⚠ 只想换 key/model 时**别**跑这个 —— 它 `uv venv --clear` 会重建整个 venv（分钟级）。换 provider 用上面的「推 env」。
+
+---
+
+
+
+# 二、跑一个 run（🟩）
+
+命令都用 `nohup … >log 2>&1 </dev/null &`：ssh **立刻返回**就能断线，任务在节点后台跑。用 `RUN_WORKLOADS` 选子集（逗号分隔），留空 = 全部。
+
+## GenoMAS【Mac】
+
+矩阵 12 格：`mw{1,2,4,8}_rep{1,2,3}`（max-workers × rep）。
+
+```zsh
+ssh "$SSH_USER@$CLIENT_NODE" \
+  "cd pi-ebpf-tracing-handoff && sudo -E RUN_WORKLOADS='mw1_rep1,mw4_rep1' \
+     nohup bash scripts/trace_script_bcc_genomas.sh > ~/genomas_run.log 2>&1 < /dev/null &"
+```
+
+
+
+## SciLink【Mac】
+
+
+| workload                       | 类型      | 内容                                    |
+| ------------------------------ | ------- | ------------------------------------- |
+| `eels_plasmons_basic`          | analyze | EELS 等离激元 mapping                     |
+| `eels_identification_basic`    | analyze | 1D EELS 谱识别                           |
+| `polycrystalline_grains_basic` | analyze | 2D 晶粒分割                               |
+| `planning_critical_materials`  | plan    | 需 embedding；FreeInference 有 `bge-m3`，把 `SCILINK_EMBEDDING_MODEL` 设成 `openai/bge-m3`（未实测） |
+
+
+```zsh
+ssh "$SSH_USER@$CLIENT_NODE" \
+  "cd pi-ebpf-tracing-handoff && sudo -E RUN_WORKLOADS='polycrystalline_grains_basic' \
+     nohup bash scripts/trace_script_bcc_scilink.sh > ~/scilink_run.log 2>&1 < /dev/null &"
+```
+
+✅ ssh 秒回、拿回提示符 = 已脱离终端，可断开 ssh。
+
+## 看进度 / 判断结束【Mac】
+
+```zsh
+ssh "$SSH_USER@$CLIENT_NODE" "tail -f ~/scilink_run.log"           
+ssh "$SSH_USER@$CLIENT_NODE" "pgrep -af trace_script_bcc_scilink"  
+# 空 = 已结束
+# 实时（GenoMAS 换 genomas_run.log）
+```
+
+✅ 日志出现 `All done. Results in: …` = 全部跑完。日志里若有 `401` / `LLM Provider NOT provided` / `NotFoundError` = provider 没配对，回「推 env」重来。
+
+---
+
+
+
+# 三、拉回结果（🟩【Mac】）
+
+```zsh
+RUN=$(ssh "$SSH_USER@$CLIENT_NODE" \
+  "ls -1dt /mnt/lustrefs/$SSH_USER/pi-ebpf-tracing-handoff/results/*/ | head -1")
+LOCAL="results/$(basename "$RUN")"
+mkdir -p "$LOCAL"
+rsync -az --progress --exclude 'work/' --exclude 'bcc.out' --exclude 'bcc.err' \
+  "$SSH_USER@$CLIENT_NODE:$RUN" "$LOCAL/"
+open "$LOCAL"/*/visualizations/index.html 2>/dev/null || open "$LOCAL"
+```
+
+✅ 本地 `results/<run_id>/<workload>/` 下出现 `visualizations/index.html`。
+
+---
+
+
+
 ## 1. Project Motivation
 
 Traditional scientific workflows usually have relatively fixed DAGs, known task dependencies, and stable producer-consumer dataflows. Existing workflow I/O characterization studies therefore focus on how task structure, file reuse, access type, operation count, dataflow size, and bandwidth explain workflow-level I/O behavior.
@@ -18,6 +179,8 @@ More specifically:
 - How much I/O is introduced purely by agent behavior — exploration, debugging, retry, repeated reads — the kind of overhead that a differently-behaved agent, running the exact same task and configuration, would not produce?
 - How much I/O comes from a demonstrably suboptimal configuration, regardless of whether that configuration was chosen by the agent's generated code or hard-coded into the workflow's own orchestration script?
 - How predictable is the I/O footprint of the same scientific goal across repeated agent runs, and how much of that unpredictability traces back to agent behavior specifically?
+
+
 
 ## 3. Scope
 
@@ -111,6 +274,8 @@ Everything left over after 5.1 and 5.2 are subtracted out. This is I/O that is n
 
 ## 6. Metrics to Characterize
 
+
+
 ### 6.1 Universal I/O Metrics
 
 Collected for all I/O, then aggregated by the three categories above.
@@ -120,8 +285,14 @@ Collected for all I/O, then aggregated by the three categories above.
 - metadata operation count
 - unique files touched
 - small-file access count, small-I/O count
-- I/O time, effective bandwidth
+- I/O time, effective bandwidth, and duty cycle. Duty cycle is
+`|union(read/write syscall intervals)| / group wall-clock time`, where group
+wall time comes from the shared run timeline: run wall for global metrics,
+tool-call interval unions for phase/role metrics, and LLM interval union vs
+run-wall remainder for inference-busy/idle metrics.
 - read/write ratio
+
+
 
 ### 6.2 Agent-Induced I/O Metrics
 
@@ -131,6 +302,8 @@ Collected for all I/O, then aggregated by the three categories above.
 - retry-induced I/O bytes and operations
 - temporary file count, abandoned artifact count
 - redundant-read fraction, non-productive I/O fraction
+
+
 
 ### 6.3 Task-Misconfigured I/O Metrics
 
@@ -143,6 +316,8 @@ These target systems run on real HPC clusters against parallel/shared filesystem
 - rank-level I/O size/time imbalance (where the task launches multiple workers/ranks, e.g. GenoMAS `--parallel-mode cohorts`, ChemGraph ensemble/FDMNES runs)
 - agent-caused vs script-caused split (see 5.2)
 
+
+
 ### 6.4 Run-to-Run Variance Metrics
 
 The purpose is to quantify how predictable the I/O footprint is when the same scientific goal is executed repeatedly by an agent, and to determine how much of that variance is attributable to agent-induced I/O specifically (5.1) versus task-misconfigured or residual I/O (5.2, 5.3), which should be comparatively stable across runs of the same fixed configuration.
@@ -150,6 +325,8 @@ The purpose is to quantify how predictable the I/O footprint is when the same sc
 Metrics: total I/O bytes/operations variance, metadata operation variance, unique files touched variance, agent-induced I/O variance, task-misconfigured I/O variance, residual I/O variance, I/O time variance, runtime variance.
 
 ## 7. Research Pipeline (Three Phases)
+
+
 
 ### Phase 1 — Comprehensive metric collection
 
@@ -164,6 +341,8 @@ Combine the raw I/O trace with execution provenance (tool-call/action-unit time 
 Select a small number of the clearest, highest-confidence findings — prioritizing task-misconfigured (script-caused) instances, since these are deterministic code paths where a single fix applies on every future run and the before/after comparison is clean without needing to average over agent run-to-run noise — and show the fix and its I/O impact.
 
 ## 8. Key Comparisons
+
+
 
 ### 8.1 Scripted Workflow vs. Agentic Workflow (optional, where a counterpart exists)
 
@@ -183,6 +362,8 @@ For a task-misconfigured instance (5.2), the comparison needed is local, not a g
 - Agent-induced I/O is more variable across repeated runs than task-misconfigured or residual I/O, which should be comparatively stable given a fixed configuration.
 - Task-misconfigured I/O occurs in both agent-generated code and in workflows' own fixed orchestration/tooling scripts; comparing the two rates indicates whether agentic code generation is a net-additional source of configuration error beyond what already exists in hand-written scientific workflow code.
 - Systems with more dynamically-orchestrated execution (SRAgent, ChemGraph, SciLink-autonomous) are expected to show higher run-to-run I/O variance than systems with a fixed action-sequence (GenoMAS), independent of task-misconfiguration.
+
+
 
 ## 10. Main Contribution
 

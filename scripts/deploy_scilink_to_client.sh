@@ -371,6 +371,17 @@ ssh "$SSH_USER@$CLIENT_NODE" \
 export OPENAI_API_KEY="${OPENAI_API_KEY}"
 REMOTE_ENV
 
+# FreeInference / any OpenAI-compatible endpoint (optional).  Emitted only
+# when OPENAI_BASE_URL is set in the local env (e.g. cloudlab_env.sh); left
+# absent otherwise so the client defaults to api.openai.com.  litellm honours
+# both OPENAI_BASE_URL and OPENAI_API_BASE, so we write both.
+if [ -n "${OPENAI_BASE_URL:-}" ]; then
+    OPENAI_BASE_BLOCK="export OPENAI_BASE_URL=\"${OPENAI_BASE_URL}\"
+export OPENAI_API_BASE=\"${OPENAI_API_BASE:-$OPENAI_BASE_URL}\""
+else
+    OPENAI_BASE_BLOCK="# No custom OPENAI_BASE_URL set; using provider default (api.openai.com)."
+fi
+
 echo "==> [3b/4] Writing ${REMOTE_HOME}/$REMOTE_HARNESS_NAME/.env.scilink"
 ssh "$SSH_USER@$CLIENT_NODE" \
     "cat > $REMOTE_HARNESS_NAME/.env.scilink && chmod 600 $REMOTE_HARNESS_NAME/.env.scilink" \
@@ -382,6 +393,7 @@ ssh "$SSH_USER@$CLIENT_NODE" \
 export OPENAI_API_KEY="${OPENAI_API_KEY}"
 export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 export FUTUREHOUSE_API_KEY="${FUTUREHOUSE_API_KEY:-}"
+${OPENAI_BASE_BLOCK}
 
 # Prevent Python from writing .pyc files into the venv.  Without this,
 # sudo -E runs leave root-owned __pycache__/*.pyc that the regular user
@@ -404,8 +416,10 @@ export AGENT_PYTHON="${REMOTE_HOME}/$REMOTE_SCILINK_DIR/.venv/bin/python"
 export POST_PYTHON="${REMOTE_HOME}/$REMOTE_SCILINK_DIR/.venv/bin/python"
 
 # Default model + Lustre data dir (matches deploy-time choices).
-export SCILINK_MODEL="gpt-4o-mini"
-export SCILINK_EMBEDDING_MODEL="text-embedding-3-small"
+# Override SCILINK_MODEL in the local env (cloudlab_env.sh) to switch providers,
+# e.g. export SCILINK_MODEL="openai/glm-5.1" for FreeInference.
+export SCILINK_MODEL="${SCILINK_MODEL:-gpt-4o-mini}"
+export SCILINK_EMBEDDING_MODEL="${SCILINK_EMBEDDING_MODEL:-text-embedding-3-small}"
 export DATA_DIR="/mnt/lustrefs/scilink_data"
 REMOTE_TRACE_ENV
 

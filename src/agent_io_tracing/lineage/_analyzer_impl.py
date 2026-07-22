@@ -311,32 +311,97 @@ def parse_iso_ts(s: str) -> float:
 # --- Step 1: load + attribute --------------------------------------
 
 def load_codeexec_index(trace_dir: Path) -> dict:
-    """Build {tool_call_run_id: {role, code_len, t_start_ms, t_end_ms}}.
+    """Build metadata for every parsed tool call, including non-code tools.
 
-    Source: pi_events.jsonl tool_execution_start / tool_execution_end.
+    ``parsed.json.tool_calls`` is the canonical source because adapters such as
+    SciLink do not emit ``tool_execution_start`` events.  PI events and
+    ``generated_code.jsonl`` enrich those records with role, phase, error, and
+    code-classification fields when available.
     """
-    pending = {}
-    index = {}
+    index: dict[str, dict] = {}
+
+    parsed_path = trace_dir / "parsed.json"
+    if parsed_path.is_file():
+        with parsed_path.open(encoding="utf-8") as f:
+            parsed = json.load(f)
+        for call in parsed.get("tool_calls", []):
+            rid = call.get("tool_id")
+            if not isinstance(rid, str) or not rid:
+                continue
+            params = call.get("input_params") or {}
+            start = call.get("start_time")
+            end = call.get("end_time")
+            try:
+                start_ms = parse_iso_ts(start) * 1000.0 if isinstance(start, str) else 0.0
+            except (TypeError, ValueError):
+                start_ms = 0.0
+            try:
+                end_ms = parse_iso_ts(end) * 1000.0 if isinstance(end, str) else start_ms
+            except (TypeError, ValueError):
+                end_ms = start_ms
+            index[rid] = {
+                "role": "?",
+                "tool_name": call.get("tool_name") or "",
+                "code_len": int(params.get("script_len") or params.get("code_len") or 0),
+                "stdout_len": 0,
+                "t_start_ms": start_ms,
+                "t_end_ms": end_ms,
+                "error": None,
+                "phase": None,
+                "io_layers": [],
+            }
+
+    pending: dict[str, dict] = {}
     with (trace_dir / "pi_events.jsonl").open() as f:
         for line in f:
             e = json.loads(line)
             t = e.get("type")
-            rid = e.get("run_id")
+            rid = e.get("run_id") or e.get("toolCallId")
             if t == "tool_execution_start":
-                pending[rid] = {
-                    "role": e.get("genomas_role", "?"),
-                    "code_len": e.get("code_len", 0),
-                    "t_start_ms": e.get("timestamp", 0.0),
-                }
+                if not isinstance(rid, str) or not rid:
+                    continue
+                entry = index.setdefault(rid, {
+                    "role": "?", "tool_name": "", "code_len": 0,
+                    "stdout_len": 0, "t_start_ms": 0.0, "t_end_ms": 0.0,
+                    "error": None, "phase": None, "io_layers": [],
+                })
+                if e.get("genomas_role"):
+                    entry["role"] = e["genomas_role"]
+                if e.get("code_len") is not None:
+                    entry["code_len"] = int(e.get("code_len") or 0)
+                if isinstance(e.get("timestamp"), (int, float)):
+                    entry["t_start_ms"] = e["timestamp"]
+                pending[rid] = entry
             elif t == "tool_execution_end":
-                if rid in pending:
-                    entry = pending.pop(rid)
-                    entry["t_end_ms"] = e.get("timestamp", entry["t_start_ms"])
-                    entry["stdout_len"] = e.get("stdout_len", 0)
-                    entry["error"] = e.get("error")
-                    entry["phase"] = e.get("phase")
-                    entry["io_layers"] = e.get("io_layers") or []
-                    index[rid] = entry
+                if not isinstance(rid, str) or not rid:
+                    continue
+                entry = pending.pop(rid, index.setdefault(rid, {
+                    "role": "?", "tool_name": "", "code_len": 0,
+                    "stdout_len": 0, "t_start_ms": 0.0, "t_end_ms": 0.0,
+                    "error": None, "phase": None, "io_layers": [],
+                }))
+                if isinstance(e.get("timestamp"), (int, float)):
+                    entry["t_end_ms"] = e["timestamp"]
+                entry["stdout_len"] = int(e.get("stdout_len") or entry.get("stdout_len") or 0)
+                entry["error"] = e.get("error")
+                entry["phase"] = e.get("phase") or entry.get("phase")
+                entry["io_layers"] = e.get("io_layers") or entry.get("io_layers") or []
+
+    generated_path = trace_dir / "generated_code.jsonl"
+    if generated_path.is_file():
+        for line in generated_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = record.get("run_id")
+            if not isinstance(rid, str) or rid not in index:
+                continue
+            entry = index[rid]
+            entry["role"] = record.get("role") or entry.get("role") or "?"
+            entry["phase"] = record.get("phase") or entry.get("phase")
+            entry["io_layers"] = record.get("io_layers") or entry.get("io_layers") or []
+            entry["code_len"] = int(record.get("code_len") or entry.get("code_len") or 0)
     return index
 
 

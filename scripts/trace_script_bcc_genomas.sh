@@ -294,15 +294,15 @@ for ws_out in "$BASE_OUT"/*/; do
         SUM_RC=$?
         [ $SUM_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}summarize"
 
-        "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" \
-            > "$ws_out/parallelism.log" 2>&1
-        PAR_RC=$?
-        [ $PAR_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}parallelism"
-
         "$POST_PYTHON" -m agent_io_tracing.lineage.analyzer "$ws_out" \
             > "$ws_out/lineage.log" 2>&1
         LIN_RC=$?
         [ $LIN_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}lineage"
+
+        "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" \
+            > "$ws_out/parallelism.log" 2>&1
+        PAR_RC=$?
+        [ $PAR_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}parallelism"
 
         "$POST_PYTHON" -m agent_io_tracing.analysis.phase1_metrics "$ws_out" \
             > "$ws_out/phase1_metrics.log" 2>&1

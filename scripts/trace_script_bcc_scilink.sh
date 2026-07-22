@@ -293,16 +293,6 @@ for ws_out in "$BASE_OUT"/*/; do
             sed 's/^/    /' "$ws_out/summarize.log" || true
             [ $SUM_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}summarize"
 
-            echo "  Computing DAG + parallelism metrics..."
-            "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" \
-                > "$ws_out/parallelism.log" 2>&1
-            PAR_RC=$?
-            sed 's/^/    /' "$ws_out/parallelism.log" || true
-            [ $PAR_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}parallelism"
-            if [ $PAR_RC -eq 0 ]; then
-                [ -f "$ws_out/call_dag.html" ] && echo "    DAG HTML: $ws_out/call_dag.html"
-                [ -f "$ws_out/parallelism_summary.json" ] && echo "    Metrics:  $ws_out/parallelism_summary.json"
-            fi
         else
             echo "  Skipping pi summary (pi_events.jsonl or tool_calls.log missing)"
         fi
@@ -315,6 +305,19 @@ for ws_out in "$BASE_OUT"/*/; do
         LIN_RC=$?
         sed 's/^/    /' "$ws_out/lineage.log" || true
         [ $LIN_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}lineage"
+
+        if [ -f "$ws_out/pi_events.jsonl" ] && [ -f "$ws_out/tool_calls.log" ]; then
+            echo "  Computing DAG + parallelism metrics..."
+            "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" \
+                > "$ws_out/parallelism.log" 2>&1
+            PAR_RC=$?
+            sed 's/^/    /' "$ws_out/parallelism.log" || true
+            [ $PAR_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}parallelism"
+            if [ $PAR_RC -eq 0 ]; then
+                [ -f "$ws_out/call_dag.html" ] && echo "    DAG HTML: $ws_out/call_dag.html"
+                [ -f "$ws_out/parallelism_summary.json" ] && echo "    Metrics:  $ws_out/parallelism_summary.json"
+            fi
+        fi
 
         echo "  Computing phase-1 I/O metrics..."
         "$POST_PYTHON" -m agent_io_tracing.analysis.phase1_metrics "$ws_out" \

@@ -4,16 +4,17 @@
 
 > `$SSH_USER` / `$CLIENT_NODE` / key / base URL / model 都来自 `cloudlab_env.sh`（本地、git-ignored）；换节点改那里。
 
-在 CloudLab 节点上跑 agentic workflow 并用 eBPF/BCC 采集 I/O。两个已接入系统的 env 命名/模型写法**不一样**，别混：
+在 CloudLab 节点上跑 workflow 并用 eBPF/BCC 采集 I/O。三个已接入系统的运行依赖**不一样**，别混：
 
 
 | 系统          | 配置文件                        | 远端 env 文件                         | key 变量             | 模型写法（FreeInference）                  | 走什么           |
 | ----------- | --------------------------- | --------------------------------- | ------------------ | ------------------------------------ | ------------- |
 | **SciLink** | `config/config_scilink.env` | `.env.scilink`                    | `OPENAI_API_KEY`   | `openai/qwen3.6-35b`（**要** `openai/` 前缀） | litellm       |
 | **GenoMAS** | `config/config_genomas.env` | `.env.genomas` + `~/GenoMAS/.env` | `OPENAI_API_KEY_1` | `qwen3.6-35b`（**裸名**，加前缀会 404）           | openai SDK 直连 |
+| **1000genome classic** | `config/config_1000genome.env` | 可选 `.env.1000genome` | 不需要 | 不适用 | 本地 Python DAG，支持离线 |
 
 
-Provider = FreeInference（OpenAI 兼容），base URL `https://freeinference.org/v1`，Bearer key 放 `OPENAI_API_KEY`。
+前两个 agentic 系统的 Provider = FreeInference（OpenAI 兼容），base URL `https://freeinference.org/v1`，Bearer key 放 `OPENAI_API_KEY`。1000genome classic 不使用 provider 或 key。
 
 ⚠ **FreeInference 的 `/v1/models` 目录虚标**：列出的模型不都真部署了。实测(2026-07-15)`glm-5.1` / `glm-5-turbo` / `minimax-m3` / `minimax-m2.5` 都 **404**，只有 **`qwen3.6-35b`**（标了「no concurrency limit」，最适合 agentic 多次调用）和 **`deepseek-v4-flash`** 返回 200。换模型前先 `curl .../v1/chat/completions` 实打一次确认,别信目录。SciLink `polycrystalline_grains_basic` 已用 `qwen3.6-35b` 端到端验证通过。
 
@@ -128,16 +129,146 @@ ssh "$SSH_USER@$CLIENT_NODE" \
 
 ✅ ssh 秒回、拿回提示符 = 已脱离终端，可断开 ssh。
 
+## 1000genome classic baseline
+
+该路径不使用 Pegasus、HTCondor 或 LLM。`run_1000genome.py` 直接执行
+`individuals → individuals_merge` 与并行的 `sifting` 分支，然后执行
+`mutation_overlap` / `frequency`。每个 task 有独立 sandbox，整个 DAG 共享一个
+全局 worker 上限。
+
+默认矩阵为 1、2、4 个 chromosome，各重复 3 次：
+
+```text
+classic_chr1_r1  classic_chr1_r2  classic_chr1_r3
+classic_chr2_r1  classic_chr2_r2  classic_chr2_r3
+classic_chr4_r1  classic_chr4_r2  classic_chr4_r3
+```
+
+默认固定 `INDIVIDUAL_JOBS=2`、`MAX_WORKERS=4`、`POPULATIONS=ALL`。
+
+### 首次联网准备【CloudLab client，只做一次】
+
+运行阶段不会下载数据；必须先把代码、Python 依赖和解压后的输入准备好：
+
+```bash
+LUSTRE_USER_DIR="${MOUNT_PATH:-/mnt/lustrefs}/$USER"
+mkdir -p "$LUSTRE_USER_DIR"
+git clone https://github.com/pegasus-isi/1000genome-workflow.git \
+  "$LUSTRE_USER_DIR/1000genome-workflow"
+cd "$LUSTRE_USER_DIR/1000genome-workflow"
+
+# upstream 脚本假定这个目录已经存在。
+mkdir -p data/20130502/sifting
+bash prepare_input.sh
+
+# 不安装 Pegasus/HTCondor。使用兼容当前 Python 的科学计算包；不要强制
+# 安装 upstream 为旧 Python 固定的版本号。
+curl -LsSf https://astral.sh/uv/install.sh | sh
+"$HOME/.local/bin/uv" venv --python 3.10 .venv
+"$HOME/.local/bin/uv" pip install --python .venv/bin/python \
+  numpy matplotlib pillow pandas plotly
+```
+
+开始前必须存在：
+
+```text
+$WORKFLOW_REPO/bin/{individuals,individuals_merge,sifting,mutation_overlap,frequency}.py
+$DATASET_DIR/columns.txt
+$DATASET_DIR/ALL.chr1.250000.vcf
+$DATASET_DIR/sifting/ALL.chr1.phase3_shapeit2_mvncall_integrated_v5.20130502.sites.annotation.vcf
+$POPULATION_DIR/ALL
+```
+
+2/4-chromosome cell 还分别需要 chr2，以及 chr2–chr4 的两类 VCF。输入必须是
+已经解压的 `.vcf`，不能只保留 `.vcf.gz`。
+
+### 跑一个最小 trace【Mac 发起】
+
+以下命令只跑 `classic_chr1_r1`。路径变量在远端普通用户 shell 中展开后再传给
+`sudo`。workflow checkout、VCF 和 venv 都放在 Lustre，不能放进容量很小的
+`$HOME`/root filesystem：
+
+```zsh
+ssh "$SSH_USER@$CLIENT_NODE" '
+  cd "$HOME/pi-ebpf-tracing-handoff"
+  REPO="/mnt/lustrefs/$USER/1000genome-workflow"
+  sudo -E env \
+    WORKFLOW_REPO="$REPO" \
+    DATASET_DIR="$REPO/data/20130502" \
+    POPULATION_DIR="$REPO/data/populations" \
+    AGENT_PYTHON="$REPO/.venv/bin/python" \
+    POST_PYTHON="$REPO/.venv/bin/python" \
+    CLASSIC_OFFLINE=1 \
+    RUN_WORKLOADS=classic_chr1_r1 \
+    nohup bash scripts/trace_script_bcc_1000genome.sh \
+      > "$HOME/classic_1000genome_run.log" 2>&1 < /dev/null &
+'
+```
+
+跑完整 9-cell 矩阵时去掉 `RUN_WORKLOADS=classic_chr1_r1`，或设为空字符串。
+也可以临时覆盖固定参数，例如：
+
+```zsh
+RUN_WORKLOADS=classic_chr1_r1 INDIVIDUAL_JOBS=2 MAX_WORKERS=4 POPULATIONS=ALL
+```
+
+### 完全离线运行
+
+这里的“离线”指运行期间不访问公网、不调用 API；CloudLab 内部的 Lustre 挂载和
+SSH 控制连接仍可使用。classic runner 本身没有下载或网络调用，且默认
+`CLASSIC_OFFLINE=1`。该标记会同时写入 `manifest.json` 和
+`work/classic_run_summary.json`，便于之后审计。
+
+在隔离节点执行前，从可联网机器一次性传入以下内容：
+
+- `1000genome-workflow` checkout，包括 `bin/`、`data/populations/`、
+  `columns.txt` 和所需的全部解压 VCF；
+- 可直接使用的 Python 3.10+ 环境，或者包含 `numpy`、`matplotlib`、`pillow`、
+  `pandas`、`plotly` 及其依赖的本地 wheelhouse；
+- 系统级 BCC 包和与当前 kernel 匹配的 headers。BCC 不能由普通 Python
+  wheelhouse 替代。
+
+如果使用 wheelhouse，在离线节点安装时禁止访问索引：
+
+```bash
+python3.10 -m venv "$WORKFLOW_REPO/.venv"
+"$WORKFLOW_REPO/.venv/bin/pip" install \
+  --no-index --find-links /path/to/wheelhouse \
+  numpy matplotlib pillow pandas plotly
+```
+
+确认输入和依赖已落盘后，执行上一节的命令即可；不需要任何 API key 或
+`.env.genomas` / `.env.scilink`。trace 脚本会在启动 tracer 前检查 repo、Python、
+`columns.txt`、population 文件和每个 chromosome 的两个 VCF，缺失时直接失败，
+不会尝试联网补齐。
+
+每个成功 cell 应至少生成：
+
+```text
+ebpf_events.log
+parsed.json
+artifact_sizes.json
+manifest.json
+work/classic_run_summary.json
+visualizations/file_access_volume.png
+visualizations/rw_asymmetry.png
+```
+
+classic run 不生成 LLM summary、lineage、parallelism 或 `viz.trace` dashboard。
+
 ## 看进度 / 判断结束【Mac】
 
 ```zsh
 ssh "$SSH_USER@$CLIENT_NODE" "tail -f ~/scilink_run.log"           
 ssh "$SSH_USER@$CLIENT_NODE" "pgrep -af trace_script_bcc_scilink"  
+# classic：把日志换成 ~/classic_1000genome_run.log，进程名换成 trace_script_bcc_1000genome
 # 空 = 已结束
 # 实时（GenoMAS 换 genomas_run.log）
 ```
 
-✅ 日志出现 `All done. Results in: …` = 全部跑完。日志里若有 `401` / `LLM Provider NOT provided` / `NotFoundError` = provider 没配对，回「推 env」重来。
+✅ Agentic 脚本日志出现 `All done. Results in: …`，或 classic 日志最后出现
+`Results: …`，表示脚本已结束。Agentic 日志里若有 `401` / `LLM Provider NOT
+provided` / `NotFoundError`，说明 provider 没配对，回「推 env」重来。
 
 ---
 
@@ -155,7 +286,9 @@ rsync -az --progress --exclude 'work/' --exclude 'bcc.out' --exclude 'bcc.err' \
 open "$LOCAL"/*/visualizations/index.html 2>/dev/null || open "$LOCAL"
 ```
 
-✅ 本地 `results/<run_id>/<workload>/` 下出现 `visualizations/index.html`。
+✅ Agentic run 应出现 `visualizations/index.html`；classic run 没有 dashboard，
+应检查 `visualizations/file_access_volume.png`、`visualizations/rw_asymmetry.png`
+和 `artifact_sizes.json`。
 
 ---
 

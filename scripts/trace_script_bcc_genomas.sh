@@ -58,6 +58,13 @@ mkdir -p "$DATA_DIR" || { echo "Error: cannot create DATA_DIR=$DATA_DIR" >&2; ex
 BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/phase4_$(date +%Y%m%d_%H%M%S)}"
 require_lustre_base_out "$BASE_OUT"
 BASE_OUT="$(cd "$BASE_OUT" && pwd)"
+RUN_VERSION_PREFIX="${GENOMAS_VERSION_PREFIX:-}"
+if [ -z "$RUN_VERSION_PREFIX" ]; then
+    RUN_VERSION_PREFIX="$(basename "$BASE_OUT")"
+fi
+# GenoMAS stores checkpoints outside BASE_OUT. Include the run directory in
+# --version so a new trace never resumes a cell from an earlier matrix run.
+RUN_VERSION_PREFIX="$(printf '%s' "$RUN_VERSION_PREFIX" | tr -c 'A-Za-z0-9_.-' '_')"
 
 if [ ! -x "$TRACER_PYTHON" ]; then
     echo "Error: TRACER_PYTHON=$TRACER_PYTHON is not executable" >&2
@@ -73,10 +80,65 @@ if [ ! -x "$AGENT_PYTHON" ]; then
     echo "Re-run deploy_genomas_to_client.sh to (re)build the uv venv." >&2
     exit 1
 fi
+if ! "$POST_PYTHON" -c "import markdown, tiktoken" >/dev/null 2>&1; then
+    echo "Error: $POST_PYTHON is missing Markdown or tiktoken." >&2
+    echo "Re-run scripts/deploy_genomas_to_client.sh before tracing." >&2
+    exit 1
+fi
 if ! "$AGENT_PYTHON" -c "import sys; sys.path.insert(0,'$GENOMAS_REPO'); import utils.llm" >/dev/null 2>&1; then
     echo "Error: GenoMAS utils.llm not importable by $AGENT_PYTHON" >&2
     echo "       GENOMAS_REPO=$GENOMAS_REPO" >&2
     exit 1
+fi
+
+# GenoMAS catches provider failures and converts them into empty responses, so
+# its process may still exit 0 after a 401.  Verify the live provider before
+# starting BCC and fail the whole run early.  Replay runs do not need network.
+if [ "${GENOMAS_LLM_REPLAY:-0}" != "1" ]; then
+    echo "Checking GenoMAS provider credentials..."
+    "$AGENT_PYTHON" - "$GENOMAS_MODEL" <<'PY'
+import os
+import sys
+import time
+from openai import OpenAI
+
+key = os.environ.get("OPENAI_API_KEY_1", "")
+base_url = os.environ.get("OPENAI_BASE_URL") or None
+if not key:
+    raise SystemExit("Error: OPENAI_API_KEY_1 is empty")
+
+try:
+    started = time.time()
+    stream = OpenAI(api_key=key, base_url=base_url).chat.completions.create(
+        model=sys.argv[1],
+        messages=[{"role": "user", "content": "Reply exactly OK"}],
+        max_tokens=8,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    first_token = None
+    usage = None
+    for chunk in stream:
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if delta is not None and (
+            delta.content or getattr(delta, "reasoning_content", None)
+        ) and first_token is None:
+            first_token = time.time()
+        if chunk.usage is not None:
+            usage = chunk.usage
+    if first_token is None:
+        raise RuntimeError("stream returned no token")
+    if usage is None:
+        raise RuntimeError("stream returned no usage; TTFT/KV metrics unavailable")
+except Exception as exc:
+    raise SystemExit("Error: GenoMAS provider preflight failed: {}".format(exc))
+
+print(
+    "GenoMAS provider preflight OK",
+    "TTFT_ms={:.1f}".format((first_token - started) * 1000.0),
+    "tokens={}".format(usage.total_tokens),
+)
+PY
 fi
 
 [ -d "$ROOT_DIR/src/agent_io_tracing" ] || {
@@ -95,27 +157,15 @@ echo "Work dir:   $WORK_DIR"
 echo "Data dir:   $DATA_DIR"
 echo "Output dir: $BASE_OUT"
 echo "Model:      $GENOMAS_MODEL"
+echo "Vendor:     ${GENOMAS_VENDOR:-unrecorded}"
+echo "Stream timing: ${GENOMAS_CAPTURE_STREAM_TIMING:-1}"
 echo "Cells:      ${#WORKLOADS[@]} (= max-workers values × reps)"
 echo "Inter-run sleep: ${INTER_RUN_SLEEP_SEC}s"
 [ -n "${RUN_WORKLOADS:-}" ] && echo "RUN_WORKLOADS filter: $RUN_WORKLOADS"
 echo ""
 
-IFS=',' read -r -a RUN_NAME_ARRAY <<< "${RUN_WORKLOADS:-}"
-
-should_run_workload() {
-    local name="$1"
-    if [ "${#RUN_NAME_ARRAY[@]}" -eq 0 ] || [ -z "${RUN_NAME_ARRAY[0]}" ]; then
-        return 0
-    fi
-    local item
-    for item in "${RUN_NAME_ARRAY[@]}"; do
-        item="$(echo "$item" | xargs)"
-        if [ -n "$item" ] && [ "$item" = "$name" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
+validate_workload_selection "${WORKLOADS[@]}"
+SELECTED_CELL_TOTAL="$(selected_workload_count "${WORKLOADS[@]}")"
 
 # Each entry: "name|max_workers|rep|extra_args"
 CELL_IDX=0
@@ -131,13 +181,25 @@ for entry in "${WORKLOADS[@]}"; do
         echo "Skip malformed cell (need name|max_workers|rep|extra): '$entry'" >&2
         continue
     fi
-    if ! should_run_workload "$NAME"; then
+    if ! workload_selected "$NAME"; then
         echo "Skipping: $NAME (not in RUN_WORKLOADS)"
         continue
     fi
 
     CELL_IDX=$((CELL_IDX + 1))
-    OUT="$BASE_OUT/$NAME"
+    # The no-cache arm writes to a distinct cell directory so it can share a
+    # BASE_OUT with the cached arm and land in the same report without
+    # overwriting it.  --task-id keeps the original name: same workload, only
+    # the prompt tagging differs.
+    CELL="$NAME"
+    case "${GENOMAS_NOCACHE:-0}" in
+        1|true|TRUE|yes|YES) CELL="${NAME}_nocache" ;;
+    esac
+    # GENOMAS_CELL_SUFFIX appends a further tag, so arms that differ in
+    # something the cell name does not encode -- vendor, model, a repeat --
+    # land in separate cells instead of overwriting each other.
+    CELL="${CELL}${GENOMAS_CELL_SUFFIX:-}"
+    OUT="$BASE_OUT/$CELL"
     mkdir -p "$OUT"
     OUT="$(cd "$OUT" && pwd)"
 
@@ -145,7 +207,7 @@ for entry in "${WORKLOADS[@]}"; do
     mkdir -p "$WORK"
     WORK="$(cd "$WORK" && pwd)"
 
-    echo "=== Cell $CELL_IDX/${#WORKLOADS[@]}: $NAME (max-workers=$MW, rep=$REP) ==="
+    echo "=== Cell $CELL_IDX/$SELECTED_CELL_TOTAL: $CELL (max-workers=$MW, rep=$REP) ==="
     echo "  Start time:  $(date +%H:%M:%S)"
     echo "  Output:      $OUT"
 
@@ -166,14 +228,15 @@ for entry in "${WORKLOADS[@]}"; do
         echo "  fullpipeline mode: regression phase enabled"
     fi
 
-    # --version embeds NAME so GenoMAS's output/log_<version>.txt is unique
-    # per cell (otherwise checkpoint-resume across cells would corrupt data).
+    VERSION="${RUN_VERSION_PREFIX}_${CELL}"
+    # VERSION is unique across both cells and matrix runs, preventing GenoMAS
+    # from silently reusing an old completion checkpoint.
     "$AGENT_PYTHON" -m agent_io_tracing.adapters.genomas.launcher \
         "$WORK" "$OUT" \
         --data-root "$DATA_DIR" \
         --model "$GENOMAS_MODEL" \
         --api 1 \
-        --version "$NAME" \
+        --version "$VERSION" \
         $QUICK_TEST_FLAG \
         --parallel-mode cohorts \
         --max-workers "$MW" \
@@ -228,24 +291,20 @@ for entry in "${WORKLOADS[@]}"; do
         >"$OUT/bcc.out" 2>"$OUT/bcc.err" &
     TRACER_PID=$!
 
-    TRACER_READY=0
-    for _ in $(seq 1 100); do
-        if [ -s "$OUT/ebpf_events.log" ]; then
-            TRACER_READY=1
-            break
-        fi
-        if ! kill -0 "$TRACER_PID" >/dev/null 2>&1; then
-            break
-        fi
-        sleep 0.1
-    done
-    if [ "$TRACER_READY" != "1" ]; then
+    if ! wait_for_trace_file "$TRACER_PID" "$OUT/ebpf_events.log"; then
         echo "  Warning: tracer did not create ebpf_events.log before agent resume" >&2
     fi
     kill -CONT "$AGENT_PID" >/dev/null 2>&1 || true
 
     wait "$AGENT_PID"
     EXIT_CODE=$?
+
+    # GenoMAS writes its detailed application log outside the trace result.
+    # Copy it into the cell so API/tool failures are included in pull checks.
+    GENOMAS_APP_LOG="$GENOMAS_REPO/output/log_${VERSION}.txt"
+    if [ -f "$GENOMAS_APP_LOG" ]; then
+        cp "$GENOMAS_APP_LOG" "$OUT/genomas_application.log"
+    fi
 
     stop_tracer "$TRACER_PID"
     if [ -n "$LUSTRE_SAMPLER_PID" ]; then
@@ -258,12 +317,18 @@ for entry in "${WORKLOADS[@]}"; do
 
     # Inter-cell sleep so the next cell starts with a fresh OpenAI rpm bucket.
     # Skip after the last cell so total wall-clock isn't padded for nothing.
-    if [ "$CELL_IDX" -lt "${#WORKLOADS[@]}" ] && [ "$INTER_RUN_SLEEP_SEC" -gt 0 ]; then
+    if [ "$CELL_IDX" -lt "$SELECTED_CELL_TOTAL" ] && [ "$INTER_RUN_SLEEP_SEC" -gt 0 ]; then
         echo "  Sleeping ${INTER_RUN_SLEEP_SEC}s before next cell..."
         sleep "$INTER_RUN_SLEEP_SEC"
     fi
     echo ""
 done
+
+if [ "$CELL_IDX" -eq 0 ]; then
+    echo "Error: RUN_WORKLOADS selected zero GenoMAS cells: ${RUN_WORKLOADS:-<empty>}" >&2
+    echo "Available cells: A_c1_w1,A_c2_w2,A_c3_w2,A_c4_w2,A_c4_w4,A_c8_w4,B_t1_w2,B_t2_w2,B_t4_w2" >&2
+    exit 2
+fi
 
 echo "=== Post-processing (parse + summarize + parallelism + visualize) ==="
 POST_FAIL_COUNT=0
@@ -308,6 +373,16 @@ for ws_out in "$BASE_OUT"/*/; do
             > "$ws_out/phase1_metrics.log" 2>&1
         P1_RC=$?
         [ $P1_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}phase1_metrics"
+
+        "$POST_PYTHON" -m agent_io_tracing.analysis.execution_units "$ws_out" \
+            > "$ws_out/execution_units.log" 2>&1
+        EU_RC=$?
+        [ $EU_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}execution_units"
+
+        "$POST_PYTHON" -m agent_io_tracing.analysis.trace_quality "$ws_out" \
+            > "$ws_out/trace_quality.log" 2>&1
+        TQ_RC=$?
+        [ $TQ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}trace_quality"
 
         "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs . \
             > "$ws_out/per_run_io_char.log" 2>&1
@@ -366,6 +441,15 @@ done
 echo "=== Matrix summary written to $SUMMARY_CSV ==="
 cat "$SUMMARY_CSV" 2>/dev/null || true
 
+set +e
+run_kvcache_report "$POST_PYTHON" "$BASE_OUT"
+KVCACHE_RC=$?
+set -e
+if [ "$KVCACHE_RC" -ne 0 ]; then
+    POST_FAIL_COUNT=$((POST_FAIL_COUNT + 1))
+    POST_FAIL_NAMES+=("kvcache_report")
+fi
+
 if [ "$POST_FAIL_COUNT" -gt 0 ]; then
     echo ""
     echo "Post-processing finished with $POST_FAIL_COUNT failed cell(s):"
@@ -373,14 +457,11 @@ if [ "$POST_FAIL_COUNT" -gt 0 ]; then
     echo "(See <cell>/{parse,summarize,parallelism,visualize}.log for details)"
 fi
 
-chmod -R a+rX "$BASE_OUT" || true
-if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
-    chown -R "$SUDO_UID:$SUDO_GID" "$BASE_OUT" 2>/dev/null || true
-    echo "Returned ownership of $BASE_OUT to ${SUDO_USER:-uid=$SUDO_UID}"
-fi
+return_results_ownership "$BASE_OUT"
 
 echo ""
 echo "=== Phase 4 matrix run complete ==="
 echo "Results in: $BASE_OUT"
 echo "Headline CSV: $SUMMARY_CSV"
-echo "Per-cell: $BASE_OUT/<cell>/{visualizations,parallelism_summary.json,ebpf_events.log,pi_events.jsonl}"
+echo "KV report: $BASE_OUT/kvcache_report.html"
+echo "Per-cell: $BASE_OUT/<cell>/{visualizations,parallelism_summary.json,ebpf_events.log,pi_events.jsonl,messages.jsonl}"

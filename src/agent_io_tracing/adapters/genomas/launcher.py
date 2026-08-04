@@ -48,17 +48,11 @@ import sys
 import traceback
 from pathlib import Path
 
+from agent_io_tracing.adapters.cli import split_forwarded_argv
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-
-
-def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
-    if "--" in argv:
-        idx = argv.index("--")
-        return argv[:idx], argv[idx + 1:]
-    return argv, []
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -159,7 +153,7 @@ def slice_task_info(
 
 
 def main() -> int:
-    ours, genomas_args = _split_argv(sys.argv[1:])
+    ours, genomas_args = split_forwarded_argv(sys.argv[1:])
     args = build_arg_parser().parse_args(ours)
 
     work_dir = args.work_dir.resolve()
@@ -235,7 +229,13 @@ def main() -> int:
 
     # Atomic-ish backup-and-replace, restore in finally.
     shutil.copy2(task_info_path, backup_path)
-    task_info_path.write_text(json.dumps(sliced, indent=2))
+    # Write a temp file and rename it into place.  Rewriting task_info.json
+    # directly needs write permission on that file, which upstream may ship
+    # read-only and which an earlier sudo-owned run can leave unwritable;
+    # replace() only needs write permission on the containing directory.
+    tmp_path = task_info_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(sliced, indent=2))
+    os.replace(tmp_path, task_info_path)
 
     # --- install the logger BEFORE importing GenoMAS ----------------------
     # genomas_tool_logger lives in this directory (the harness dir),
@@ -264,8 +264,8 @@ def main() -> int:
 
     patched = install_global(handler)
     if not patched:
-        print(f"[analyze_codebase_genomas] WARNING: no LLM clients patched; "
-              f"the run will proceed but pi_events.jsonl will be empty",
+        print("[analyze_codebase_genomas] WARNING: no LLM clients patched; "
+              "the run will proceed but pi_events.jsonl will be empty",
               file=sys.stderr)
 
     # --- build argv for main.py and run -----------------------------------
@@ -306,7 +306,7 @@ def main() -> int:
     finally:
         # Restore original task_info.json *always*, even on crash.
         try:
-            shutil.move(str(backup_path), str(task_info_path))
+            os.replace(str(backup_path), str(task_info_path))
             print(f"[analyze_codebase_genomas] restored {task_info_path} "
                   f"from {backup_path.name}", file=sys.stderr)
         except Exception as e:

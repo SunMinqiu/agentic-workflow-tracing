@@ -43,6 +43,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from agent_io_tracing.adapters.llm_trace import (
+    EMPTY_USAGE,
+    cache_key,
+    field,
+    format_system_prompt as _format_system_prompt_entry,
+    format_tool_log as _format_log_line,
+    infer_phase,
+    normalize_messages,
+    provider_request_id,
+    runtime_vendor,
+    strip_nocache_tag,
+)
+
 try:
     from agent_io_tracing.analysis.io_api_classifier import classify_code
 except Exception:
@@ -56,67 +69,12 @@ _current_parent: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # ----- formatting helpers (mirror langchain_tool_logger.py exactly) ---------
 
 
-def _format_time(dt: datetime) -> str:
-    return dt.strftime("%H:%M:%S.%f")
-
-
 def _normalize_tool_name(name: str | None) -> str:
     if not name:
         return "Tool"
     if name.lower() == "bash":
         return "Bash"
     return name[0].upper() + name[1:]
-
-
-def _python_literal(value: Any) -> str:
-    """Round-trippable Python literal for ast.literal_eval."""
-    if value is None:
-        return "None"
-    if isinstance(value, bool):
-        return "True" if value else "False"
-    if isinstance(value, (int, float)):
-        if value != value or value in (float("inf"), float("-inf")):
-            return "None"
-        return repr(value)
-    if isinstance(value, str):
-        return repr(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_python_literal(v) for v in value) + "]"
-    if isinstance(value, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"{_python_literal(str(k))}: {_python_literal(v)}"
-                for k, v in value.items()
-            )
-            + "}"
-        )
-    return _python_literal(str(value))
-
-
-def _format_log_line(
-    started_at: datetime,
-    ended_at: datetime,
-    tool_name: str,
-    tool_id: str,
-    tool_input: Any,
-) -> str:
-    duration_ms = (ended_at - started_at).total_seconds() * 1000.0
-    return (
-        f"[{_format_time(started_at)} -> {_format_time(ended_at)}] "
-        f"({duration_ms:.1f}ms) {tool_name} (id={tool_id}) "
-        f"input={_python_literal(tool_input)}\n"
-    )
-
-
-def _format_system_prompt_entry(captured_at: datetime, prompt: str) -> str:
-    return (
-        f"[{captured_at.isoformat()}] length={len(prompt)}\n"
-        "--- SYSTEM PROMPT START ---\n"
-        f"{prompt}\n"
-        "--- SYSTEM PROMPT END ---\n"
-        "\n"
-    )
 
 
 # ----- usage normalization (litellm response shapes) ------------------------
@@ -162,6 +120,14 @@ def _normalize_usage_from_litellm(response: Any) -> dict:
     )
     if details is not None:
         cache = _get(details, "cached_tokens", "cache_read", "cacheRead")
+    if not cache:
+        cache = _get(
+            usage,
+            "cache_read_input_tokens",
+            "cached_tokens",
+            "cache_read",
+            "cacheRead",
+        )
 
     return {
         "input": inp,
@@ -189,6 +155,58 @@ def _to_datetime(t: Any) -> datetime:
     if isinstance(t, (int, float)):
         return datetime.fromtimestamp(float(t) if t < 1e12 else t / 1000.0)
     return datetime.now()
+
+
+def _infer_scilink_role(kwargs: dict[str, Any]) -> str:
+    """Read the most specific agent name LiteLLM exposes in request metadata."""
+    candidates = [
+        kwargs.get("metadata"),
+        (kwargs.get("litellm_params") or {}).get("metadata")
+        if isinstance(kwargs.get("litellm_params"), dict) else None,
+    ]
+    for metadata in candidates:
+        if not isinstance(metadata, dict):
+            continue
+        for name in ("agent_role", "agent", "role", "caller", "name"):
+            value = metadata.get(name)
+            if value:
+                return str(value)
+    frame = inspect.currentframe()
+    try:
+        for _ in range(20):
+            frame = frame.f_back if frame is not None else None
+            if frame is None:
+                break
+            caller = frame.f_locals.get("self")
+            class_name = type(caller).__name__ if caller is not None else ""
+            if class_name.endswith(("Agent", "Controller")):
+                return class_name
+    finally:
+        del frame
+    return "SciLinkAgent"
+
+
+def _litellm_provider(kwargs: dict[str, Any], model: Any) -> str:
+    params = kwargs.get("litellm_params")
+    if isinstance(params, dict):
+        provider = params.get("custom_llm_provider")
+        if provider:
+            return str(provider)
+    return str(model).split("/", 1)[0] if "/" in str(model) else "litellm"
+
+
+def _first_token_ms(kwargs: dict[str, Any], start_ms: float, end_ms: float) -> float | None:
+    """Read LiteLLM's measured completion-start timestamp when available."""
+    if kwargs.get("stream") is not True:
+        return None
+    for name in ("completion_start_time", "first_token_time"):
+        value = kwargs.get(name)
+        if value is None:
+            continue
+        timestamp = _to_epoch_ms(value)
+        if start_ms <= timestamp <= end_ms:
+            return timestamp
+    return None
 
 
 # ----- handler --------------------------------------------------------------
@@ -228,11 +246,12 @@ class LiteLLMToolLogger:
         self._system_prompt_log = self._log_dir / "tool_calls.log.system_prompt"
         self._events_log = self._log_dir / "pi_events.jsonl"
         self._generated_code_log = self._log_dir / "generated_code.jsonl"
+        self._messages_log = self._log_dir / "messages.jsonl"
 
         # Truncate at start (mirror analyze_codebase_pi.py behavior).
         for p in (self._tool_log, self._subagent_log,
                   self._system_prompt_log, self._events_log,
-                  self._generated_code_log):
+                  self._generated_code_log, self._messages_log):
             p.write_text("", encoding="utf-8")
 
         self._pending: dict[str, _PendingTool] = {}
@@ -259,6 +278,11 @@ class LiteLLMToolLogger:
     def _append_generated_code(self, record: dict) -> None:
         with self._lock:
             with self._generated_code_log.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+    def _append_messages(self, record: dict) -> None:
+        with self._lock:
+            with self._messages_log.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
     def capture_generated_code(
@@ -340,33 +364,101 @@ class LiteLLMToolLogger:
     ) -> None:
         """litellm success_callback signature."""
         try:
-            self._capture_system_prompt_once(kwargs.get("messages"))
+            # The launcher may have tagged the prompt for the no-cache arm.
+            # Strip it here so every recorded field matches the cached arm byte
+            # for byte; the tag itself is recorded separately.
+            messages, nocache_tag = strip_nocache_tag(kwargs.get("messages") or [])
+            self._capture_system_prompt_once(messages)
             usage = _normalize_usage_from_litellm(completion_response)
+            if nocache_tag and usage.get("cacheRead"):
+                print(
+                    "[litellm_tool_logger] WARNING: no-cache arm got cacheRead="
+                    f"{usage['cacheRead']}; this cell is not a valid no-cache "
+                    "observation.",
+                    flush=True,
+                )
             run_id = uuid.uuid4().hex
             parent = _current_parent.get()
+            model = kwargs.get("model") or field(completion_response, "model") or "?"
+            provider = _litellm_provider(kwargs, model)
+            start_ms = _to_epoch_ms(start_time)
+            end_ms = _to_epoch_ms(end_time)
+            first_token_ms = _first_token_ms(kwargs, start_ms, end_ms)
+            cache_config = {
+                key: kwargs[key]
+                for key in (
+                    "prompt_cache_key",
+                    "prompt_cache_retention",
+                    "prompt_cache_options",
+                    "cache_control",
+                )
+                if key in kwargs
+            }
+            common = {
+                "agent_role": _infer_scilink_role(kwargs),
+                "provider": provider,
+                "vendor": runtime_vendor(provider, model),
+                "model": str(model),
+                "cache_config": cache_config,
+                "phase": infer_phase(messages),
+                "cache_key": cache_key(provider, model, messages),
+                "provider_request_id": provider_request_id(completion_response),
+                "nocache": bool(nocache_tag),
+            }
 
             start_event = {
+                **common,
                 "type": "message_start",
                 "run_id": run_id,
                 "message": {
                     "role": "assistant",
-                    "timestamp": _to_epoch_ms(start_time),
+                    "timestamp": start_ms,
                 },
             }
             end_event = {
+                **common,
                 "type": "message_end",
                 "run_id": run_id,
                 "message": {
                     "role": "assistant",
-                    "timestamp": _to_epoch_ms(end_time),
+                    "timestamp": end_ms,
                     "usage": usage,
                 },
+                "stream_timing_available": first_token_ms is not None,
             }
             if parent:
                 start_event["parent_run_id"] = parent
                 end_event["parent_run_id"] = parent
             self._append_event(start_event)
+            if first_token_ms is not None:
+                self._append_event({
+                    **common,
+                    "type": "message_first_token",
+                    "run_id": run_id,
+                    "wall_time_ms": first_token_ms,
+                    "message": {
+                        "role": "assistant",
+                        "timestamp": first_token_ms,
+                    },
+                })
+                self._append_event({
+                    **common,
+                    "type": "message_last_token",
+                    "run_id": run_id,
+                    "wall_time_ms": end_ms,
+                    "message": {
+                        "role": "assistant",
+                        "timestamp": end_ms,
+                    },
+                })
             self._append_event(end_event)
+            self._append_messages({
+                **common,
+                "run_id": run_id,
+                "timestamp": _to_epoch_ms(start_time),
+                "messages": normalize_messages(messages),
+                "nocache_tag": nocache_tag,
+            })
         except Exception as e:
             # Never let logging break the user's run.
             print(f"[litellm_tool_logger] on_llm_success error: {e!r}",
@@ -378,10 +470,22 @@ class LiteLLMToolLogger:
     ) -> None:
         """litellm failure_callback signature."""
         try:
-            self._capture_system_prompt_once(kwargs.get("messages"))
+            messages, nocache_tag = strip_nocache_tag(kwargs.get("messages") or [])
+            self._capture_system_prompt_once(messages)
             run_id = uuid.uuid4().hex
             parent = _current_parent.get()
+            model = kwargs.get("model") or "?"
+            provider = _litellm_provider(kwargs, model)
+            common = {
+                "agent_role": _infer_scilink_role(kwargs),
+                "provider": provider,
+                "model": str(model),
+                "phase": infer_phase(messages),
+                "cache_key": cache_key(provider, model, messages),
+                "nocache": bool(nocache_tag),
+            }
             start_event = {
+                **common,
                 "type": "message_start",
                 "run_id": run_id,
                 "message": {
@@ -390,13 +494,14 @@ class LiteLLMToolLogger:
                 },
             }
             end_event = {
+                **common,
                 "type": "message_end",
                 "run_id": run_id,
                 "error": repr(original_exception),
                 "message": {
                     "role": "assistant",
                     "timestamp": _to_epoch_ms(end_time),
-                    "usage": {"input": 0, "output": 0, "cacheRead": 0, "totalTokens": 0},
+                    "usage": dict(EMPTY_USAGE),
                 },
             }
             if parent:
@@ -404,6 +509,14 @@ class LiteLLMToolLogger:
                 end_event["parent_run_id"] = parent
             self._append_event(start_event)
             self._append_event(end_event)
+            self._append_messages({
+                **common,
+                "run_id": run_id,
+                "timestamp": _to_epoch_ms(start_time),
+                "messages": normalize_messages(messages),
+                "nocache_tag": nocache_tag,
+                "error": repr(original_exception),
+            })
         except Exception as e:
             print(f"[litellm_tool_logger] on_llm_failure error: {e!r}",
                   flush=True)

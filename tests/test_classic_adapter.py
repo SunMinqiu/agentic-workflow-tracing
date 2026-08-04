@@ -162,6 +162,17 @@ class GenomeDriverTests(unittest.TestCase):
             self.assertTrue((work / "artifacts" / "chr1n.tar.gz").is_symlink())
             self.assertTrue((work / "artifacts" / "chr1-ALL.tar.gz").is_symlink())
             self.assertTrue((work / "artifacts" / "chr1-ALL-freq.tar.gz").is_symlink())
+            units = [
+                json.loads(line)
+                for line in (work / "execution_units.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(units), 6)
+            self.assertEqual(
+                {row["stage"] for row in units},
+                {"individuals", "individuals_merge", "sifting", "mutation_overlap", "frequency"},
+            )
+            self.assertTrue(all(isinstance(row["pid"], int) for row in units))
+            self.assertTrue(all(row["end_ts_ms"] >= row["start_ts_ms"] for row in units))
 
 
 if __name__ == "__main__":

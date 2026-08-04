@@ -88,6 +88,16 @@ if ! "$AGENT_PYTHON" -c "import scilink, litellm" >/dev/null 2>&1; then
     echo "Error: scilink / litellm not importable by $AGENT_PYTHON" >&2
     exit 1
 fi
+if ! "$POST_PYTHON" -c "import markdown, tiktoken" >/dev/null 2>&1; then
+    echo "Error: $POST_PYTHON is missing Markdown or tiktoken." >&2
+    echo "Re-run scripts/deploy_scilink_to_client.sh before tracing." >&2
+    exit 1
+fi
+SCILINK_BIN="$(dirname "$AGENT_PYTHON")/scilink"
+if [ ! -x "$SCILINK_BIN" ]; then
+    echo "Error: SciLink CLI not found: $SCILINK_BIN" >&2
+    exit 1
+fi
 
 [ -d "$ROOT_DIR/src/agent_io_tracing" ] || {
     echo "Error: package not found: $ROOT_DIR/src/agent_io_tracing" >&2
@@ -112,28 +122,14 @@ echo "Workflow:   $SCRIPT_DIR"
 echo "Workloads:  ${#WORKLOADS[@]} entries"
 echo ""
 
-IFS=',' read -r -a RUN_NAME_ARRAY <<< "${RUN_WORKLOADS:-}"
-
-should_run_workload() {
-    local name="$1"
-    if [ "${#RUN_NAME_ARRAY[@]}" -eq 0 ] || [ -z "${RUN_NAME_ARRAY[0]}" ]; then
-        return 0
-    fi
-    local item
-    for item in "${RUN_NAME_ARRAY[@]}"; do
-        item="$(echo "$item" | xargs)"
-        if [ -n "$item" ] && [ "$item" = "$name" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
+validate_workload_selection "${WORKLOADS[@]}"
 
 # Each entry in WORKLOADS is "<name>|<global_args>|<subcommand>|<args>|<prompt>".
 #   - global_args: empty for SciLink (no global flags).
 #   - subcommand : always 'analyze' for now.
 #   - args       : forwarded to `scilink analyze`; --mode autonomous required.
 #   - prompt     : fed via stdin as the agent's first message.  No '|' inside.
+RUN_CELL_COUNT=0
 for entry in "${WORKLOADS[@]}"; do
     NAME="${entry%%|*}"
     REST1="${entry#*|}"
@@ -149,12 +145,24 @@ for entry in "${WORKLOADS[@]}"; do
         continue
     fi
 
-    if ! should_run_workload "$NAME"; then
+    if ! workload_selected "$NAME"; then
         echo "Skipping: $NAME (not in RUN_WORKLOADS)"
         continue
     fi
+    RUN_CELL_COUNT=$((RUN_CELL_COUNT + 1))
 
-    OUT="$BASE_OUT/$NAME"
+    # The no-cache arm writes to a distinct cell directory so it can share a
+    # BASE_OUT with the cached arm and land in the same report without
+    # overwriting it.  Only the prompt tagging differs; the workload is the same.
+    CELL="$NAME"
+    case "${SCILINK_NOCACHE:-0}" in
+        1|true|TRUE|yes|YES) CELL="${NAME}_nocache" ;;
+    esac
+    # SCILINK_CELL_SUFFIX appends a further tag, so arms that differ in
+    # something the cell name does not encode -- vendor, model, a repeat --
+    # land in separate cells instead of overwriting each other.
+    CELL="${CELL}${SCILINK_CELL_SUFFIX:-}"
+    OUT="$BASE_OUT/$CELL"
     mkdir -p "$OUT"
     OUT="$(cd "$OUT" && pwd)"
 
@@ -192,6 +200,23 @@ for entry in "${WORKLOADS[@]}"; do
     eval "set -- $SRARGS"
     SRARGS_ARRAY=("$@")
 
+    if ! "$SCILINK_BIN" "$SUBCMD" --help >/dev/null 2>&1; then
+        echo "Error: installed SciLink does not support subcommand '$SUBCMD'" >&2
+        exit 1
+    fi
+    for path_flag in --data --metadata --data-dir --knowledge-dir --code-dir; do
+        for ((arg_i = 0; arg_i < ${#SRARGS_ARRAY[@]}; arg_i++)); do
+            if [ "${SRARGS_ARRAY[$arg_i]}" = "$path_flag" ]; then
+                path_i=$((arg_i + 1))
+                path_value="${SRARGS_ARRAY[$path_i]:-}"
+                if [ -z "$path_value" ] || [ ! -e "$path_value" ]; then
+                    echo "Error: $NAME requires existing $path_flag path: ${path_value:-<missing>}" >&2
+                    exit 1
+                fi
+            fi
+        done
+    done
+
     # Build optional --pre flag (always empty for SciLink today, kept for
     # SRAgent-harness parity).  Use the `key=value` form so argparse doesn't
     # peel off a leading `--flag` as one of its own options.
@@ -228,18 +253,7 @@ for entry in "${WORKLOADS[@]}"; do
     # --ready-fd FIFO handshake cannot be used for the privileged tracer.
     # Wait until the tracer creates the JSONL stream (meta record written) or
     # exits with an error before resuming the paused agent.
-    TRACER_READY=0
-    for _ in $(seq 1 100); do
-        if [ -s "$OUT/ebpf_events.log" ]; then
-            TRACER_READY=1
-            break
-        fi
-        if ! kill -0 "$TRACER_PID" >/dev/null 2>&1; then
-            break
-        fi
-        sleep 0.1
-    done
-    if [ "$TRACER_READY" != "1" ]; then
+    if ! wait_for_trace_file "$TRACER_PID" "$OUT/ebpf_events.log"; then
         echo "  Warning: tracer did not create ebpf_events.log before agent resume" >&2
     fi
     kill -CONT "$AGENT_PID" >/dev/null 2>&1 || true
@@ -254,6 +268,12 @@ for entry in "${WORKLOADS[@]}"; do
     echo "  Exit code: $EXIT_CODE"
     echo ""
 done
+
+if [ "$RUN_CELL_COUNT" -eq 0 ]; then
+    echo "Error: RUN_WORKLOADS selected zero SciLink cells: ${RUN_WORKLOADS:-<empty>}" >&2
+    echo "Check the workload names in config/config_scilink.env." >&2
+    exit 2
+fi
 
 echo "=== Running parse and visualization ==="
 # Each step wrapped with set +e so a single workload's post-processing
@@ -326,6 +346,16 @@ for ws_out in "$BASE_OUT"/*/; do
         sed 's/^/    /' "$ws_out/phase1_metrics.log" || true
         [ $P1_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}phase1_metrics"
 
+        "$POST_PYTHON" -m agent_io_tracing.analysis.execution_units "$ws_out" \
+            > "$ws_out/execution_units.log" 2>&1
+        EU_RC=$?
+        [ $EU_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}execution_units"
+
+        "$POST_PYTHON" -m agent_io_tracing.analysis.trace_quality "$ws_out" \
+            > "$ws_out/trace_quality.log" 2>&1
+        TQ_RC=$?
+        [ $TQ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}trace_quality"
+
         echo "  Generating per-run I/O characterization figures..."
         "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs . \
             > "$ws_out/per_run_io_char.log" 2>&1
@@ -357,6 +387,15 @@ for ws_out in "$BASE_OUT"/*/; do
     echo ""
 done
 
+set +e
+run_kvcache_report "$POST_PYTHON" "$BASE_OUT"
+KVCACHE_RC=$?
+set -e
+if [ "$KVCACHE_RC" -ne 0 ]; then
+    POST_FAIL_COUNT=$((POST_FAIL_COUNT + 1))
+    POST_FAIL_NAMES+=("kvcache_report")
+fi
+
 if [ "$POST_FAIL_COUNT" -gt 0 ]; then
     echo "Post-processing finished with $POST_FAIL_COUNT failed workload(s):"
     for n in "${POST_FAIL_NAMES[@]}"; do
@@ -365,14 +404,7 @@ if [ "$POST_FAIL_COUNT" -gt 0 ]; then
     echo "(See <workload>/{parse,summarize,visualize}.log for details)"
 fi
 
-chmod -R a+rX "$BASE_OUT" || true
-
-# When invoked via `sudo -E`, root owns every artefact.  Hand ownership
-# back to the invoking user.  No-op if not running under sudo.
-if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
-    chown -R "$SUDO_UID:$SUDO_GID" "$BASE_OUT" 2>/dev/null || true
-    echo "Returned ownership of $BASE_OUT to ${SUDO_USER:-uid=$SUDO_UID}"
-fi
+return_results_ownership "$BASE_OUT"
 
 echo "All done. Results in: $BASE_OUT"
 echo "Per-workload outputs now stay under: $BASE_OUT/<workload>/"
@@ -381,4 +413,4 @@ echo "  $BASE_OUT/<workload>/                    trace root"
 echo "  $BASE_OUT/<workload>/visualizations/     HTML/PNG visualization output"
 echo "  $BASE_OUT/<workload>/scilink_session/    SciLink session state"
 echo "  $BASE_OUT/<workload>/work/               SciLink cwd/generated artifacts"
-echo "Look for: visualizations/index.html, visualizations/agent_timeline.html, call_dag.html, call_tree.txt, parallelism_summary.json"
+echo "Look for: kvcache_report.html, visualizations/index.html, call_dag.html, call_tree.txt, parallelism_summary.json"

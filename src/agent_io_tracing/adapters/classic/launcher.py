@@ -12,12 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-
-def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
-    if "--" not in argv:
-        return argv, []
-    index = argv.index("--")
-    return argv[:index], argv[index + 1 :]
+from agent_io_tracing.adapters.cli import split_forwarded_argv
 
 
 def _input_spec(value: str) -> tuple[Path, Path]:
@@ -76,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ours, extra = _split_argv(list(sys.argv[1:] if argv is None else argv))
+    ours, extra = split_forwarded_argv(list(sys.argv[1:] if argv is None else argv))
     args = build_parser().parse_args(ours)
 
     work_dir = args.work_dir.expanduser().resolve()

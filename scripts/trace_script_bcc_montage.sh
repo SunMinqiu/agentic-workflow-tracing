@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Trace the classic 1000genome DAG through its direct Python driver.
+# Trace a fixed-input Montage mosaic through the direct stage driver.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-CFG_DIR="$ROOT_DIR/config"
-CONFIG_FILE="${CONFIG_FILE:-$CFG_DIR/config_1000genome.env}"
+CONFIG_FILE="${CONFIG_FILE:-$ROOT_DIR/config/config_montage.env}"
 CALLER_BASE_OUT="${BASE_OUT:-}"
 export PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 # shellcheck disable=SC1091
@@ -33,12 +32,6 @@ cleanup_interrupted_cell() {
 }
 trap cleanup_interrupted_cell INT TERM
 
-if [ -f "$ROOT_DIR/.env.1000genome" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "$ROOT_DIR/.env.1000genome"
-    set +a
-fi
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "Error: config file not found: $CONFIG_FILE" >&2
     exit 1
@@ -47,61 +40,45 @@ fi
 source "$CONFIG_FILE"
 [ -n "$CALLER_BASE_OUT" ] && BASE_OUT="$CALLER_BASE_OUT"
 
-if [ ! -d "$WORKFLOW_REPO/bin" ]; then
-    echo "Error: invalid WORKFLOW_REPO=$WORKFLOW_REPO (missing bin/)" >&2
-    exit 1
-fi
-if [ ! -x "$TRACER_PYTHON" ]; then
-    echo "Error: TRACER_PYTHON=$TRACER_PYTHON is not executable" >&2
-    exit 1
-fi
+for python_var in TRACER_PYTHON AGENT_PYTHON POST_PYTHON; do
+    python_path="${!python_var}"
+    if [ ! -x "$python_path" ]; then
+        echo "Error: $python_var=$python_path is not executable" >&2
+        exit 1
+    fi
+done
 if ! "$TRACER_PYTHON" -c "from bcc import BPF" >/dev/null 2>&1; then
     echo "Error: $TRACER_PYTHON cannot import bcc.BPF" >&2
     exit 1
 fi
-if [ ! -x "$AGENT_PYTHON" ]; then
-    echo "Error: AGENT_PYTHON=$AGENT_PYTHON is not executable" >&2
-    exit 1
-fi
-if [ ! -x "$POST_PYTHON" ]; then
-    echo "Error: POST_PYTHON=$POST_PYTHON is not executable" >&2
-    exit 1
-fi
-if [ ! -f "$COLUMNS_FILE" ]; then
-    echo "Error: columns file not found: $COLUMNS_FILE" >&2
+if ! "$AGENT_PYTHON" -c "import MontagePy; import agent_io_tracing" >/dev/null 2>&1; then
+    echo "Error: $AGENT_PYTHON cannot import MontagePy and agent_io_tracing" >&2
     exit 1
 fi
 if [ "${#WORKLOADS[@]}" -eq 0 ]; then
     echo "Error: WORKLOADS array is empty" >&2
     exit 1
 fi
-if ! [[ "$CLASSIC_VCF_RECORD_LIMIT" =~ ^[0-9]+$ ]]; then
-    echo "Error: CLASSIC_VCF_RECORD_LIMIT must be a non-negative integer" >&2
+if [ "$MONTAGE_OFFLINE" != "1" ] && [ "$MONTAGE_OFFLINE" != "true" ]; then
+    echo "Error: formal Montage traces require MONTAGE_OFFLINE=1 and fixed input" >&2
     exit 1
 fi
 if ! [[ "$BCC_PERF_PAGES" =~ ^[1-9][0-9]*$ ]] || [ $((BCC_PERF_PAGES & (BCC_PERF_PAGES - 1))) -ne 0 ]; then
     echo "Error: BCC_PERF_PAGES must be a positive power of two" >&2
     exit 1
 fi
-if [ "$CLASSIC_VCF_RECORD_LIMIT" -gt 0 ] && [ "$ROWS_PER_CHROMOSOME" -gt "$CLASSIC_VCF_RECORD_LIMIT" ]; then
-    echo "Error: ROWS_PER_CHROMOSOME cannot exceed CLASSIC_VCF_RECORD_LIMIT" >&2
-    exit 1
-fi
 
-BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/classic_1000genome_$(date +%Y%m%d_%H%M%S)}"
+BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/classic_montage_$(date +%Y%m%d_%H%M%S)}"
 require_lustre_base_out "$BASE_OUT"
 BASE_OUT="$(cd "$BASE_OUT" && pwd)"
 
 validate_workload_selection "${WORKLOADS[@]}"
 
-echo "=== Classic 1000genome FS tracer ==="
-echo "Repo:          $WORKFLOW_REPO"
+echo "=== Montage fixed-input FS tracer ==="
+echo "Input root:    $MONTAGE_INPUT_ROOT"
 echo "Output:        $BASE_OUT"
-echo "Task workers:  $MAX_WORKERS"
-echo "Chunk jobs:    $INDIVIDUAL_JOBS per chromosome"
-echo "Populations:   $POPULATIONS"
-echo "Offline:       $CLASSIC_OFFLINE"
-echo "VCF record cap: $CLASSIC_VCF_RECORD_LIMIT (0 = complete inputs)"
+echo "Runtime:       $AGENT_PYTHON"
+echo "Offline:       $MONTAGE_OFFLINE"
 echo "Perf pages:    $BCC_PERF_PAGES per CPU"
 echo "Cells:         ${#WORKLOADS[@]}"
 echo ""
@@ -109,99 +86,53 @@ echo ""
 RUN_FAIL_COUNT=0
 for entry in "${WORKLOADS[@]}"; do
     NAME="${entry%%|*}"
-    REST1="${entry#*|}"
-    SCALE="${REST1%%|*}"
-    REST2="${REST1#*|}"
-    REP="${REST2%%|*}"
-    EXTRA="${REST2#*|}"
-    if [ -z "$NAME" ] || ! [[ "$SCALE" =~ ^[0-9]+$ ]] || [ "$SCALE" -lt 1 ] || [ -z "$REP" ]; then
+    REST="${entry#*|}"
+    SIZE="${REST%%|*}"
+    REP="${REST#*|}"
+    if [ -z "$NAME" ] || ! [[ "$SIZE" =~ ^[0-9]+([.][0-9]+)?$ ]] || [ -z "$REP" ]; then
         echo "Skipping malformed cell: $entry" >&2
         continue
     fi
     workload_selected "$NAME" || { echo "Skipping: $NAME"; continue; }
+
+    SIZE_TAG="${SIZE/./p}deg"
+    INPUT_DIR="$MONTAGE_INPUT_ROOT/m17_${SIZE_TAG}/raw"
+    FIRST_FITS="$(find "$INPUT_DIR" -maxdepth 1 -type f -name '*.fits' -print -quit 2>/dev/null || true)"
+    if [ ! -d "$INPUT_DIR" ] || [ -z "$FIRST_FITS" ]; then
+        echo "Error: fixed FITS input is missing for $NAME: $INPUT_DIR" >&2
+        exit 1
+    fi
+    if [ ! -s "$MONTAGE_INPUT_ROOT/m17_${SIZE_TAG}/input_manifest.sha256" ]; then
+        echo "Error: input manifest is missing: $MONTAGE_INPUT_ROOT/m17_${SIZE_TAG}/input_manifest.sha256" >&2
+        exit 1
+    fi
+    if ! (cd "$MONTAGE_INPUT_ROOT/m17_${SIZE_TAG}" && sha256sum -c input_manifest.sha256 >/dev/null); then
+        echo "Error: fixed input checksum validation failed for $NAME" >&2
+        exit 1
+    fi
 
     OUT="$BASE_OUT/$NAME"
     WORK="$OUT/work"
     mkdir -p "$WORK"
     OUT="$(cd "$OUT" && pwd)"
     WORK="$(cd "$WORK" && pwd)"
-    CHROMOSOMES="$(seq -s, 1 "$SCALE")"
-
-    subset_vcf() {
-        local source="$1" destination="$2" limit="$3"
-        awk -v limit="$limit" '
-            /^#/ { print; next }
-            records < limit { print; records++; if (records >= limit) exit }
-        ' "$source" > "$destination"
-        local records
-        records="$(awk '!/^#/ { records++ } END { print records + 0 }' "$destination")"
-        if [ "$records" -ne "$limit" ]; then
-            echo "Error: requested $limit records but found $records in $source" >&2
-            return 1
-        fi
-    }
-
-    INPUT_ARGS=(--input "$COLUMNS_FILE")
-    IFS=',' read -r -a POPULATION_ARRAY <<< "$POPULATIONS"
-    for population in "${POPULATION_ARRAY[@]}"; do
-        population="$(echo "$population" | xargs)"
-        [ -n "$population" ] || continue
-        population_file="$POPULATION_DIR/$population"
-        if [ ! -f "$population_file" ]; then
-            echo "Error: population file not found: $population_file" >&2
-            exit 1
-        fi
-        INPUT_ARGS+=(--input "$population_file")
-    done
-    for chromosome in $(seq 1 "$SCALE"); do
-        main_vcf="${MAIN_VCF_SOURCE_TEMPLATE//\{chromosome\}/$chromosome}"
-        annotation_vcf="${ANNOTATION_VCF_SOURCE_TEMPLATE//\{chromosome\}/$chromosome}"
-        if [ ! -f "$main_vcf" ] || [ ! -f "$annotation_vcf" ]; then
-            echo "Error: decompressed inputs missing for chromosome $chromosome" >&2
-            echo "  main:       $main_vcf" >&2
-            echo "  annotation: $annotation_vcf" >&2
-            exit 1
-        fi
-        if [ "$CLASSIC_VCF_RECORD_LIMIT" -gt 0 ]; then
-            subset_dir="$OUT/input_subset"
-            mkdir -p "$subset_dir"
-            subset_main="$subset_dir/$(basename "$main_vcf")"
-            subset_annotation="$subset_dir/$(basename "$annotation_vcf")"
-            subset_vcf "$main_vcf" "$subset_main" "$CLASSIC_VCF_RECORD_LIMIT"
-            subset_vcf "$annotation_vcf" "$subset_annotation" "$CLASSIC_VCF_RECORD_LIMIT"
-            INPUT_ARGS+=(--input "$subset_main" --input "$subset_annotation")
-        else
-            INPUT_ARGS+=(--input "$main_vcf" --input "$annotation_vcf")
-        fi
-    done
-
-    EXTRA_ARGS=()
-    [ -n "$EXTRA" ] && read -r -a EXTRA_ARGS <<< "$EXTRA"
-    OFFLINE_ARGS=()
-    OFFLINE_JSON=false
-    if [ "$CLASSIC_OFFLINE" = "1" ] || [ "$CLASSIC_OFFLINE" = "true" ]; then
-        OFFLINE_ARGS=(--offline)
-        OFFLINE_JSON=true
-    fi
-    echo "=== $NAME: chromosomes=$CHROMOSOMES rep=$REP ==="
+    echo "=== $NAME: size=${SIZE}deg rep=$REP ==="
 
     set +e
     "$AGENT_PYTHON" -m agent_io_tracing.adapters.classic.launcher \
         "$WORK" "$OUT" \
         --cmd "$WORKFLOW_CMD" \
-        --repo "$WORKFLOW_REPO" \
-        "${INPUT_ARGS[@]}" \
+        --input "$INPUT_DIR:raw" \
+        --env "TMPDIR=$MONTAGE_ROOT/tmp" \
+        --env "PYTHONPYCACHEPREFIX=$MONTAGE_ROOT/cache/python" \
+        --env "MPLCONFIGDIR=$MONTAGE_ROOT/cache/matplotlib" \
+        --env "XDG_CACHE_HOME=$MONTAGE_ROOT/cache/xdg" \
+        --env "XDG_CONFIG_HOME=$MONTAGE_ROOT/cache/config" \
         -- \
-        --chromosomes "$CHROMOSOMES" \
-        --populations "$POPULATIONS" \
-        --individual-jobs "$INDIVIDUAL_JOBS" \
-        --max-workers "$MAX_WORKERS" \
-        --rows-per-chromosome "$ROWS_PER_CHROMOSOME" \
+        --work-dir "$WORK" \
+        --size-deg "$SIZE" \
         --execution-units-log "$OUT/execution_units.jsonl" \
-        --main-vcf-template "$MAIN_VCF_NAME_TEMPLATE" \
-        --annotation-vcf-template "$ANNOTATION_VCF_NAME_TEMPLATE" \
-        "${OFFLINE_ARGS[@]}" \
-        "${EXTRA_ARGS[@]}" \
+        --offline \
         >"$OUT/classic_launcher.log" 2>&1 &
     AGENT_PID=$!
     CURRENT_AGENT_PID="$AGENT_PID"
@@ -235,14 +166,15 @@ for entry in "${WORKLOADS[@]}"; do
     if [ "$COLLECT_LUSTRE_COUNTERS" = "1" ] || [ "$COLLECT_LUSTRE_COUNTERS" = "true" ]; then
         INSTRUMENTATION_LEVEL="ebpf+lustre-counters"
     fi
-    EXTRA_JSON="{\"offline\":$OFFLINE_JSON,\"scale_chromosomes\":$SCALE,\"chromosomes\":\"$CHROMOSOMES\",\"rep\":$REP,\"rows_per_chromosome\":$ROWS_PER_CHROMOSOME,\"vcf_record_limit\":$CLASSIC_VCF_RECORD_LIMIT,\"individual_jobs\":$INDIVIDUAL_JOBS,\"max_workers\":$MAX_WORKERS,\"populations\":\"$POPULATIONS\"}"
+    INPUT_COUNT="$(find "$INPUT_DIR" -maxdepth 1 -type f -name '*.fits' | wc -l)"
+    EXTRA_JSON="{\"offline\":true,\"survey\":\"2MASS J\",\"location\":\"M 17\",\"mosaic_size_deg\":$SIZE,\"rep\":$REP,\"input_fits_count\":$INPUT_COUNT,\"input_manifest\":\"$MONTAGE_INPUT_ROOT/m17_${SIZE_TAG}/input_manifest.sha256\"}"
     "$POST_PYTHON" -m agent_io_tracing.experiments.run_manifest \
         --output "$OUT/manifest.json" \
-        --workload "1000genome-classic" \
+        --workload "montage-classic" \
         --task-id "$NAME" \
-        --agent-count "$MAX_WORKERS" \
+        --agent-count 1 \
         --pid "$AGENT_PID" \
-        --data-dir "$DATASET_DIR" \
+        --data-dir "$INPUT_DIR" \
         --work-dir "$WORK" \
         --output-dir "$OUT" \
         --instrumentation "$INSTRUMENTATION_LEVEL" \
@@ -290,6 +222,7 @@ for entry in "${WORKLOADS[@]}"; do
         set -e
         continue
     fi
+
     kill -CONT "$AGENT_PID" >/dev/null 2>&1
     wait "$AGENT_PID"
     EXIT_CODE=$?
@@ -306,7 +239,7 @@ for entry in "${WORKLOADS[@]}"; do
     [ "$EXIT_CODE" -eq 0 ] || RUN_FAIL_COUNT=$((RUN_FAIL_COUNT + 1))
 done
 
-echo "=== Classic post-processing ==="
+echo "=== Montage post-processing ==="
 POST_FAIL_COUNT=0
 for ws_out in "$BASE_OUT"/*/; do
     [ -f "$ws_out/ebpf_events.log" ] || continue
@@ -317,28 +250,20 @@ for ws_out in "$BASE_OUT"/*/; do
     PARSE_RC=$?
     [ "$PARSE_RC" -ne 0 ] && failed_step="parse_ebpf"
     if [ "$PARSE_RC" -eq 0 ] && [ -f "$ws_out/parsed.json" ]; then
-        "$POST_PYTHON" -m agent_io_tracing.analysis.artifact_sizes "$ws_out" \
-            >"$ws_out/artifact_sizes.log" 2>&1
-        ARTIFACT_RC=$?
-        [ "$ARTIFACT_RC" -ne 0 ] && failed_step="${failed_step:+$failed_step,}artifact_sizes"
-
-        if [ -s "$ws_out/pi_events.jsonl" ]; then
-            "$POST_PYTHON" -m agent_io_tracing.analysis.summary "$ws_out" \
-                >"$ws_out/analysis_summary.log" 2>&1
-            STEP_RC=$?
-            [ "$STEP_RC" -ne 0 ] && failed_step="${failed_step:+$failed_step,}analysis.summary"
-        fi
+        "$POST_PYTHON" -m agent_io_tracing.analysis.artifact_sizes "$ws_out" >"$ws_out/artifact_sizes.log" 2>&1
+        STEP_RC=$?
+        [ "$STEP_RC" -ne 0 ] && failed_step="${failed_step:+$failed_step,}artifact_sizes"
         for module in lineage.analyzer analysis.parallelism analysis.phase1_metrics analysis.execution_units analysis.trace_quality viz.trace; do
-                log_name="${module//./_}.log"
-                "$POST_PYTHON" -m "agent_io_tracing.$module" "$ws_out" >"$ws_out/$log_name" 2>&1
-                STEP_RC=$?
-                [ "$STEP_RC" -ne 0 ] && failed_step="${failed_step:+$failed_step,}$module"
-                if [ "$module" = "lineage.analyzer" ] && [ "$STEP_RC" -eq 0 ]; then
-                    "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char \
-                        --results "$ws_out" --runs . >"$ws_out/per_run_io_char.log" 2>&1
-                    IO_RC=$?
-                    [ "$IO_RC" -ne 0 ] && failed_step="${failed_step:+$failed_step,}per_run_io_char"
-                fi
+            log_name="${module//./_}.log"
+            "$POST_PYTHON" -m "agent_io_tracing.$module" "$ws_out" >"$ws_out/$log_name" 2>&1
+            STEP_RC=$?
+            [ "$STEP_RC" -ne 0 ] && failed_step="${failed_step:+$failed_step,}$module"
+            if [ "$module" = "lineage.analyzer" ] && [ "$STEP_RC" -eq 0 ]; then
+                "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char \
+                    --results "$ws_out" --runs . >"$ws_out/per_run_io_char.log" 2>&1
+                IO_RC=$?
+                [ "$IO_RC" -ne 0 ] && failed_step="${failed_step:+$failed_step,}per_run_io_char"
+            fi
         done
     fi
     set -e

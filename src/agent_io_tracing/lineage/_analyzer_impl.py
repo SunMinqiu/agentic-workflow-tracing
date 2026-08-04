@@ -24,6 +24,7 @@ trace_dir must contain:
 from __future__ import annotations
 import json
 import os
+import re
 import sys
 import csv
 from pathlib import Path
@@ -37,9 +38,14 @@ import matplotlib.pyplot as plt
 
 from agent_io_tracing.analysis.size_bins import (
     DARSHAN_SIZE_LABELS,
+    darshan_bin_index,
     darshan_hist,
 )
 from agent_io_tracing.analysis.labels import role_for_entry
+from agent_io_tracing.analysis.execution_units import (
+    annotate_parsed_execution_units,
+    load_execution_units,
+)
 
 # --- Configuration -------------------------------------------------
 
@@ -232,6 +238,20 @@ def is_workload_artifact(path: str) -> bool:
     return not any(s in path for s in EXCLUDE_PATH_SUBSTRINGS)
 
 
+def is_execution_unit_relative_artifact(entry: dict, path: str) -> bool:
+    """Accept relative paths emitted by an attributed classic task.
+
+    Classic tasks run in isolated per-task sandboxes and normally open their
+    staged inputs and outputs by basename.  The tracer therefore records paths
+    such as ``chr1n.tar.gz`` rather than the absolute sandbox path.  Requiring
+    an execution-unit attribution keeps this fallback scoped to measured task
+    processes instead of admitting arbitrary interpreter-relative files.
+    """
+    return bool(path) and not path.startswith("/") and bool(
+        entry.get("execution_unit_id")
+    )
+
+
 def classify_artifact(path: str, rec: dict) -> str:
     """Assign a storage-placement category to one artifact.
 
@@ -324,6 +344,7 @@ def load_codeexec_index(trace_dir: Path) -> dict:
     if parsed_path.is_file():
         with parsed_path.open(encoding="utf-8") as f:
             parsed = json.load(f)
+        annotate_parsed_execution_units(parsed, load_execution_units(trace_dir))
         for call in parsed.get("tool_calls", []):
             rid = call.get("tool_id")
             if not isinstance(rid, str) or not rid:
@@ -407,12 +428,14 @@ def load_codeexec_index(trace_dir: Path) -> dict:
 
 def load_parsed_entries(trace_dir: Path) -> list[dict]:
     parsed = json.load((trace_dir / "parsed.json").open())
+    annotate_parsed_execution_units(parsed, load_execution_units(trace_dir))
     return parsed.get("fs_entries", [])
 
 
 def load_data_io_events(trace_dir: Path) -> list[dict]:
     """Filter fs_entries to read/write on workload artifacts with size>0."""
     parsed = json.load((trace_dir / "parsed.json").open())
+    annotate_parsed_execution_units(parsed, load_execution_units(trace_dir))
     out = []
     for e in parsed.get("fs_entries", []):
         syscall = e.get("syscall")
@@ -422,7 +445,10 @@ def load_data_io_events(trace_dir: Path) -> list[dict]:
         if size <= 0:
             continue
         path = e.get("path") or ""
-        if not is_workload_artifact(path):
+        if not (
+            is_workload_artifact(path)
+            or is_execution_unit_relative_artifact(e, path)
+        ):
             continue
         out.append({
             "path": path,
@@ -831,12 +857,42 @@ def build_fanout_summary(per_artifact: dict) -> dict:
         for rec in per_artifact.values()
         if rec.get("writer_tool_ids") or rec.get("reader_tool_ids")
     )
+    pc_classes = Counter()
+    for rec in per_artifact.values():
+        writers = len(rec["writer_tool_ids"])
+        readers = len(rec["reader_tool_ids"])
+        if writers < 1 or readers < 1:
+            continue
+        if writers == 1 and readers == 1:
+            pc_classes["1-1"] += 1
+        elif writers == 1:
+            pc_classes["1-n"] += 1
+        elif readers == 1:
+            pc_classes["n-1"] += 1
+        else:
+            pc_classes["n-n"] += 1
+    pc_total = sum(pc_classes.values())
     return {
         "reader": one("reader"),
         "writer": one("writer"),
         "reader_writer_joint": {
             f"{w},{r}": int(n) for (w, r), n in sorted(joint.items())
         },
+        "producer_consumer_classes": {
+            label: {
+                "files": int(pc_classes.get(label, 0)),
+                "pct": (
+                    100.0 * pc_classes.get(label, 0) / pc_total
+                    if pc_total else None
+                ),
+            }
+            for label in ("1-1", "1-n", "n-1", "n-n")
+        },
+        "producer_consumer_classified_files": pc_total,
+        "producer_consumer_definition": (
+            "Distinct observed execution-unit writers/readers per artifact; "
+            "inputs without a writer and dead outputs without a reader are excluded."
+        ),
     }
 
 
@@ -850,6 +906,18 @@ def build_lifecycle_summary(per_artifact: dict) -> dict:
     ]
     generated_dead = [float(rec.get("dead_seconds") or 0.0) for rec in generated]
     reclaimable_dead = [float(rec.get("dead_seconds") or 0.0) for rec in reclaimable]
+    reclaimable_lifetimes = [
+        max(0.0, float(rec.get("t_reclaimable") or 0.0) - float(rec.get("t_create") or 0.0))
+        for rec in reclaimable
+        if rec.get("t_create") is not None and rec.get("t_reclaimable") is not None
+    ]
+
+    def quantiles(values: list[float]) -> dict[str, float | None]:
+        return {
+            "p50": float(np.percentile(values, 50)) if values else None,
+            "p95": float(np.percentile(values, 95)) if values else None,
+            "p99": float(np.percentile(values, 99)) if values else None,
+        }
     return {
         "by_class": dict(by_class),
         "generated_files": len(generated),
@@ -863,6 +931,9 @@ def build_lifecycle_summary(per_artifact: dict) -> dict:
         ),
         "generated_median_dead_s": _median_or_none(generated_dead),
         "reclaimable_median_dead_s": _median_or_none(reclaimable_dead),
+        "generated_dead_seconds": quantiles(generated_dead),
+        "reclaimable_dead_seconds": quantiles(reclaimable_dead),
+        "reclaimable_lifetime_seconds": quantiles(reclaimable_lifetimes),
     }
 
 
@@ -1032,25 +1103,80 @@ def compute_generations(per_artifact: dict):
                 if parent != child:
                     parents[child].add(parent)
 
-    memo = {}
+    # Collapse strongly connected components before computing depth.  Classic
+    # workflows may use the same relative logical path in multiple task
+    # sandboxes; that can create cycles in the path-level graph even though the
+    # task DAG itself is acyclic.  An iterative Kosaraju pass also avoids
+    # Python's recursion limit on workflows with thousands of artifacts.
+    nodes = set(per_artifact)
+    children = defaultdict(set)
+    reverse = defaultdict(set)
+    for child, upstream in parents.items():
+        for parent in upstream:
+            if parent in nodes and child in nodes:
+                children[parent].add(child)
+                reverse[child].add(parent)
 
-    def depth(node, stack):
-        if node in memo:
-            return memo[node]
-        if node in stack:          # cycle guard (e.g. read+write same file)
-            return 0
-        ps = parents.get(node)
-        if not ps:
-            memo[node] = 0
-            return 0
-        stack.add(node)
-        d = 1 + max(depth(p, stack) for p in ps)
-        stack.discard(node)
-        memo[node] = d
-        return d
+    visited = set()
+    finish_order = []
+    for root in nodes:
+        if root in visited:
+            continue
+        visited.add(root)
+        stack = [(root, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if expanded:
+                finish_order.append(node)
+                continue
+            stack.append((node, True))
+            for child in children.get(node, ()):
+                if child not in visited:
+                    visited.add(child)
+                    stack.append((child, False))
+
+    component_of = {}
+    components = []
+    for root in reversed(finish_order):
+        if root in component_of:
+            continue
+        component_id = len(components)
+        component = set()
+        stack = [root]
+        component_of[root] = component_id
+        while stack:
+            node = stack.pop()
+            component.add(node)
+            for parent in reverse.get(node, ()):
+                if parent not in component_of:
+                    component_of[parent] = component_id
+                    stack.append(parent)
+        components.append(component)
+
+    component_children = defaultdict(set)
+    indegree = [0] * len(components)
+    for parent, downstream in children.items():
+        parent_component = component_of[parent]
+        for child in downstream:
+            child_component = component_of[child]
+            if parent_component == child_component:
+                continue
+            if child_component not in component_children[parent_component]:
+                component_children[parent_component].add(child_component)
+                indegree[child_component] += 1
+
+    generation = [0] * len(components)
+    queue = [idx for idx, degree in enumerate(indegree) if degree == 0]
+    while queue:
+        component = queue.pop()
+        for child in component_children.get(component, ()):
+            generation[child] = max(generation[child], generation[component] + 1)
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                queue.append(child)
 
     for path, rec in per_artifact.items():
-        rec["generation"] = depth(path, set())
+        rec["generation"] = generation[component_of[path]]
 
 
 def annotate_lifecycle(per_artifact: dict, run_start: float, run_end: float,
@@ -1237,9 +1363,80 @@ def fig_io_volume_summary(summary: dict, out_path: Path):
 
 
 
+# Adapter-neutral "what is this file" labels, derived purely from the path
+# (extension / basename) with the storage category as a fallback.  This answers
+# "what kind of thing is each size bucket reading/writing" WITHOUT inferring who
+# issued the syscall -- the target file identity is recorded verbatim in the
+# trace, so it is an observable fact, not an attribution guess.  Kept generic on
+# purpose so GenoMAS, SciLink, classic, etc. all classify with the same rules.
+# chr<N>.<SAMPLE> per-individual genome data (1000genome individuals stage).
+_CHROM_SAMPLE_RE = re.compile(r"^chr[0-9xym]+\.(hg|na)\d+")
+
+
+def io_kind(path: str, category: str | None = None) -> str:
+    # Coarse, meaning-based buckets (not per-format).  raw_data lumps every bulk
+    # scientific/binary format together (gz/tar/fits/vcf/npy/h5/...).  Anything
+    # we cannot type by extension is "other" -- we deliberately do NOT fall back
+    # to the storage-role category, so the label stays a pure file-type axis.
+    # `category` is accepted only for call-site compatibility and is unused.
+    if not path:
+        return "other"
+    base = path.rsplit("/", 1)[-1].lower()
+
+    def ends(*exts: str) -> bool:
+        return any(base.endswith(e) for e in exts)
+
+    if ends(".gz", ".tgz", ".tar", ".zip", ".bz2", ".xz", ".zst",
+            ".fits", ".vcf", ".bcf",
+            ".npy", ".npz", ".h5", ".hdf5", ".nc", ".parquet", ".bam", ".cram"):
+        return "raw_data"
+    # Special case: extension-less per-sample chromosome data (1000genome splits
+    # a chromosome into one file per sample, e.g. chr1.HG00096 / chrX.NA18612).
+    # The trailing token is a sample id, not an extension, so it would otherwise
+    # fall to "other" and hide the workflow's bulk raw data.
+    if _CHROM_SAMPLE_RE.match(base):
+        return "raw_data"
+    if ends(".csv", ".tsv", ".tbl"):
+        return "table"
+    if ends(".tmp") or ".tmp." in base:
+        return "tmp"
+    if ends(".log") or base.startswith("log_") or ".log." in base:
+        return "log"
+    if ends(".json", ".jsonl", ".ndjson", ".yaml", ".yml", ".toml",
+            ".ini", ".cfg", ".hdr", ".lock"):
+        return "config"
+    if ends(".txt", ".md", ".rst"):
+        return "text"
+    if ends(".py", ".sh", ".c", ".cpp", ".h", ".r", ".ipynb"):
+        return "code"
+    if ends(".png", ".jpg", ".jpeg", ".pdf", ".svg", ".gif", ".html", ".htm"):
+        return "image/doc"
+    return "other"
+
+
+def _bin_kind_annotation(counter: Counter) -> str:
+    """Compact multi-line 'n×kind' label for one size bucket (top 2 kinds; a
+    second kind is shown only when it is at least 20% of the bucket)."""
+    if not counter:
+        return ""
+    total = sum(counter.values())
+    top = counter.most_common(2)
+    parts = [f"{n}×{k}" for k, n in top if n >= 0.2 * total]
+    if not parts:
+        k, n = top[0]
+        parts = [f"{n}×{k}"]
+    return "\n".join(parts)
+
+
 def fig_size_distribution(io_events: list[dict], per_artifact: dict, out_path: Path):
-    """Darshan-bin request-size and per-file size distributions."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
+    """Darshan-bin request-size and per-file size distributions.
+
+    Under each size bucket we annotate WHAT that bucket is reading/writing (top
+    panel) and WHAT kind of files land in that on-disk-size bucket (bottom
+    panel), using io_kind().  Bars/data are unchanged -- this only adds text.
+    """
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 11),
+                                   gridspec_kw={"hspace": 1.0})
 
     reads = [e["size"] for e in io_events if e["kind"] == "R"]
     writes = [e["size"] for e in io_events if e["kind"] == "W"]
@@ -1254,19 +1451,40 @@ def fig_size_distribution(io_events: list[dict], per_artifact: dict, out_path: P
     ax1.set_xticks(x)
     ax1.set_xticklabels(DARSHAN_SIZE_LABELS, rotation=30, ha="right")
     ax1.set_ylabel("# syscalls")
-    ax1.set_title("Per-syscall I/O Request Size", fontsize=10)
+    ax1.set_title("Per-syscall I/O Request Size  (R/W content per bucket below)",
+                  fontsize=10)
     ax1.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     ax1.grid(axis="y", alpha=0.3)
 
+    # Per-bucket content: what each read/write bucket is actually touching.
+    read_kind = defaultdict(Counter)
+    write_kind = defaultdict(Counter)
+    for e in io_events:
+        cat = per_artifact.get(e["path"], {}).get("category")
+        k = io_kind(e["path"], cat)
+        idx = darshan_bin_index(e["size"])
+        (read_kind if e["kind"] == "R" else write_kind)[idx][k] += 1
+    for i in x:
+        rl = _bin_kind_annotation(read_kind.get(i))
+        wl = _bin_kind_annotation(write_kind.get(i))
+        if rl:
+            ax1.annotate("R: " + rl.replace("\n", "\n    "), (i, 0),
+                         xytext=(0, -46), textcoords="offset points",
+                         ha="center", va="top", fontsize=6.3, color="#1a7a1a")
+        if wl:
+            ax1.annotate("W: " + wl.replace("\n", "\n    "), (i, 0),
+                         xytext=(0, -74), textcoords="offset points",
+                         ha="center", va="top", fontsize=6.3, color="#b02020")
+
     file_sizes = []
-    n_skipped = 0
-    for rec in per_artifact.values():
+    file_kind = defaultdict(Counter)
+    for path, rec in per_artifact.items():
         size = rec.get("true_size")
         if size is None:
-            n_skipped += 1
             continue
         if size > 0:
             file_sizes.append(size)
+            file_kind[darshan_bin_index(size)][io_kind(path, rec.get("category"))] += 1
     fh = darshan_hist(file_sizes)
     vals = [fh[l] for l in DARSHAN_SIZE_LABELS]
     if any(vals):
@@ -1277,14 +1495,19 @@ def fig_size_distribution(io_events: list[dict], per_artifact: dict, out_path: P
                  color="#7f8c8d")
     ax2.set_xticks(x)
     ax2.set_xticklabels(DARSHAN_SIZE_LABELS, rotation=30, ha="right")
-    ax2.set_xlabel("per-file true on-disk size")
+    # labelpad pushes the axis title below the per-bucket file-type annotations.
+    ax2.set_xlabel("per-file true on-disk size", labelpad=52)
     ax2.set_ylabel("# artifacts")
-    _skip_note = (f"  ·  {n_skipped} input(s) skipped (size un-statted)"
-                  if n_skipped else "")
-    ax2.set_title("Per-file Artifact Size", fontsize=10)
+    ax2.set_title("Per-file Artifact Size  (file type per bucket below)",
+                  fontsize=10)
     ax2.grid(axis="y", alpha=0.3)
+    for i in x:
+        fl = _bin_kind_annotation(file_kind.get(i))
+        if fl:
+            ax2.annotate(fl.replace("\n", "\n"), (i, 0),
+                         xytext=(0, -46), textcoords="offset points",
+                         ha="center", va="top", fontsize=6.3, color="#33506b")
 
-    fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -1369,9 +1592,8 @@ def fig_staleness_cdf(write_read_gap: dict, out_path: Path):
 
 
 def fig_lifecycle_spans(per_artifact: dict, run_start: float, run_end: float,
-                        out_path: Path, top_n: int = 25):
+                        out_path: Path):
     """Histogram of generated-file dead fraction."""
-    run_span = max(run_end - run_start, 1e-9)
     generated = [r for r in per_artifact.values() if r.get("writes")]
     if not generated:
         fig, ax = plt.subplots(figsize=(8, 4))
@@ -1414,7 +1636,7 @@ def print_summary(per_artifact: dict, io_events: list[dict], io_summary: dict | 
         cov = io_summary["coverage_pct"]
         rw = wl["rw_byte_ratio"]
         rw_str = f"{rw:.1f}:1" if rw else "n/a"
-        print(f"  IO VOLUME (workload data):")
+        print("  IO VOLUME (workload data):")
         print(f"    READ  {human_bytes1(wl['read_bytes']):>10}  ({wl['n_reads']:,} syscalls)")
         print(f"    WRITE {human_bytes1(wl['write_bytes']):>10}  ({wl['n_writes']:,} syscalls)")
         print(f"    R:W bytes = {rw_str}")
@@ -1422,7 +1644,7 @@ def print_summary(per_artifact: dict, io_events: list[dict], io_summary: dict | 
             print(f"    coverage: {cov['read']:.1f}% read / {cov['write']:.1f}% write of process-tree bytes")
         ru = io_summary.get("reuse", {})
         if ru.get("dead_write_pct_of_write") is not None:
-            print(f"  REUSE:")
+            print("  REUSE:")
             print(f"    dead writes (written, never read): {human_bytes1(ru['dead_write_bytes'])} "
                   f"= {ru['dead_write_pct_of_write']:.0f}% of written bytes")
             if ru.get("read_reuse_factor") is not None:
@@ -1432,7 +1654,7 @@ def print_summary(per_artifact: dict, io_events: list[dict], io_summary: dict | 
         br = io_summary.get("by_role", {})
         if br.get("by_role"):
             tr, tw = br.get("top_reader"), br.get("top_writer")
-            print(f"  WHO:")
+            print("  WHO:")
             if tr:
                 rp = br["by_role"][tr].get("read_pct")
                 rp_text = f"{rp:.0f}%" if rp is not None else "n/a"

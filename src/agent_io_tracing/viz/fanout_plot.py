@@ -34,8 +34,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-AXIS1 = [("base", 1), ("a1_c2", 2), ("a1_c4", 4), ("a1_c8", 8)]  # x = C cohorts
-AXIS2 = [("base", 1), ("a2_t2", 2), ("a2_t4", 4), ("a2_t8", 8)]  # x = T traits
+AXIS1 = [
+    (("A_c1_w1", "base"), 1),
+    (("A_c2_w2", "a1_c2"), 2),
+    (("A_c4_w4", "a1_c4"), 4),
+    (("A_c8_w4", "a1_c8"), 8),
+]  # x = C cohorts
+AXIS2 = [
+    (("B_t1_w2", "base"), 1),
+    (("B_t2_w2", "a2_t2"), 2),
+    (("B_t4_w2", "a2_t4"), 4),
+    (("B_t8_w2", "a2_t8"), 8),
+]  # x = T traits
 
 
 def jload(p: Path) -> dict:
@@ -103,7 +113,9 @@ def cell_metrics(run: Path, cell: str) -> dict | None:
     }
 
 
-def collect(run: Path, axis: list[tuple[str, int]]) -> tuple[list[int], dict[str, list]]:
+def collect(
+    run: Path, axis: list[tuple[tuple[str, ...], int]]
+) -> tuple[list[int], dict[str, list]]:
     xs: list[int] = []
     series: dict[str, list] = {k: [] for k in
                                ("generated_files", "distinct_files", "metadata_ops",
@@ -113,8 +125,35 @@ def collect(run: Path, axis: list[tuple[str, int]]) -> tuple[list[int], dict[str
                                 "wall_s", "total_work_s",
                                 "code_execs", "io_execs",
                                 "pct_stdio_only", "pct_structured_any")}
-    for cell, x in axis:
+    for aliases, x in axis:
+        cell = next((name for name in aliases if (run / name).is_dir()), aliases[0])
         m = cell_metrics(run, cell)
+        # Some fanout matrices were resumed in a new timestamped run after a
+        # standalone baseline.  If the local x=1 cell is incomplete, reuse a
+        # complete same-name baseline from a sibling phase4 run rather than
+        # plotting zero input bytes as a real measurement.
+        if x == 1 and (
+            m is None
+            or m.get("wall_s") is None
+            or not (m.get("unique_input_MB") or 0)
+        ):
+            for sibling in sorted(run.parent.glob("phase4_*")):
+                if sibling == run:
+                    continue
+                sibling_cell = next(
+                    (name for name in aliases if (sibling / name).is_dir()),
+                    None,
+                )
+                if sibling_cell is None:
+                    continue
+                candidate = cell_metrics(sibling, sibling_cell)
+                if (
+                    candidate is not None
+                    and candidate.get("wall_s") is not None
+                    and (candidate.get("unique_input_MB") or 0) > 0
+                ):
+                    m = candidate
+                    break
         if m is None:
             continue
         xs.append(x)
@@ -143,7 +182,7 @@ def _panel(ax, xs, ys, title, ylabel, ref_linear=False):
 
 
 def make_figure(run: Path, axis_name: str, xlabel: str,
-                axis: list[tuple[str, int]], out: Path):
+                axis: list[tuple[tuple[str, ...], int]], out: Path):
     xs, s = collect(run, axis)
     fig, axes = plt.subplots(2, 2, figsize=(10, 7))
     fig.suptitle(f"{axis_name}  (GEO-only, gpt-5-nano, quick-test)", fontsize=12)

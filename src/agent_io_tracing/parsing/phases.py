@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from agent_io_tracing.parsing.tool_log import ToolCall, parse_tool_calls_log, parse_time
+from agent_io_tracing.parsing.tool_log import ToolCall, parse_tool_calls_log
 
 
 # =============================================================================
@@ -240,7 +240,6 @@ def group_into_batches(tool_calls: list[ToolCall], threshold_ms: float = 100.0) 
 def extract_phases(
     tool_calls: list[ToolCall],
     threshold_ms: float = 100.0,
-    include_initial_model_phase: bool = False,
 ) -> PhaseAnalysis:
     """
     Extract execution phases from tool calls.
@@ -252,8 +251,6 @@ def extract_phases(
     Args:
         tool_calls: List of tool calls (will be sorted internally)
         threshold_ms: Threshold for grouping tool calls into batches
-        include_initial_model_phase: If True, include model completion phase before first batch
-        
     Returns:
         PhaseAnalysis containing all phases and statistics
     """
@@ -428,7 +425,7 @@ Examples:
     # Print summary if requested
     if args.summary:
         summary = analysis.to_dict()["summary"]
-        print(f"Phase Analysis Summary:", file=sys.stderr)
+        print("Phase Analysis Summary:", file=sys.stderr)
         print(f"  Total duration: {summary['total_duration_ms']:.1f}ms", file=sys.stderr)
         print(f"  Tool execution: {summary['total_tool_execution_ms']:.1f}ms ({summary['tool_execution_pct']:.1f}%)", file=sys.stderr)
         print(f"  Model completion: {summary['total_model_completion_ms']:.1f}ms ({summary['model_completion_pct']:.1f}%)", file=sys.stderr)

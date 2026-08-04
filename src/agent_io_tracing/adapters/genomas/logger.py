@@ -39,13 +39,23 @@ import hashlib
 import inspect
 import json
 import os
-import sys
 import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+from agent_io_tracing.adapters.llm_trace import (
+    apply_nocache_tag as _apply_nocache_tag,
+    cache_request_config as _cache_request_config,
+    format_system_prompt as _format_system_prompt_entry,
+    format_tool_log as _format_log_line,
+    make_nocache_tag as _make_nocache_tag,
+    normalize_messages as _normalize_messages,
+    runtime_vendor as _runtime_vendor,
+    stable_json as _stable_json,
+)
 
 # I/O abstraction classifier (Phase 1 §3.3 / H1). Guard the
 # import so a missing/broken classifier only disables classification, never
@@ -60,65 +70,10 @@ except Exception:  # pragma: no cover - best-effort
 # ---------------------------------------------------------------------------
 
 
-def _format_time(dt: datetime) -> str:
-    return dt.strftime("%H:%M:%S.%f")
-
-
 def _normalize_tool_name(name: str | None) -> str:
     if not name:
         return "LLMCall"
     return name[0].upper() + name[1:]
-
-
-def _python_literal(value: Any) -> str:
-    """Round-trippable Python literal for ast.literal_eval."""
-    if value is None:
-        return "None"
-    if isinstance(value, bool):
-        return "True" if value else "False"
-    if isinstance(value, (int, float)):
-        if value != value or value in (float("inf"), float("-inf")):
-            return "None"
-        return repr(value)
-    if isinstance(value, str):
-        return repr(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_python_literal(v) for v in value) + "]"
-    if isinstance(value, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"{_python_literal(str(k))}: {_python_literal(v)}"
-                for k, v in value.items()
-            )
-            + "}"
-        )
-    return _python_literal(str(value))
-
-
-def _format_log_line(
-    started_at: datetime,
-    ended_at: datetime,
-    tool_name: str,
-    tool_id: str,
-    tool_input: Any,
-) -> str:
-    duration_ms = (ended_at - started_at).total_seconds() * 1000.0
-    return (
-        f"[{_format_time(started_at)} -> {_format_time(ended_at)}] "
-        f"({duration_ms:.1f}ms) {tool_name} (id={tool_id}) "
-        f"input={_python_literal(tool_input)}\n"
-    )
-
-
-def _format_system_prompt_entry(captured_at: datetime, prompt: str) -> str:
-    return (
-        f"[{captured_at.isoformat()}] length={len(prompt)}\n"
-        "--- SYSTEM PROMPT START ---\n"
-        f"{prompt}\n"
-        "--- SYSTEM PROMPT END ---\n"
-        "\n"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -126,18 +81,50 @@ def _format_system_prompt_entry(captured_at: datetime, prompt: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _field(obj: Any, *names: str) -> Any:
+    """First non-None of obj.<name> / obj[name] across the given names."""
+    for n in names:
+        v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
+        if v is not None:
+            return v
+    return None
+
+
+def _cached_tokens_from_raw(genomas_result: dict) -> int:
+    """Dig the provider's prompt-cache hit out of the raw response.
+
+    GenoMAS's own ``usage`` dict is stripped to input/output/cost, but it also
+    returns ``raw_response`` — the untouched provider object. OpenAI reports the
+    reused-prefix length at ``usage.prompt_tokens_details.cached_tokens``; other
+    OpenAI-compatible backends (e.g. FreeInference) leave it null. Best-effort,
+    handles both attribute- and dict-shaped responses; defaults to 0.
+    """
+    raw = genomas_result.get("raw_response")
+    if raw is None:
+        return 0
+    usage = _field(raw, "usage")
+    if usage is None:
+        return 0
+    details = _field(usage, "prompt_tokens_details")
+    src = details if details is not None else usage
+    val = _field(src, "cached_tokens", "cache_read", "cacheRead")
+    try:
+        return int(val or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _to_pi_usage(genomas_result: Any) -> dict:
-    """GenoMAS returns {"usage": {"input_tokens","output_tokens","cost"}}.
-    pi schema expects {"input","output","cacheRead","totalTokens"}.
+    """GenoMAS returns {"usage": {"input_tokens","output_tokens","cost"},
+    "raw_response": <provider object>}. pi schema expects
+    {"input","output","cacheRead","totalTokens"}.
     """
     if not isinstance(genomas_result, dict):
         return {"input": 0, "output": 0, "cacheRead": 0, "totalTokens": 0}
     usage = genomas_result.get("usage") or {}
     inp = int(usage.get("input_tokens", 0) or 0)
     out = int(usage.get("output_tokens", 0) or 0)
-    # GenoMAS doesn't surface cache-read tokens; raw_response may have them
-    # but each provider stores them differently — best-effort, default 0.
-    cache = 0
+    cache = _cached_tokens_from_raw(genomas_result)
     return {
         "input": inp,
         "output": out,
@@ -146,15 +133,41 @@ def _to_pi_usage(genomas_result: Any) -> dict:
     }
 
 
+def _provider_request_id(genomas_result: Any) -> str | None:
+    if not isinstance(genomas_result, dict):
+        return None
+    raw = genomas_result.get("raw_response")
+    value = _field(raw, "id", "request_id", "_request_id") if raw is not None else None
+    return str(value) if value is not None else None
+
+
+def _stream_timing(genomas_result: Any) -> dict[str, float]:
+    """Read real streaming timestamps supplied by a provider integration.
+
+    Provider clients can attach ``_trace_timing`` to the normalized result with
+    wall-clock millisecond values for ``response_headers_ms``,
+    ``first_token_ms``, and ``last_token_ms``. Missing fields stay missing.
+    """
+    if not isinstance(genomas_result, dict):
+        return {}
+    timing = genomas_result.get("_trace_timing")
+    if not isinstance(timing, dict):
+        return {}
+    output: dict[str, float] = {}
+    for name in ("response_headers_ms", "first_token_ms", "last_token_ms"):
+        value = timing.get(name)
+        if isinstance(value, (int, float)):
+            output[name] = float(value)
+    return output
+
+
 def _epoch_ms(dt: datetime) -> float:
     return dt.timestamp() * 1000.0
 
 
-def _stable_json(value: Any) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-    except Exception:
-        return str(value)
+def _nocache_enabled() -> bool:
+    """No-cache arm: see `apply_nocache_tag` in adapters/llm_trace.py."""
+    return os.environ.get("GENOMAS_NOCACHE", "0").lower() in {"1", "true", "yes"}
 
 
 def _llm_cache_key(client: Any, messages: Any) -> str:
@@ -273,6 +286,15 @@ class GenoMASToolLogger:
         # Per-code-exec generated-code capture for I/O-API classification (§3.2/§3.3).
         self._generated_code_log = self._log_dir / "generated_code.jsonl"
         self._llm_cache_log = self._log_dir / "llm_cache.jsonl"
+        # Raw per-call prompt capture: the full messages array BEFORE it is
+        # hashed into cache_key. cache_key alone (a one-way sha256) can only
+        # answer "is this whole prompt identical"; the raw messages are what let
+        # us compute longest-common-prefix between calls and split the reused
+        # prefix by source (system / instructions / history / tool output).
+        self._messages_log = self._log_dir / "messages.jsonl"
+        self._dump_messages = os.environ.get("GENOMAS_DUMP_MESSAGES", "1").lower() in {
+            "1", "true", "yes"
+        }
 
         self._cache_path = Path(
             os.environ.get("GENOMAS_LLM_CACHE_PATH") or str(self._llm_cache_log)
@@ -295,9 +317,12 @@ class GenoMASToolLogger:
                     self._llm_cache[key] = rec["result"]
 
         # Truncate at start (mirror analyze_codebase_pi.py behaviour).
-        for p in (self._tool_log, self._subagent_log,
-                  self._system_prompt_log, self._events_log,
-                  self._generated_code_log):
+        _truncate = [self._tool_log, self._subagent_log,
+                     self._system_prompt_log, self._events_log,
+                     self._generated_code_log]
+        if self._dump_messages:
+            _truncate.append(self._messages_log)
+        for p in _truncate:
             p.write_text("", encoding="utf-8")
         if not self._replay_mode and self._cache_path == self._llm_cache_log:
             self._llm_cache_log.write_text("", encoding="utf-8")
@@ -327,6 +352,11 @@ class GenoMASToolLogger:
             with self._generated_code_log.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
+    def _append_messages(self, record: dict) -> None:
+        with self._lock:
+            with self._messages_log.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
     def _append_llm_cache(self, record: dict) -> None:
         with self._lock:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -337,14 +367,18 @@ class GenoMASToolLogger:
         return self._llm_cache.get(key)
 
     def record_llm_result(self, key: str, result: Any) -> None:
-        self._llm_cache[key] = result
+        cached_result = result
+        if isinstance(result, dict) and "_trace_timing" in result:
+            cached_result = dict(result)
+            cached_result.pop("_trace_timing", None)
+        self._llm_cache[key] = cached_result
         if not self._replay_mode:
             self._append_llm_cache({
                 "cache_key": key,
                 "cached_response_hash": hashlib.sha256(
-                    _stable_json(result).encode("utf-8", "replace")
+                    _stable_json(cached_result).encode("utf-8", "replace")
                 ).hexdigest(),
-                "result": result,
+                "result": cached_result,
             })
 
     # ---- system prompt capture (first call only) -----------------------
@@ -379,55 +413,114 @@ class GenoMASToolLogger:
         error: BaseException | None = None,
         cache_key: str | None = None,
         cache_hit: bool = False,
+        run_id: str | None = None,
+        started_monotonic_ns: int | None = None,
+        ended_monotonic_ns: int | None = None,
+        attempt: int = 1,
+        nocache_tag: str | None = None,
     ) -> None:
         """One LLM call's start+end events, plus the tool_calls.log line."""
         try:
             self._capture_system_prompt_once(messages)
 
-            run_id = uuid.uuid4().hex
+            run_id = run_id or uuid.uuid4().hex
             role = _infer_role_from_stack()
             provider = getattr(getattr(client, "config", None), "provider", "?")
             model = getattr(getattr(client, "config", None), "model_name", "?")
             phase = _infer_llm_phase(messages)
             # Tool name must be plain \w+ for summarize_pi_events.py's regex;
             # model+provider live in the input dict, not the name.
-            tool_label = role
+            provider_request_id = _provider_request_id(result)
+            timing = _stream_timing(result)
+            common = {
+                "run_id": run_id,
+                "agent_role": role,
+                "genomas_role": role,
+                "provider": provider,
+                "vendor": _runtime_vendor(provider, model),
+                "model": model,
+                "cache_config": _cache_request_config(client),
+                "phase": phase,
+                "cache_key": cache_key,
+                "cache_hit": cache_hit,
+                "provider_request_id": provider_request_id,
+                "attempt": attempt,
+                "nocache": bool(nocache_tag),
+            }
 
             # pi_events.jsonl
-            start_event = {
-                "type": "message_start",
-                "run_id": run_id,
+            request_start_event = {
+                **common,
+                "type": "message_request_start",
+                "wall_time_ms": _epoch_ms(started_at),
+                "monotonic_ns": started_monotonic_ns,
                 "message": {
                     "role": "assistant",
                     "timestamp": _epoch_ms(started_at),
                 },
-                "genomas_role": role,
-                "provider": provider,
-                "model": model,
-                "phase": phase,
-                "cache_key": cache_key,
-                "cache_hit": cache_hit,
+            }
+            start_event = {
+                **common,
+                "type": "message_start",
+                "message": {
+                    "role": "assistant",
+                    "timestamp": _epoch_ms(started_at),
+                },
+                "wall_time_ms": _epoch_ms(started_at),
+                "monotonic_ns": started_monotonic_ns,
             }
             end_event = {
+                **common,
                 "type": "message_end",
-                "run_id": run_id,
                 "message": {
                     "role": "assistant",
                     "timestamp": _epoch_ms(ended_at),
                     "usage": _to_pi_usage(result) if error is None else
                              {"input": 0, "output": 0, "cacheRead": 0, "totalTokens": 0},
                 },
-                "genomas_role": role,
-                "provider": provider,
-                "model": model,
-                "phase": phase,
-                "cache_key": cache_key,
-                "cache_hit": cache_hit,
+                "wall_time_ms": _epoch_ms(ended_at),
+                "monotonic_ns": ended_monotonic_ns,
+                "stream_timing_available": "first_token_ms" in timing,
             }
             if error is not None:
                 end_event["error"] = repr(error)
+            self._append_event(request_start_event)
             self._append_event(start_event)
+            for event_type, timing_key in [
+                ("message_response_headers", "response_headers_ms"),
+                ("message_first_token", "first_token_ms"),
+                ("message_last_token", "last_token_ms"),
+            ]:
+                if timing_key not in timing:
+                    continue
+                self._append_event({
+                    **common,
+                    "type": event_type,
+                    "wall_time_ms": timing[timing_key],
+                    "message": {
+                        "role": "assistant",
+                        "timestamp": timing[timing_key],
+                    },
+                })
             self._append_event(end_event)
+
+            # Raw prompt dump, joinable to pi_events via run_id. Written from the
+            # same `messages` object used to compute cache_key, so it captures the
+            # exact bytes that were prefilled — the input to prefix-overlap and
+            # source-decomposition analysis (Q3 structure / Q4).
+            if self._dump_messages:
+                self._append_messages({
+                    "run_id": run_id,
+                    "cache_key": cache_key,
+                    "agent_role": role,
+                    "genomas_role": role,
+                    "phase": phase,
+                    "provider": provider,
+                    "model": model,
+                    "timestamp": _epoch_ms(started_at),
+                    "messages": _normalize_messages(messages),
+                    "nocache_tag": nocache_tag,
+                })
 
             # NOTE: We deliberately do NOT write LLM calls to tool_calls.log.
             # That file is reserved for actual tool/code-exec invocations
@@ -454,37 +547,70 @@ def _make_async_wrapper(
     """Build an async wrapper around an LLMClient.generate_completion."""
     async def wrapper(self, messages, *args, **kwargs):
         started_at = datetime.now()
+        started_monotonic_ns = time.monotonic_ns()
+        run_id = uuid.uuid4().hex
         cache_key = _llm_cache_key(self, messages)
         if handler._replay_mode:
             cached = handler.get_cached_llm_result(cache_key)
             if cached is not None:
                 ended_at = datetime.now()
+                ended_monotonic_ns = time.monotonic_ns()
                 handler.on_llm_call(
                     self, messages, cached, started_at, ended_at,
                     cache_key=cache_key, cache_hit=True,
+                    run_id=run_id,
+                    started_monotonic_ns=started_monotonic_ns,
+                    ended_monotonic_ns=ended_monotonic_ns,
                 )
                 return cached
             if handler._replay_strict:
                 ended_at = datetime.now()
+                ended_monotonic_ns = time.monotonic_ns()
                 err = RuntimeError(f"LLM replay cache miss: {cache_key}")
                 handler.on_llm_call(
                     self, messages, None, started_at, ended_at,
                     error=err, cache_key=cache_key, cache_hit=False,
+                    run_id=run_id,
+                    started_monotonic_ns=started_monotonic_ns,
+                    ended_monotonic_ns=ended_monotonic_ns,
                 )
                 raise err
+        nocache_tag = _make_nocache_tag() if _nocache_enabled() else None
+        sent_messages = (
+            _apply_nocache_tag(messages, nocache_tag) if nocache_tag else messages
+        )
         try:
-            result = await original(self, messages, *args, **kwargs)
+            result = await original(self, sent_messages, *args, **kwargs)
             ended_at = datetime.now()
+            ended_monotonic_ns = time.monotonic_ns()
             handler.record_llm_result(cache_key, result)
+            if nocache_tag:
+                hit = _cached_tokens_from_raw(result if isinstance(result, dict) else {})
+                if hit:
+                    print(
+                        "[genomas_tool_logger] WARNING: no-cache arm got "
+                        f"cached_tokens={hit} on run_id={run_id}; this cell is "
+                        "not a valid no-cache observation.",
+                        flush=True,
+                    )
             handler.on_llm_call(
                 self, messages, result, started_at, ended_at,
                 cache_key=cache_key, cache_hit=False,
+                run_id=run_id,
+                started_monotonic_ns=started_monotonic_ns,
+                ended_monotonic_ns=ended_monotonic_ns,
+                nocache_tag=nocache_tag,
             )
             return result
         except BaseException as e:
             ended_at = datetime.now()
+            ended_monotonic_ns = time.monotonic_ns()
             handler.on_llm_call(self, messages, None, started_at, ended_at,
-                                error=e, cache_key=cache_key, cache_hit=False)
+                                error=e, cache_key=cache_key, cache_hit=False,
+                                run_id=run_id,
+                                started_monotonic_ns=started_monotonic_ns,
+                                ended_monotonic_ns=ended_monotonic_ns,
+                                nocache_tag=nocache_tag)
             raise
     wrapper._genomas_patched = True  # type: ignore[attr-defined]
     return wrapper
@@ -503,6 +629,105 @@ _CLIENT_CLASS_NAMES = (
     "NovitaClient",
     "DeepSeekClient",
 )
+
+
+def _install_openai_stream_timing(llm_mod: Any) -> bool:
+    """Replace GenoMAS's OpenAI-compatible call with a usage-bearing stream."""
+    enabled = os.environ.get("GENOMAS_CAPTURE_STREAM_TIMING", "1").lower() in {
+        "1", "true", "yes",
+    }
+    cls = getattr(llm_mod, "OpenAIClient", None)
+    if not enabled or cls is None:
+        return False
+    current = getattr(cls, "generate_completion", None)
+    if current is None or getattr(current, "_genomas_stream_timing", False):
+        return bool(current)
+
+    async def generate_completion(self, messages):
+        try:
+            recent = getattr(llm_mod, "check_recent_openai_model", lambda _: False)
+            if recent(self.model_name) and messages and messages[0].get("role") == "system":
+                messages[0]["role"] = (
+                    "assistant" if "o1-mini" in self.model_name.lower() else "developer"
+                )
+            params = dict(self.config.extra_message_params or {})
+            params.pop("stream", None)
+            params.pop("stream_options", None)
+            stream = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                stream=True,
+                stream_options={"include_usage": True},
+                **params,
+            )
+            headers_ms = time.time() * 1000.0
+            first_token_ms = None
+            last_token_ms = None
+            content_parts: list[str] = []
+            usage = None
+            response_id = None
+            response_model = self.model_name
+            async for chunk in stream:
+                now_ms = time.time() * 1000.0
+                response_id = response_id or _field(chunk, "id")
+                response_model = _field(chunk, "model") or response_model
+                chunk_usage = _field(chunk, "usage")
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                choices = _field(chunk, "choices") or []
+                delta = _field(choices[0], "delta") if choices else None
+                content = _field(delta, "content") if delta is not None else None
+                reasoning = (
+                    _field(delta, "reasoning_content")
+                    if delta is not None else None
+                )
+                if content:
+                    content_parts.append(str(content))
+                if content or reasoning:
+                    if first_token_ms is None:
+                        first_token_ms = now_ms
+                    last_token_ms = now_ms
+            if usage is None:
+                raise RuntimeError(
+                    "stream completed without usage; provider must support "
+                    "stream_options.include_usage for KV-cache tracing"
+                )
+            if first_token_ms is None:
+                raise RuntimeError("stream completed without a generated token")
+            usage_dict = (
+                usage.model_dump()
+                if hasattr(usage, "model_dump") else dict(usage)
+                if isinstance(usage, dict) else {
+                    "prompt_tokens": _field(usage, "prompt_tokens"),
+                    "completion_tokens": _field(usage, "completion_tokens"),
+                    "prompt_tokens_details": _field(usage, "prompt_tokens_details"),
+                }
+            )
+            raw_response = {
+                "id": response_id,
+                "model": response_model,
+                "usage": usage_dict,
+            }
+            result = self._format_response(
+                content="".join(content_parts),
+                input_tokens=int(_field(usage, "prompt_tokens", "input_tokens") or 0),
+                output_tokens=int(
+                    _field(usage, "completion_tokens", "output_tokens") or 0
+                ),
+                raw_response=raw_response,
+            )
+            result["_trace_timing"] = {
+                "response_headers_ms": headers_ms,
+                "first_token_ms": first_token_ms,
+                "last_token_ms": last_token_ms,
+            }
+            return result
+        except Exception as exc:
+            return self.handle_exception(exc)
+
+    generate_completion._genomas_stream_timing = True  # type: ignore[attr-defined]
+    cls.generate_completion = generate_completion
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +952,8 @@ def install_global(handler: GenoMASToolLogger) -> list[str]:
         return []
 
     patched: list[str] = []
+    if _install_openai_stream_timing(llm_mod):
+        patched.append("OpenAIClient.stream_timing")
     for cls_name in _CLIENT_CLASS_NAMES:
         cls = getattr(llm_mod, cls_name, None)
         if cls is None:

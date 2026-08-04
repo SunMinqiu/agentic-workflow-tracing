@@ -50,14 +50,7 @@ import sys
 import traceback
 from pathlib import Path
 
-
-def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
-    """Split on the first standalone '--'; everything after goes to SRAgent."""
-    if "--" in argv:
-        idx = argv.index("--")
-        return argv[:idx], argv[idx + 1 :]
-    return argv, []
-
+from agent_io_tracing.adapters.cli import split_forwarded_argv
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -93,7 +86,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    ours, sragent_args = _split_argv(sys.argv[1:])
+    ours, sragent_args = split_forwarded_argv(sys.argv[1:])
     args = build_arg_parser().parse_args(ours)
 
     work_dir = args.work_dir.resolve()

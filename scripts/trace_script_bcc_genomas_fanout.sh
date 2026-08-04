@@ -222,6 +222,8 @@ for ws_out in "$BASE_OUT"/*/; do
         "$POST_PYTHON" -m agent_io_tracing.lineage.analyzer "$ws_out" > "$ws_out/lineage.log" 2>&1
         "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" > "$ws_out/parallelism.log" 2>&1
         "$POST_PYTHON" -m agent_io_tracing.analysis.phase1_metrics "$ws_out" > "$ws_out/phase1_metrics.log" 2>&1
+        "$POST_PYTHON" -m agent_io_tracing.analysis.execution_units "$ws_out" > "$ws_out/execution_units.log" 2>&1
+        "$POST_PYTHON" -m agent_io_tracing.analysis.trace_quality "$ws_out" > "$ws_out/trace_quality.log" 2>&1
         "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs . > "$ws_out/per_run_io_char.log" 2>&1
         "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" > "$ws_out/visualize.log" 2>&1
     else

@@ -490,8 +490,6 @@ def aggregate(target: Path) -> dict:
     structured_any = 0
     no_io = 0
     parse_failures = 0
-    per_role: dict[str, Counter] = defaultdict(Counter)
-
     for _id, code in _iter_code_records(target):
         total += 1
         res = classify_code(code)

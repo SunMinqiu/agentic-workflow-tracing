@@ -48,5 +48,23 @@ def darshan_hist(values: Iterable[float]) -> dict[str, int]:
     return counts
 
 
+def darshan_bin_index(value: float) -> int:
+    """Return the index into DARSHAN_SIZE_LABELS for a single value.
+
+    Mirrors darshan_hist's binning exactly (used when we need per-bin
+    breakdowns, not just counts). Negatives clamp to the smallest bin.
+    """
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if x < 0:
+        x = 0.0
+    for idx, (lo, hi) in enumerate(zip(DARSHAN_SIZE_BINS, DARSHAN_SIZE_BINS[1:])):
+        if lo <= x < hi or (math.isinf(hi) and x >= lo):
+            return idx
+    return len(DARSHAN_SIZE_LABELS) - 1
+
+
 def finite_darshan_edges() -> list[float]:
     return [float(x) for x in DARSHAN_SIZE_BINS if not math.isinf(x)]

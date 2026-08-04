@@ -942,6 +942,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="File descriptor to write 'ready\\n' to once probes are active.  "
              "Useful for synchronising with a launch script.",
     )
+    parser.add_argument(
+        "--perf-pages",
+        type=int,
+        default=1024,
+        help="Perf-buffer pages per CPU. Must be a positive power of two. "
+             "Default: 1024.",
+    )
     parser.set_defaults(include_net=True)
     parser.add_argument(
         "--include-net",
@@ -974,6 +981,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
+    if args.perf_pages <= 0 or args.perf_pages & (args.perf_pages - 1):
+        raise SystemExit("--perf-pages must be a positive power of two")
 
     root_pid = int(args.root_pid)
     out_path = args.output
@@ -1122,10 +1131,18 @@ def main() -> int:
 
             f.write(json.dumps(payload) + "\n")
 
-        bpf["events"].open_perf_buffer(handle_event, page_cnt=256)
+        lost_events = [0]
+
+        def handle_lost(_cpu, count):
+            lost_events[0] += int(count)
+
+        bpf["events"].open_perf_buffer(
+            handle_event, page_cnt=args.perf_pages, lost_cb=handle_lost
+        )
 
         print(
-            f"Tracing PID tree rooted at {root_pid}; writing to {out_path}",
+            f"Tracing PID tree rooted at {root_pid}; writing to {out_path}; "
+            f"perf_pages={args.perf_pages}",
             file=sys.stderr,
         )
         next_hpc_attach_check = time.monotonic() + 1.0
@@ -1153,7 +1170,7 @@ def main() -> int:
             bpf.perf_buffer_poll(timeout=50)
         f.flush()
 
-    print("Tracer stopped.", file=sys.stderr)
+    print(f"Tracer stopped. lost_events={lost_events[0]}", file=sys.stderr)
     return 0
 
 

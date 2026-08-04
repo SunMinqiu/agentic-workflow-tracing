@@ -51,7 +51,16 @@ _INTERP_MARKERS = ("/site-packages/", "/.venv/", "/lib/python", "/dist-packages/
 
 
 def _entry_bytes(entry: dict[str, Any]) -> int:
-    size = entry.get("actual_size") or entry.get("requested_size") or entry.get("bytes_transferred") or 0
+    # Cross-workflow byte totals use completed syscall bytes, not the requested
+    # buffer size.  A short read may request 4 MiB and return only a few bytes;
+    # counting the request would inflate volume and disagree with the common
+    # byte denominators in phase1_metrics/trace_quality.
+    size = entry.get("bytes_transferred")
+    if not isinstance(size, (int, float)):
+        size = entry.get("actual_size")
+    if not isinstance(size, (int, float)):
+        size = entry.get("requested_size")
+    size = size or 0
     return int(size) if isinstance(size, (int, float)) and size > 0 else 0
 
 
@@ -138,7 +147,7 @@ def _fmt_bytes(n: float) -> str:
     return f"{n:.0f}TB"
 
 
-def _empty(ax_or_fig, out_png: Path, msg: str) -> None:
+def _empty(out_png: Path, msg: str) -> None:
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
     ax.text(0.5, 0.5, msg, ha="center", va="center")
     ax.set_axis_off()
@@ -158,7 +167,7 @@ def plot_file_access_volume(per_file: dict[str, dict[str, Any]], out_png: Path) 
     totals = np.array([r["read_bytes"] + r["write_bytes"] for r in per_file.values()], dtype=float)
     opens = np.array([max(r["opens"], 1) for r in per_file.values()], dtype=int)
     if totals.size == 0:
-        _empty(None, out_png, "no workload file I/O in this run")
+        _empty(out_png, "no workload file I/O in this run")
         return
 
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
@@ -198,7 +207,7 @@ def plot_rw_asymmetry(per_file: dict[str, dict[str, Any]], out_png: Path) -> Non
     reads = np.array([r["read_bytes"] for r in per_file.values()], dtype=float)
     writes = np.array([r["write_bytes"] for r in per_file.values()], dtype=float)
     if reads.size == 0:
-        _empty(None, out_png, "no workload file I/O in this run")
+        _empty(out_png, "no workload file I/O in this run")
         return
 
     fig, (axa, axb) = plt.subplots(1, 2, figsize=(11.5, 4.4))

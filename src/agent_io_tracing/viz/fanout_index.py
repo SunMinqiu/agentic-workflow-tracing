@@ -27,10 +27,14 @@ FIGURE_ORDER = [
     # time & attribution (visualizations/ + call_dag)
     ("visualizations/agent_timeline.png", "Agent Timeline"),
     ("visualizations/phase_breakdown.png", "Time Accounting"),
+    ("visualizations/byte_normalized_summary.png", "Byte-normalized I/O Counts"),
+    ("visualizations/file_access_volume.png", "File Access Frequency x Volume"),
+    ("visualizations/rw_asymmetry.png", "Read/Write Asymmetry"),
     ("visualizations/measured_interface_layers.png", "Measured I/O Interface Mix"),
     ("visualizations/directory_scan.png", "Directory Re-scans (getdents64)"),
     ("visualizations/inter_arrival_cdf.png", "Inter-arrival Histogram"),
     ("visualizations/reread_attribution.png", "Reread Attribution"),
+    ("visualizations/request_size_rw_cdf.png", "Read/Write Request-size CDF"),
     ("visualizations/access_pattern.png", "Access Pattern"),
     ("visualizations/io_rate.png", "I/O Rate Over Time"),
     ("visualizations/effective_bandwidth.png", "Effective BW by Phase"),
@@ -42,6 +46,8 @@ DATA_LINKS = [
     "phase1_metrics.json", "lineage/io_summary.json",
     "lineage/artifacts.csv", "lineage/tool_call_attribution.csv",
     "generated_code.jsonl", "manifest.json", "parallelism_summary.json",
+    "trace_quality.json", "lineage/execution_unit_io.csv",
+    "lineage/execution_unit_summary.json",
 ]
 
 

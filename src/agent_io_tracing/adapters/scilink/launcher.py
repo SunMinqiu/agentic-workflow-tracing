@@ -46,14 +46,8 @@ import sys
 import traceback
 from pathlib import Path
 
-
-def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
-    """Split on the first standalone '--'; everything after goes to scilink."""
-    if "--" in argv:
-        idx = argv.index("--")
-        return argv[:idx], argv[idx + 1:]
-    return argv, []
-
+from agent_io_tracing.adapters.cli import split_forwarded_argv
+from agent_io_tracing.adapters.llm_trace import apply_nocache_tag, make_nocache_tag
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -142,7 +136,7 @@ def _stdin_for_scilink(
 
 
 def main() -> int:
-    ours, scilink_args = _split_argv(sys.argv[1:])
+    ours, scilink_args = split_forwarded_argv(sys.argv[1:])
     args = build_arg_parser().parse_args(ours)
 
     work_dir = args.work_dir.resolve()
@@ -166,15 +160,25 @@ def main() -> int:
 
     original_completion = litellm.completion
 
+    # No-cache arm: tag the outgoing prompt so no provider-side prefix cache can
+    # hit.  The logger strips the tag back off before writing messages.jsonl, so
+    # the recorded prompt stays byte-comparable with the cached arm.
+    nocache = os.environ.get("SCILINK_NOCACHE", "0").lower() in {"1", "true", "yes"}
+
     def completion_with_drop_params(*c_args, **c_kwargs):
         c_kwargs.setdefault("drop_params", True)
+        if nocache and c_kwargs.get("messages"):
+            c_kwargs["messages"] = apply_nocache_tag(
+                c_kwargs["messages"], make_nocache_tag()
+            )
         return original_completion(*c_args, **c_kwargs)
 
     completion_with_drop_params._pi_drop_params_patched = True  # type: ignore[attr-defined]
     litellm.completion = completion_with_drop_params
     print(
         "[analyze_codebase_scilink] litellm.drop_params=True; "
-        "completion() injects drop_params=True",
+        "completion() injects drop_params=True"
+        + ("; SCILINK_NOCACHE=1 (no-cache arm)" if nocache else ""),
         file=sys.stderr,
         flush=True,
     )

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import json
 import math
 import re
@@ -39,6 +40,11 @@ try:
         role_for_tool_call,
     )
     from agent_io_tracing.analysis.size_bins import darshan_hist
+    from agent_io_tracing.analysis.execution_units import (
+        annotate_parsed_execution_units,
+        load_execution_units,
+    )
+    from agent_io_tracing.analysis.workload_paths import workload_path_index
 except Exception:  # pragma: no cover - script still reports partial metrics
     classify_syscall = None  # type: ignore
     resource_bucket_for_syscall = None  # type: ignore
@@ -48,6 +54,9 @@ except Exception:  # pragma: no cover - script still reports partial metrics
     role_for_entry = None  # type: ignore
     role_for_tool_call = None  # type: ignore
     darshan_hist = None  # type: ignore
+    annotate_parsed_execution_units = None  # type: ignore
+    load_execution_units = None  # type: ignore
+    workload_path_index = None  # type: ignore
 
 
 DATA_SYSCALLS = {"read", "write", "pread64", "pwrite64", "readv", "writev",
@@ -64,8 +73,10 @@ OPEN_STAT_SYSCALLS = {"open", "openat", "openat2", "stat", "fstat", "lstat",
 # (small JSON files rewritten to record run/task state), as opposed to a
 # dataset/result file. Matches GenoMAS's `cohort_info.json` / `completed_tasks.json`
 # and generalizes past this one workflow via substring match, not an exact list.
-STATE_FILE_PATH_HINTS = ("cohort_info", "completed_tasks", "_state.json",
-                         "manifest.json", ".lock")
+STATE_FILE_PATH_HINTS = (
+    "state", "checkpoint", "manifest", ".ckpt", ".lock",
+    "cohort_info", "completed_tasks",
+)
 
 PAGE_CACHE_TIME_BINS = [
     (0.0, 1.0, "<1s"),
@@ -326,7 +337,7 @@ def compute_reread_attribution(parsed: dict[str, Any],
         })
         if e.get("timestamp") and (not t["first_ts"] or e["timestamp"] < t["first_ts"]):
             t["first_ts"] = e["timestamp"]
-        sz = e.get("actual_size") or e.get("requested_size") or 0
+        sz = _io_bytes(e)
         t["bytes"] += sz if isinstance(sz, (int, float)) and sz > 0 else 0
 
     by_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -397,8 +408,7 @@ def compute_bytes_ops_by_phase(parsed: dict[str, Any],
         ph = phase_for_entry(e, phases, tool_calls)
         d = by_phase[ph]
         d["ops"] += 1
-        size = e.get("actual_size") or e.get("requested_size") or e.get("bytes_transferred") or 0
-        size = size if isinstance(size, (int, float)) and size > 0 else 0
+        size = _io_bytes(e)
         if syscall in {"write", "pwrite64", "writev", "pwritev", "pwritev2"}:
             d["write_ops"] += 1
             d["write_bytes"] += size
@@ -689,6 +699,7 @@ def compute_directory_scan_count(parsed: dict[str, Any],
     hist = Counter(">=10" if c >= 10 else str(c) for c in by_path.values())
     return {
         "total_scans": len(entries),
+        "rescan_ops": sum(max(0, count - 1) for count in by_path.values()),
         "unique_directories_scanned": len(by_path),
         "rescanned_directories": sum(1 for c in by_path.values() if c > 1),
         "scans_per_dir_hist": {k: hist.get(k, 0) for k in [*(str(i) for i in range(1, 10)), ">=10"]},
@@ -696,7 +707,8 @@ def compute_directory_scan_count(parsed: dict[str, Any],
     }
 
 
-def compute_failed_open_stat_count(parsed: dict[str, Any]) -> dict[str, Any]:
+def compute_failed_open_stat_count(parsed: dict[str, Any],
+                                   artifacts: list[dict[str, Any]]) -> dict[str, Any]:
     # Denominator: every open/stat/access attempt (success or failure), used to
     # normalize the failed-probe count so traces of different length are
     # comparable. CPython import-machinery probes are excluded from both the
@@ -707,10 +719,16 @@ def compute_failed_open_stat_count(parsed: dict[str, Any]) -> dict[str, Any]:
     failed_all = 0
     import_probe_failed = 0
     agent_entries: list[dict[str, Any]] = []
+    wl_file = make_workload_filter(artifacts)
+    wl_dir = make_workload_dir_filter(artifacts)
     for e in parsed.get("fs_entries", []):
         if str(e.get("syscall")) not in OPEN_STAT_SYSCALLS:
             continue
         is_import = _is_python_import_probe(e.get("path"))
+        path = e.get("path") or ""
+        parent = str(Path(path).parent) if path else ""
+        if path and not (wl_file(path) or wl_dir(path) or wl_dir(parent)):
+            continue
         total_attempts += 1
         if not is_import:
             total_attempts_agent += 1
@@ -724,6 +742,10 @@ def compute_failed_open_stat_count(parsed: dict[str, Any]) -> dict[str, Any]:
             agent_entries.append(e)
 
     by_syscall = Counter(str(e.get("syscall")) for e in agent_entries)
+    by_errno = Counter(
+        errno.errorcode.get(abs(int(e["return_value"])), str(abs(int(e["return_value"]))))
+        for e in agent_entries
+    )
     by_path = Counter(e.get("path") for e in agent_entries if e.get("path"))
     return {
         # Agent-level (import probes excluded) — the Axis-4 exploration signal.
@@ -731,6 +753,7 @@ def compute_failed_open_stat_count(parsed: dict[str, Any]) -> dict[str, Any]:
         "failed_rate": (len(agent_entries) / total_attempts_agent
                         if total_attempts_agent else None),
         "by_syscall": dict(by_syscall),
+        "by_errno": dict(by_errno),
         "distinct_paths_involved": len(by_path),
         "top_failing_paths": by_path.most_common(5),
         # Transparency: how much interpreter noise was filtered out.
@@ -764,7 +787,7 @@ def compute_state_file_rewrite_frequency(artifacts: list[dict[str, Any]]) -> dic
     validate_and_save_cohort_info)."""
     rows = [
         a for a in artifacts
-        if any(h in (a.get("path") or "") for h in STATE_FILE_PATH_HINTS)
+        if any(h in (a.get("path") or "").lower() for h in STATE_FILE_PATH_HINTS)
     ]
     per_file = [
         {
@@ -772,24 +795,34 @@ def compute_state_file_rewrite_frequency(artifacts: list[dict[str, Any]]) -> dic
             "n_writes": int(float(a.get("n_writes") or 0)),
             "n_reads": int(float(a.get("n_reads") or 0)),
             "total_write_bytes": int(float(a.get("total_write_bytes") or 0)),
+            "total_read_bytes": int(float(a.get("total_read_bytes") or 0)),
         }
         for a in rows
     ]
     return {
         "state_shaped_files": len(per_file),
         "total_writes": sum(r["n_writes"] for r in per_file),
+        "total_reads": sum(r["n_reads"] for r in per_file),
+        "total_write_bytes": sum(r["total_write_bytes"] for r in per_file),
+        "total_read_bytes": sum(r["total_read_bytes"] for r in per_file),
         "per_file": per_file,
         "path_hints": list(STATE_FILE_PATH_HINTS),
     }
 
 
-def compute_op_ratios(parsed: dict[str, Any]) -> dict[str, Any]:
+def compute_op_ratios(parsed: dict[str, Any],
+                      artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    wl_file = make_workload_filter(artifacts)
+    wl_dir = make_workload_dir_filter(artifacts)
     entries = parsed.get("fs_entries", [])
     cats = Counter()
     storage_metadata = 0
     data_ops = 0
     for e in entries:
         syscall = str(e.get("syscall"))
+        path = e.get("path") or ""
+        if not (wl_file(path) or wl_dir(path)):
+            continue
         cat = classify_syscall(syscall) if classify_syscall else "other"
         cats[cat] += 1
         if syscall in DATA_SYSCALLS:
@@ -807,18 +840,16 @@ def compute_op_ratios(parsed: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def compute_request_size_cdf(parsed: dict[str, Any]) -> dict[str, Any]:
-    sizes = []
+def _request_size_summary(sizes: list[float]) -> dict[str, Any]:
     bytes_total = 0.0
     bytes_weighted_num = 0.0
-    for e in parsed.get("fs_entries", []):
-        if str(e.get("syscall")) not in DATA_SYSCALLS:
-            continue
-        sz = e.get("requested_size") or e.get("actual_size") or e.get("bytes_transferred")
-        if isinstance(sz, (int, float)) and sz > 0:
-            sizes.append(float(sz))
-            bytes_total += float(sz)
-            bytes_weighted_num += float(sz) * float(sz)
+    for size in sizes:
+        bytes_total += size
+        bytes_weighted_num += size * size
+    cdf = [
+        {"percentile": q, "bytes": percentile(sizes, q)}
+        for q in range(0, 101)
+    ] if sizes else []
     return {
         "count": len(sizes),
         "p50_bytes": percentile(sizes, 50),
@@ -826,9 +857,34 @@ def compute_request_size_cdf(parsed: dict[str, Any]) -> dict[str, Any]:
         "p99_bytes": percentile(sizes, 99),
         "pct_lt_4kb": pct(sizes, lambda x: x < 4096),
         "pct_lt_64kb": pct(sizes, lambda x: x < 64 * 1024),
+        "pct_lt_1mb": pct(sizes, lambda x: x < 1024 * 1024),
         "pct_lt_10mb": pct(sizes, lambda x: x < 10 * 1024 * 1024),
-        "bytes_weighted_mean_request_bytes": (bytes_weighted_num / bytes_total) if bytes_total else None,
+        "bytes_weighted_mean_request_bytes": (
+            bytes_weighted_num / bytes_total if bytes_total else None
+        ),
+        "cdf": cdf,
     }
+
+
+def compute_request_size_cdf(parsed: dict[str, Any],
+                             artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    wl = make_workload_filter(artifacts)
+    by_kind: dict[str, list[float]] = {"read": [], "write": []}
+    for e in parsed.get("fs_entries", []):
+        syscall = str(e.get("syscall"))
+        if syscall not in (READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT):
+            continue
+        if not wl(e.get("path") or ""):
+            continue
+        sz = e.get("requested_size") or e.get("actual_size") or e.get("bytes_transferred")
+        if isinstance(sz, (int, float)) and sz > 0:
+            kind = "write" if syscall in WRITE_SYSCALLS_STRICT else "read"
+            by_kind[kind].append(float(sz))
+    combined = by_kind["read"] + by_kind["write"]
+    return {**_request_size_summary(combined),
+            "read": _request_size_summary(by_kind["read"]),
+            "write": _request_size_summary(by_kind["write"]),
+            "scope": "workload artifact paths only"}
 
 
 def compute_file_size_cdf(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -849,6 +905,145 @@ def compute_file_size_cdf(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
         "pct_lt_1mb": pct(sizes, lambda x: x < 1024 * 1024),
         "pct_lt_1gb": pct(sizes, lambda x: x < 1024 ** 3),
     }
+
+
+def compute_byte_normalized_summary(
+    parsed: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    directory_scan: dict[str, Any],
+    *,
+    failed_open_stat: dict[str, Any] | None = None,
+    error_log_reads: dict[str, Any] | None = None,
+    state_files: dict[str, Any] | None = None,
+    sequentiality: dict[str, Any] | None = None,
+    same_file_reopen: dict[str, Any] | None = None,
+    lineage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Common cross-workflow counts normalized only by transferred bytes."""
+    wl = make_workload_filter(artifacts)
+    read_ops = write_ops = read_bytes = write_bytes = 0
+    for entry in parsed.get("fs_entries", []):
+        syscall = str(entry.get("syscall"))
+        if syscall not in (READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT):
+            continue
+        if not wl(entry.get("path") or ""):
+            continue
+        size = _io_bytes(entry)
+        if size <= 0:
+            continue
+        if syscall in READ_SYSCALLS_STRICT:
+            read_ops += 1
+            read_bytes += size
+        else:
+            write_ops += 1
+            write_bytes += size
+
+    read_files = sum(
+        1 for row in artifacts if int(float(row.get("n_reads") or 0)) > 0
+    )
+    written_files = sum(
+        1 for row in artifacts if int(float(row.get("n_writes") or 0)) > 0
+    )
+    total_bytes = read_bytes + write_bytes
+    gib = float(1024 ** 3)
+
+    def per_gib(count: int, denominator_bytes: int) -> float | None:
+        return count * gib / denominator_bytes if denominator_bytes > 0 else None
+
+    storage_metadata_ops = int(metadata.get("storage_metadata_ops") or 0)
+    scans = int(directory_scan.get("total_scans") or 0)
+    rescans = int(directory_scan.get("rescan_ops") or 0)
+    failed = int((failed_open_stat or {}).get("total_failed") or 0)
+    log_reads = int((error_log_reads or {}).get("total_reads") or 0)
+    state_reads = int((state_files or {}).get("total_reads") or 0)
+    state_writes = int((state_files or {}).get("total_writes") or 0)
+    merge = (sequentiality or {}).get("mergeability") or {}
+    saved_read_ops = int(((merge.get("read") or {}).get("saved_ops")) or 0)
+    saved_write_ops = int(((merge.get("write") or {}).get("saved_ops")) or 0)
+    reopen_count = int((same_file_reopen or {}).get("reopen_count") or 0)
+    reuse = (lineage or {}).get("reuse") or {}
+    dead_files = int((((reuse.get("by_class") or {}).get("dead_write") or {}).get("files")) or 0)
+    total_ops = read_ops + write_ops
+    return {
+        "denominators": {
+            "read_bytes": read_bytes,
+            "write_bytes": write_bytes,
+            "total_io_bytes": total_bytes,
+        },
+        "absolute": {
+            "read_ops": read_ops,
+            "write_ops": write_ops,
+            "storage_metadata_ops": storage_metadata_ops,
+            "directory_scans": scans,
+            "directory_rescans": rescans,
+            "failed_open_stat_access": failed,
+            "error_log_reads": log_reads,
+            "state_file_reads": state_reads,
+            "state_file_writes": state_writes,
+            "same_file_reopens": reopen_count,
+            "mergeable_saved_read_ops": saved_read_ops,
+            "mergeable_saved_write_ops": saved_write_ops,
+            "dead_files": dead_files,
+            "read_files": read_files,
+            "written_files": written_files,
+        },
+        "normalized": {
+            "read_ops_per_gib_read": per_gib(read_ops, read_bytes),
+            "write_ops_per_gib_write": per_gib(write_ops, write_bytes),
+            "storage_metadata_ops_per_gib_total_io": per_gib(
+                storage_metadata_ops, total_bytes
+            ),
+            "directory_scans_per_gib_total_io": per_gib(scans, total_bytes),
+            "directory_rescans_per_gib_total_io": per_gib(rescans, total_bytes),
+            "failed_open_stat_access_per_gib_total_io": per_gib(failed, total_bytes),
+            "error_log_reads_per_gib_read": per_gib(log_reads, read_bytes),
+            "state_file_reads_per_gib_read": per_gib(state_reads, read_bytes),
+            "state_file_writes_per_gib_write": per_gib(state_writes, write_bytes),
+            "same_file_reopens_per_gib_read": per_gib(reopen_count, read_bytes),
+            "mergeable_saved_read_ops_per_gib_read": per_gib(saved_read_ops, read_bytes),
+            "mergeable_saved_write_ops_per_gib_write": per_gib(saved_write_ops, write_bytes),
+            "dead_files_per_gib_write": per_gib(dead_files, write_bytes),
+            "read_files_per_gib_read": per_gib(read_files, read_bytes),
+            "written_files_per_gib_write": per_gib(written_files, write_bytes),
+        },
+        "shares": {
+            "read_byte_pct": 100.0 * read_bytes / total_bytes if total_bytes else None,
+            "write_byte_pct": 100.0 * write_bytes / total_bytes if total_bytes else None,
+            "read_op_pct": 100.0 * read_ops / total_ops if total_ops else None,
+            "write_op_pct": 100.0 * write_ops / total_ops if total_ops else None,
+        },
+        "zero_denominator_rule": "N/A",
+    }
+
+
+def add_byte_normalized_breakdowns(metrics: dict[str, Any]) -> None:
+    """Attach the frozen run-level byte denominators to phase/interface cuts."""
+    denominators = (metrics.get("byte_normalized_summary") or {}).get("denominators") or {}
+    read_bytes = int(denominators.get("read_bytes") or 0)
+    write_bytes = int(denominators.get("write_bytes") or 0)
+    total_bytes = read_bytes + write_bytes
+    gib = float(1024 ** 3)
+
+    def rate(count: Any, denominator: int) -> float | None:
+        value = int(count or 0)
+        return value * gib / denominator if denominator else None
+
+    for values in (metrics.get("bytes_ops_by_phase") or {}).values():
+        values["read_ops_per_gib_read"] = rate(values.get("read_ops"), read_bytes)
+        values["write_ops_per_gib_write"] = rate(values.get("write_ops"), write_bytes)
+        values["read_byte_share_pct"] = (
+            100.0 * float(values.get("read_bytes") or 0) / read_bytes if read_bytes else None
+        )
+        values["write_byte_share_pct"] = (
+            100.0 * float(values.get("write_bytes") or 0) / write_bytes if write_bytes else None
+        )
+
+    layers = ((metrics.get("measured_interface_layers") or {}).get("layers") or {})
+    for values in layers.values():
+        values["read_ops_per_gib_read"] = rate(values.get("read_ops"), read_bytes)
+        values["write_ops_per_gib_write"] = rate(values.get("write_ops"), write_bytes)
+        values["ops_per_gib_total_io"] = rate(values.get("ops"), total_bytes)
 
 
 def compute_fs_io_non_llm(parsed: dict[str, Any], pi_summary: dict[str, Any],
@@ -884,9 +1079,9 @@ def make_workload_filter(artifacts: list[dict[str, Any]]):
     that path set makes the analysis env-independent and guarantees it matches
     the per-syscall histogram exactly. Falls back to is_workload_artifact (env
     prefixes) only when artifacts.csv is missing/empty."""
-    workload_paths = {row.get("path") for row in artifacts if row.get("path")}
-    if workload_paths:
-        return lambda p: p in workload_paths
+    index = workload_path_index(artifacts) if workload_path_index else None
+    if index and index.files:
+        return index.is_file
     if is_workload_artifact is not None:
         return is_workload_artifact
     return lambda _p: True
@@ -896,19 +1091,25 @@ def make_workload_dir_filter(artifacts: list[dict[str, Any]]):
     """Predicate for DIRECTORY paths (getdents), which are never in artifacts.csv
     (that lists files). A directory is workload iff some workload file lives under
     it. Env-independent, same source of truth as make_workload_filter."""
-    workload_paths = {row.get("path") for row in artifacts if row.get("path")}
-    if not workload_paths:
+    index = workload_path_index(artifacts) if workload_path_index else None
+    if not index or not index.files:
         if is_workload_artifact is not None:
             return is_workload_artifact
         return lambda _p: True
+    return index.is_directory
 
-    def _is_workload_dir(d: str) -> bool:
-        if not d:
-            return False
-        prefix = d.rstrip("/") + "/"
-        return any(f == d or f.startswith(prefix) for f in workload_paths)
 
-    return _is_workload_dir
+def _scoped_parsed(
+    parsed: dict[str, Any], predicate
+) -> dict[str, Any]:
+    """Shallow parsed view whose filesystem entries already match a scope."""
+    return {
+        **parsed,
+        "fs_entries": [
+            entry for entry in parsed.get("fs_entries", [])
+            if predicate(entry.get("path") or "")
+        ],
+    }
 
 
 def compute_analytical_optimum(parsed: dict[str, Any],
@@ -1154,6 +1355,13 @@ def compute_sequentiality(parsed: dict[str, Any],
     )
     if not ops_with_offset:
         note += " No offset-bearing data operations were available in this parsed trace."
+    merge_all = mergeability(streams_tid)
+    merge_all["read"] = mergeability({
+        key: value for key, value in streams_tid.items() if key[0] == "read"
+    })
+    merge_all["write"] = mergeability({
+        key: value for key, value in streams_tid.items() if key[0] == "write"
+    })
     return {
         "eligible_data_ops": eligible_ops,
         "ops_with_offset": ops_with_offset,
@@ -1167,7 +1375,7 @@ def compute_sequentiality(parsed: dict[str, Any],
         "four_cell_pct": four_cell_pct,
         "by_stream_tid_fd_open_generation": tid_classified,
         "by_stream_pid_fd_open_generation": pid_classified,
-        "mergeability": mergeability(streams_tid),
+        "mergeability": merge_all,
         "note": note,
     }
 
@@ -1221,7 +1429,8 @@ def compute_access_type_rhwhrw(artifacts: list[dict[str, Any]]) -> dict[str, Any
 
 
 def inter_arrival_deltas(parsed: dict[str, Any],
-                         artifacts: list[dict[str, Any]]) -> tuple[list[float], int]:
+                         artifacts: list[dict[str, Any]],
+                         syscalls: set[str] | None = None) -> tuple[list[float], int]:
     """Raw per-file inter-access time gaps (seconds) and the number of files
     that were re-accessed. An access is any data syscall carrying a path;
     consecutive identical timestamps on one file (buffered reads on one fd)
@@ -1234,11 +1443,11 @@ def inter_arrival_deltas(parsed: dict[str, Any],
     _wl = make_workload_filter(artifacts)
     ts_by_path: dict[str, list[float]] = defaultdict(list)
     for e in parsed.get("fs_entries", []):
-        if str(e.get("syscall")) not in DATA_SYSCALLS:
+        syscall = str(e.get("syscall"))
+        if syscall not in (syscalls or DATA_SYSCALLS):
             continue
         path = e.get("path")
-        ts = e.get("timestamp")
-        if not isinstance(path, str) or not isinstance(ts, str):
+        if not isinstance(path, str):
             continue
         if not _wl(path):
             continue
@@ -1261,8 +1470,8 @@ def compute_inter_arrival(parsed: dict[str, Any],
                           artifacts: list[dict[str, Any]]) -> dict[str, Any]:
     """Axis 1: distribution of the time gap (seconds) between successive
     accesses to the same file (Patel FAST'20 Fig. 5a/6b analogue)."""
-    deltas, files_reaccessed = inter_arrival_deltas(parsed, artifacts)
-    return {
+    def summarize(deltas: list[float], files_reaccessed: int) -> dict[str, Any]:
+        return {
         "files_with_repeat_access": files_reaccessed,
         "n_intervals": len(deltas),
         "hist": page_cache_time_hist(deltas),
@@ -1276,6 +1485,69 @@ def compute_inter_arrival(parsed: dict[str, Any],
         "p99_s": percentile(deltas, 99),
         "mean_s": (sum(deltas) / len(deltas)) if deltas else None,
         "pct_lt_1s": pct(deltas, lambda x: x < 1.0),
+        }
+
+    deltas, files_reaccessed = inter_arrival_deltas(parsed, artifacts)
+    read_deltas, read_files = inter_arrival_deltas(
+        parsed, artifacts, READ_SYSCALLS_STRICT
+    )
+    write_deltas, write_files = inter_arrival_deltas(
+        parsed, artifacts, WRITE_SYSCALLS_STRICT
+    )
+    return {
+        **summarize(deltas, files_reaccessed),
+        "read": summarize(read_deltas, read_files),
+        "write": summarize(write_deltas, write_files),
+    }
+
+
+def compute_same_file_reopen(parsed: dict[str, Any],
+                             artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Universal reread signal independent of agent backtrack labels.
+
+    A read touch is one distinct (pid, fd, open_generation) stream. The first
+    touch of a file establishes use; later streams are same-file reopens.
+    """
+    wl = make_workload_filter(artifacts)
+    streams: dict[tuple[str, Any, Any, Any], dict[str, Any]] = {}
+    for entry in parsed.get("fs_entries", []):
+        if str(entry.get("syscall")) not in READ_SYSCALLS_STRICT:
+            continue
+        path = entry.get("path") or ""
+        if not wl(path):
+            continue
+        size = _io_bytes(entry)
+        if size <= 0:
+            continue
+        key = (
+            path, entry.get("pid"), entry.get("file_descriptor"),
+            entry.get("open_generation"),
+        )
+        row = streams.setdefault(key, {"path": path, "first_ts": None, "bytes": 0})
+        ts = _entry_end_s(entry)
+        if ts is not None and (row["first_ts"] is None or ts < row["first_ts"]):
+            row["first_ts"] = ts
+        row["bytes"] += size
+    by_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in streams.values():
+        by_path[row["path"]].append(row)
+    reopen_count = reopen_bytes = files_reopened = 0
+    for touches in by_path.values():
+        touches.sort(key=lambda row: float(row["first_ts"] or 0.0))
+        if len(touches) <= 1:
+            continue
+        files_reopened += 1
+        reopen_count += len(touches) - 1
+        reopen_bytes += sum(int(row["bytes"]) for row in touches[1:])
+    total_read_bytes = sum(int(row["bytes"]) for row in streams.values())
+    return {
+        "files_reopened": files_reopened,
+        "reopen_count": reopen_count,
+        "reopen_read_bytes": reopen_bytes,
+        "reopen_read_byte_share_pct": (
+            100.0 * reopen_bytes / total_read_bytes if total_read_bytes else None
+        ),
+        "definition": "subsequent distinct (pid,fd,open_generation) read streams per file",
     }
 
 
@@ -1336,8 +1608,7 @@ def _binned_series(parsed: dict[str, Any], window_s: float,
         t = _entry_end_s(e)
         if t is None:
             continue
-        sz = e.get("actual_size") or e.get("requested_size") or e.get("bytes_transferred") or 0
-        points.append((t, float(sz) if isinstance(sz, (int, float)) and sz > 0 else 0.0))
+        points.append((t, float(_io_bytes(e))))
     if not points and not timeline:
         return []
     if timeline and timeline.get("wall_s"):
@@ -1399,13 +1670,15 @@ def compute_io_autocorrelation(parsed: dict[str, Any],
 
 
 def compute_intensity_phases(parsed: dict[str, Any],
+                             artifacts: list[dict[str, Any]],
                              timeline: dict[str, Any] | None = None,
                              window_s: float = 60.0) -> dict[str, Any]:
     """Axis 5: high/low-intensity I/O phase segmentation. Bin total I/O bytes
     into fixed windows, threshold at the 75th/25th percentile of non-empty bins,
     and segment consecutive high / low bins (Patel SC'19 Fig. 7/8)."""
     series = _binned_series(parsed, window_s, timeline,
-                            READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT)
+                            READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT,
+                            artifacts)
     nonzero = [x for x in series if x > 0]
     if len(nonzero) < 4:
         return {"n_bins": len(series), "note": "too few active bins to segment"}
@@ -1440,6 +1713,61 @@ def compute_intensity_phases(parsed: dict[str, Any],
             "count": len(lo_segs),
             "mean_len_bins": (sum(lo_segs) / len(lo_segs)) if lo_segs else None,
             "max_len_bins": max(lo_segs) if lo_segs else 0,
+        },
+    }
+
+
+def compute_burst_summary(parsed: dict[str, Any],
+                          artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Universal I/O bursts at explicit 1/10/60-second idle-gap thresholds."""
+    wl = make_workload_filter(artifacts)
+    intervals = sorted(
+        interval
+        for entry in parsed.get("fs_entries", [])
+        if str(entry.get("syscall")) in (READ_SYSCALLS_STRICT | WRITE_SYSCALLS_STRICT)
+        and wl(entry.get("path") or "")
+        and _io_bytes(entry) > 0
+        and (interval := _entry_interval_ms(entry)) is not None
+    )
+
+    def summarize(threshold_s: float) -> dict[str, Any]:
+        if not intervals:
+            return {"count": 0, "duration_s": {}, "gap_s": {}, "duty_cycle": None}
+        bursts: list[tuple[float, float]] = []
+        gaps: list[float] = []
+        start, previous_end = intervals[0]
+        for interval_start, interval_end in intervals[1:]:
+            gap_ms = interval_start - previous_end
+            if gap_ms > threshold_s * 1000.0:
+                bursts.append((start, previous_end))
+                gaps.append(gap_ms / 1000.0)
+                start = interval_start
+            previous_end = max(previous_end, interval_end)
+        bursts.append((start, previous_end))
+        durations = [max(0.0, end - start) / 1000.0 for start, end in bursts]
+        wall = max(0.0, intervals[-1][1] - intervals[0][0]) / 1000.0
+        active = sum(durations)
+        return {
+            "count": len(bursts),
+            "duration_s": {
+                "p50": percentile(durations, 50),
+                "p95": percentile(durations, 95),
+                "max": max(durations) if durations else None,
+            },
+            "gap_s": {
+                "p50": percentile(gaps, 50),
+                "p95": percentile(gaps, 95),
+                "max": max(gaps) if gaps else None,
+            },
+            "duty_cycle": active / wall if wall > 0 else None,
+        }
+
+    return {
+        "definitions": "bursts are separated by an idle gap greater than the named threshold",
+        "by_idle_gap_threshold": {
+            "1s": summarize(1.0),
+            "10s": summarize(10.0),
+            "60s": summarize(60.0),
         },
     }
 
@@ -1487,7 +1815,7 @@ def _interval_overlap_ms(a: tuple[float, float], b: tuple[float, float]) -> floa
 
 
 def _io_bytes(entry: dict[str, Any]) -> int:
-    value = entry.get("bytes_transferred") or entry.get("actual_size") or entry.get("requested_size") or 0
+    value = entry.get("bytes_transferred") or entry.get("actual_size") or 0
     return int(value) if isinstance(value, (int, float)) and value > 0 else 0
 
 
@@ -1704,7 +2032,9 @@ def _bandwidth_stats(items: list[tuple[float, float, int]],
                      wall_s: float | None = None) -> dict[str, Any]:
     if not items:
         return {"ops": 0, "bytes": 0, "io_time_s": 0.0, "busy_time_s": 0.0,
-                "wall_s": float(wall_s or 0.0), "effective_Bps": None, "aggregate_Bps": None,
+                "wall_s": float(wall_s or 0.0), "active_Bps": None,
+                "wall_Bps": None, "syscall_sum_Bps": None,
+                "effective_Bps": None, "aggregate_Bps": None,
                 "duty_cycle": None, "effective_reliable": False,
                 "effective_unreliable_reason": "no operations"}
     intervals = [(s, e) for s, e, _ in items]
@@ -1713,25 +2043,34 @@ def _bandwidth_stats(items: list[tuple[float, float, int]],
     busy_s = _union_length_ms(intervals) / 1000.0
     if wall_s is None:
         wall_s = (max(e for _, e, _ in items) - min(s for s, _, _ in items)) / 1000.0
-    effective_reliable = len(items) >= MIN_EFFECTIVE_BW_OPS and io_time_s >= MIN_EFFECTIVE_BW_IO_TIME_S
+    effective_reliable = len(items) >= MIN_EFFECTIVE_BW_OPS and busy_s >= MIN_EFFECTIVE_BW_IO_TIME_S
     unreliable_reason = None
     if not effective_reliable:
         if len(items) < MIN_EFFECTIVE_BW_OPS:
             unreliable_reason = f"ops<{MIN_EFFECTIVE_BW_OPS}"
-        if io_time_s < MIN_EFFECTIVE_BW_IO_TIME_S:
-            suffix = f"io_time_s<{MIN_EFFECTIVE_BW_IO_TIME_S:g}"
+        if busy_s < MIN_EFFECTIVE_BW_IO_TIME_S:
+            suffix = f"busy_time_s<{MIN_EFFECTIVE_BW_IO_TIME_S:g}"
             unreliable_reason = f"{unreliable_reason}; {suffix}" if unreliable_reason else suffix
+    active_bps = bytes_total / busy_s if effective_reliable and busy_s > 0 else None
+    wall_bps = bytes_total / wall_s if wall_s > 0 else None
+    syscall_sum_bps = bytes_total / io_time_s if io_time_s > 0 else None
     return {
         "ops": len(items),
         "bytes": bytes_total,
         "io_time_s": io_time_s,
         "busy_time_s": busy_s,
         "wall_s": wall_s,
-        "effective_Bps": bytes_total / io_time_s if effective_reliable else None,
-        "aggregate_Bps": bytes_total / busy_s if busy_s > 0 else None,
+        "active_Bps": active_bps,
+        "wall_Bps": wall_bps,
+        "syscall_sum_Bps": syscall_sum_bps,
+        # Preserve the pre-existing names for downstream readers. New code
+        # should use the explicitly defined active/wall/syscall_sum fields.
+        "effective_Bps": syscall_sum_bps if effective_reliable else None,
+        "aggregate_Bps": active_bps,
         "duty_cycle": busy_s / wall_s if wall_s > 0 else None,
         "effective_reliable": effective_reliable,
         "effective_unreliable_reason": unreliable_reason,
+        "definition": "active=bytes/I-O-busy union; wall=bytes/wall; syscall_sum=bytes/sum syscall durations",
     }
 
 
@@ -1943,10 +2282,18 @@ def write_markdown(trace_dir: Path, metrics: dict[str, Any]) -> None:
 
 def build_metrics(trace_dir: Path, optimal_request_bytes: int) -> dict[str, Any]:
     parsed = load_json(trace_dir / "parsed.json", {})
+    if annotate_parsed_execution_units and load_execution_units:
+        annotate_parsed_execution_units(parsed, load_execution_units(trace_dir))
     pi_summary = load_json(trace_dir / "pi_summary.json", {})
     manifest = load_json(trace_dir / "manifest.json", {})
     lineage = load_json(trace_dir / "lineage" / "io_summary.json", {})
     artifacts = read_artifacts(trace_dir)
+    wl_file = make_workload_filter(artifacts)
+    wl_dir = make_workload_dir_filter(artifacts)
+    workload_parsed = _scoped_parsed(parsed, wl_file)
+    workload_scope_parsed = _scoped_parsed(
+        parsed, lambda path: wl_file(path) or wl_dir(path)
+    )
     phases = read_event_phase_index(trace_dir)
     tool_calls = build_tool_call_map(parsed)
     timeline = _run_timeline_ms(trace_dir, parsed, phases, tool_calls)
@@ -1956,37 +2303,67 @@ def build_metrics(trace_dir: Path, optimal_request_bytes: int) -> dict[str, Any]
         aggregate_io_api(generated_code) if aggregate_io_api and generated_code.is_file()
         else {}
     )
+    metadata_data_ratio = compute_op_ratios(workload_scope_parsed, artifacts)
+    request_size_cdf = compute_request_size_cdf(workload_parsed, artifacts)
+    directory_scan = compute_directory_scan_count(workload_scope_parsed, artifacts)
+    failed_open_stat = compute_failed_open_stat_count(parsed, artifacts)
+    error_log_reads = compute_error_log_reads(artifacts)
+    state_files = compute_state_file_rewrite_frequency(artifacts)
+    # Keep the full entry stream here because the metric reports excluded
+    # non-workload operations as part of its diagnostic output.
+    sequentiality = compute_sequentiality(parsed, artifacts)
+    same_file_reopen = compute_same_file_reopen(workload_parsed, artifacts)
 
     metrics = {
         "trace_dir": str(trace_dir),
         "manifest": manifest,
-        "metadata_data_ratio": compute_op_ratios(parsed),
-        "request_size_cdf": compute_request_size_cdf(parsed),
+        "metadata_data_ratio": metadata_data_ratio,
+        "request_size_cdf": request_size_cdf,
         "file_size_cdf": compute_file_size_cdf(artifacts),
         "latency_by_phase": compute_latency_by_phase(parsed, phases),
         "fs_io_non_llm": compute_fs_io_non_llm(parsed, pi_summary, manifest),
         "analytical_optimum_amplification": compute_analytical_optimum(
-            parsed, artifacts, optimal_request_bytes
+            workload_parsed, artifacts, optimal_request_bytes
         ),
         "interface_mix": interface_mix,
         "interface_byte_mix": compute_interface_byte_mix(parsed, artifacts),
         "measured_interface_layers": compute_measured_interface_layers(parsed, artifacts),
         "namespace": lineage.get("namespace", {}),
-        "sequentiality": compute_sequentiality(parsed, artifacts),
-        "bytes_ops_by_phase": compute_bytes_ops_by_phase(parsed, phases, artifacts),
-        "reread_attribution": compute_reread_attribution(parsed, phases, artifacts),
-        "directory_scan": compute_directory_scan_count(parsed, artifacts),
-        "failed_open_stat": compute_failed_open_stat_count(parsed),
-        "error_log_reads": compute_error_log_reads(artifacts),
-        "state_file_rewrite_frequency": compute_state_file_rewrite_frequency(artifacts),
+        "sequentiality": sequentiality,
+        "bytes_ops_by_phase": compute_bytes_ops_by_phase(workload_parsed, phases, artifacts),
+        "reread_attribution": compute_reread_attribution(workload_parsed, phases, artifacts),
+        "directory_scan": directory_scan,
+        "failed_open_stat": failed_open_stat,
+        "error_log_reads": error_log_reads,
+        "state_file_rewrite_frequency": state_files,
+        "same_file_reopen": same_file_reopen,
         # Newly implemented axis metrics (data-derived, no oracle required)
         "access_type_rhwhrw": compute_access_type_rhwhrw(artifacts),          # axis 2
-        "inter_arrival": compute_inter_arrival(parsed, artifacts),             # axis 2
-        "io_autocorrelation": compute_io_autocorrelation(parsed, artifacts),  # axis 6
-        "intensity_phases": compute_intensity_phases(parsed, timeline),       # axis 6
-        "io_vs_inference": compute_io_vs_inference(trace_dir, parsed, artifacts, timeline),
-        "effective_bandwidth": compute_effective_bandwidth(trace_dir, parsed, phases, artifacts, timeline),
+        "inter_arrival": compute_inter_arrival(workload_parsed, artifacts),             # axis 2
+        "io_autocorrelation": compute_io_autocorrelation(workload_parsed, artifacts),  # axis 6
+        "intensity_phases": compute_intensity_phases(workload_parsed, artifacts, timeline),  # axis 6
+        "burst_summary": compute_burst_summary(workload_parsed, artifacts),
+        "io_vs_inference": compute_io_vs_inference(trace_dir, workload_parsed, artifacts, timeline),
+        "effective_bandwidth": compute_effective_bandwidth(trace_dir, workload_parsed, phases, artifacts, timeline),
     }
+    metrics["byte_normalized_summary"] = compute_byte_normalized_summary(
+        workload_parsed, artifacts, metadata_data_ratio, directory_scan,
+        failed_open_stat=failed_open_stat,
+        error_log_reads=error_log_reads,
+        state_files=state_files,
+        sequentiality=sequentiality,
+        same_file_reopen=same_file_reopen,
+        lineage=lineage,
+    )
+    metrics["comparison_schema"] = {
+        "version": 1,
+        "zero_denominator": "N/A",
+        "read_count_denominator": "actual transferred read bytes",
+        "write_count_denominator": "actual transferred write bytes",
+        "shared_count_denominator": "actual transferred read bytes + write bytes",
+        "distribution_normalization": None,
+    }
+    add_byte_normalized_breakdowns(metrics)
     # axis 4: assembled from bytes_ops_by_phase (already computed above) + reuse
     metrics["exploration_overhead"] = compute_exploration_overhead(
         metrics["bytes_ops_by_phase"], artifacts

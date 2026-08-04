@@ -51,6 +51,15 @@ GENOMAS_GIT_REF="${GENOMAS_GIT_REF:-main}"
 # Drive — see the END_OF_DEPLOY_NOTES section at the bottom.
 REMOTE_DATA_DIR="${REMOTE_DATA_DIR_GENOMAS:-${MOUNT_PATH}/genomas_data}"
 
+# cloudlab_env.sh keeps SciLink/OpenAI and GenoMAS/FreeInference credentials
+# separate.  Prefer the dedicated GenoMAS variables while retaining the old
+# generic names as a compatibility fallback.
+OPENAI_API_KEY="${GENOMAS_OPENAI_API_KEY:-${OPENAI_API_KEY:-}}"
+if [ -n "${GENOMAS_BASE_URL:-}" ]; then
+    OPENAI_BASE_URL="$GENOMAS_BASE_URL"
+    OPENAI_API_BASE="$GENOMAS_BASE_URL"
+fi
+
 # ----------------------------------------------------------------
 # Pre-flight (local)
 # ----------------------------------------------------------------
@@ -88,9 +97,10 @@ echo "  Lustre mount OK: $MOUNT_PATH"
 # Three user-owned subdirs on Lustre (root of $MOUNT_PATH is owned by root,
 # can't be chmod'd; we instead create per-project siblings and chown them):
 #   - $REMOTE_DATA_DIR             : GenoMAS input data (GEO/, TCGA/)
-#   - $MOUNT_PATH/genomas_venv     : Python venv (kept separate from data
-#                                    tree so we can tar the data tree alone
-#                                    as evidence)
+#   - $MOUNT_PATH/genomas_venv     : user-owned venv container; the actual
+#                                    environment is in genomas_venv/venv so
+#                                    uv --clear never has to unlink a child of
+#                                    the root-owned Lustre mount directory
 #   - $MOUNT_PATH/genomas_output   : GenoMAS ./output symlink target
 #   - $MOUNT_PATH/$SSH_USER/pi-ebpf-tracing-handoff/results : trace outputs
 #   - $MOUNT_PATH/uv_cache_genomas : uv wheel cache (deduplicated across
@@ -187,9 +197,10 @@ echo "  GenoMAS output -> \$(readlink -f output)"
 # Writability test targets genomas_data (user-owned subdir), not the mount
 # root (which is root-owned and would always fail).
 if grep -qE "[[:space:]]/mnt/lustrefs[[:space:]]" /proc/mounts && [ -w /mnt/lustrefs/genomas_data ]; then
-    VENV_DIR=/mnt/lustrefs/genomas_venv
+    VENV_ROOT=/mnt/lustrefs/genomas_venv
+    VENV_DIR="\$VENV_ROOT/venv"
     export UV_CACHE_DIR=/mnt/lustrefs/uv_cache_genomas
-    mkdir -p "\$UV_CACHE_DIR"
+    mkdir -p "\$VENV_ROOT" "\$UV_CACHE_DIR"
     echo "  venv:     \$VENV_DIR (Lustre)"
     echo "  uv cache: \$UV_CACHE_DIR (Lustre)"
 else
@@ -216,8 +227,8 @@ uv pip install --python .venv/bin/python -r requirements.txt
 
 # Post-processing extras for visualize_strace.py (Phase 3).  pandas/numpy/
 # matplotlib are already in requirements.txt; only plotly is extra.
-echo "  Installing visualization extras (plotly)..."
-uv pip install --python .venv/bin/python plotly
+echo "  Installing tracing analysis dependencies..."
+uv pip install --python .venv/bin/python Markdown plotly tiktoken
 
 # Smoke imports.  These are the imports main.py does at module load time.
 # If any of these fail, no point continuing.

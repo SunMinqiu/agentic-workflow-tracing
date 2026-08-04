@@ -9,10 +9,12 @@ description = "Agent-aware workflow I/O tracing and characterization toolkit."
 readme = "Overview.md"
 requires-python = ">=3.10"
 dependencies = [
+  "Markdown",
   "matplotlib",
   "numpy",
   "pandas",
   "plotly",
+  "tiktoken",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +40,7 @@ agent-trace-stage-geo = "agent_io_tracing.experiments.stage_geo_view:main"
 agent-trace-w0 = "agent_io_tracing.experiments.w0_microbench:main"
 agent-trace-manifest = "agent_io_tracing.experiments.run_manifest:main"
 agent-trace-lustre-counters = "agent_io_tracing.tracing.lustre_counters:main"
+agent-trace-kvcache = "agent_io_tracing.analysis.kvcache.report:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

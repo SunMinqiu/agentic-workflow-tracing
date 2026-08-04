@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ ANNOTATION_VCF = (
 @dataclass(frozen=True)
 class Task:
     name: str
+    stage: str
     command: tuple[str, ...]
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
@@ -35,6 +37,9 @@ class TaskResult:
     returncode: int
     outputs: dict[str, Path]
     error: str | None = None
+    pid: int | None = None
+    start_ts_ms: float | None = None
+    end_ts_ms: float | None = None
 
 
 def _csv(value: str) -> list[str]:
@@ -58,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--individual-jobs", type=int, default=2)
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--rows-per-chromosome", type=int, default=250_000)
+    parser.add_argument(
+        "--execution-units-log",
+        type=Path,
+        help="Write one JSONL record per task for PID/time I/O attribution.",
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--main-vcf-template", default=MAIN_VCF)
     parser.add_argument("--annotation-vcf-template", default=ANNOTATION_VCF)
@@ -139,6 +149,7 @@ def build_tasks(args: argparse.Namespace, repo: Path) -> tuple[list[Task], set[s
             tasks.append(
                 Task(
                     name=task_name,
+                    stage="individuals",
                     command=(
                         python,
                         scripts["individuals"],
@@ -161,6 +172,7 @@ def build_tasks(args: argparse.Namespace, repo: Path) -> tuple[list[Task], set[s
         tasks.append(
             Task(
                 name=sift_name,
+                stage="sifting",
                 command=(python, scripts["sifting"], annotation_vcf, chromosome),
                 inputs=(annotation_vcf,),
                 outputs=(sifted_output,),
@@ -172,6 +184,7 @@ def build_tasks(args: argparse.Namespace, repo: Path) -> tuple[list[Task], set[s
         tasks.append(
             Task(
                 name=merge_name,
+                stage="individuals_merge",
                 command=(
                     python,
                     scripts["individuals_merge"],
@@ -191,6 +204,7 @@ def build_tasks(args: argparse.Namespace, repo: Path) -> tuple[list[Task], set[s
                 (
                     Task(
                         name=f"chr{chromosome}_mutation_overlap_{population}",
+                        stage="mutation_overlap",
                         command=(
                             python,
                             scripts["mutation_overlap"],
@@ -205,6 +219,7 @@ def build_tasks(args: argparse.Namespace, repo: Path) -> tuple[list[Task], set[s
                     ),
                     Task(
                         name=f"chr{chromosome}_frequency_{population}",
+                        stage="frequency",
                         command=(
                             python,
                             scripts["frequency"],
@@ -232,6 +247,8 @@ def _safe_task_dir(tasks_dir: Path, name: str) -> Path:
 
 
 def _run_task(task: Task, tasks_dir: Path, inputs: dict[str, Path]) -> TaskResult:
+    start_ts_ms = time.time() * 1000.0
+    pid: int | None = None
     try:
         task_dir = _safe_task_dir(tasks_dir, task.name)
         for logical_name in task.inputs:
@@ -241,15 +258,19 @@ def _run_task(task: Task, tasks_dir: Path, inputs: dict[str, Path]) -> TaskResul
         with (task_dir / "stdout.log").open("w", encoding="utf-8") as stdout, (
             task_dir / "stderr.log"
         ).open("w", encoding="utf-8") as stderr:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 task.command,
                 cwd=task_dir,
                 stdout=stdout,
                 stderr=stderr,
-                check=False,
             )
-        if completed.returncode:
-            return TaskResult(task, completed.returncode, {}, "task process failed")
+            pid = process.pid
+            returncode = process.wait()
+        end_ts_ms = time.time() * 1000.0
+        if returncode:
+            return TaskResult(
+                task, returncode, {}, "task process failed", pid, start_ts_ms, end_ts_ms
+            )
         output_paths: dict[str, Path] = {}
         missing: list[str] = []
         for logical_name in task.outputs:
@@ -260,14 +281,15 @@ def _run_task(task: Task, tasks_dir: Path, inputs: dict[str, Path]) -> TaskResul
                 missing.append(logical_name)
         if missing:
             return TaskResult(
-                task,
-                1,
-                output_paths,
+                task, 1, output_paths,
                 "declared output(s) missing: " + ", ".join(missing),
+                pid, start_ts_ms, end_ts_ms,
             )
-        return TaskResult(task, 0, output_paths)
+        return TaskResult(task, 0, output_paths, None, pid, start_ts_ms, end_ts_ms)
     except Exception as exc:
-        return TaskResult(task, 1, {}, str(exc))
+        return TaskResult(
+            task, 1, {}, str(exc), pid, start_ts_ms, time.time() * 1000.0
+        )
 
 
 def _register_artifact(artifacts_dir: Path, logical_name: str, source: Path) -> None:
@@ -284,6 +306,7 @@ def run_dag(
     max_workers: int,
     *,
     offline: bool = False,
+    execution_units_log: Path | None = None,
 ) -> int:
     tasks_dir = work_dir / "tasks"
     artifacts_dir = work_dir / "artifacts"
@@ -302,6 +325,7 @@ def run_dag(
     completed: set[str] = set()
     running: dict[Future[TaskResult], Task] = {}
     failures: list[dict[str, object]] = []
+    execution_units: list[dict[str, object]] = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         while pending or running:
@@ -339,6 +363,21 @@ def run_dag(
             for future in done:
                 task = running.pop(future)
                 result = future.result()
+                execution_units.append(
+                    {
+                        "execution_unit_id": task.name,
+                        "task_id": task.name,
+                        "stage": task.stage,
+                        "pid": result.pid,
+                        "start_ts_ms": result.start_ts_ms,
+                        "end_ts_ms": result.end_ts_ms,
+                        "status": "completed" if result.returncode == 0 else "failed",
+                        "returncode": result.returncode,
+                        "dependencies": list(task.dependencies),
+                        "inputs": list(task.inputs),
+                        "outputs": list(task.outputs),
+                    }
+                )
                 if result.returncode:
                     message = result.error or f"exit code {result.returncode}"
                     failures.append(
@@ -375,6 +414,12 @@ def run_dag(
     (work_dir / "classic_run_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
+    units_path = execution_units_log or (work_dir / "execution_units.jsonl")
+    units_path.parent.mkdir(parents=True, exist_ok=True)
+    units_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in execution_units),
+        encoding="utf-8",
+    )
     return 1 if failures else 0
 
 
@@ -400,6 +445,7 @@ def main(argv: list[str] | None = None) -> int:
             work_dir,
             args.max_workers,
             offline=args.offline,
+            execution_units_log=args.execution_units_log,
         )
     except (OSError, ValueError) as exc:
         print(f"[1000genome-driver] setup failed: {exc}", file=sys.stderr)

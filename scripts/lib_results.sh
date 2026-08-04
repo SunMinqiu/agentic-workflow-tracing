@@ -43,6 +43,95 @@ require_lustre_base_out() {
     fi
 }
 
+workload_selected() {
+    local name="$1"
+    local selection="${RUN_WORKLOADS:-}"
+    [ -z "$selection" ] && return 0
+    local item
+    local old_ifs="$IFS"
+    IFS=','
+    for item in $selection; do
+        item="${item#"${item%%[![:space:]]*}"}"
+        item="${item%"${item##*[![:space:]]}"}"
+        if [ "$item" = "$name" ]; then
+            IFS="$old_ifs"
+            return 0
+        fi
+    done
+    IFS="$old_ifs"
+    return 1
+}
+
+validate_workload_selection() {
+    [ -z "${RUN_WORKLOADS:-}" ] && return 0
+    local requested entry available="" found
+    local old_ifs="$IFS"
+    for entry in "$@"; do
+        available="$available ${entry%%|*}"
+    done
+    IFS=','
+    for requested in $RUN_WORKLOADS; do
+        requested="${requested#"${requested%%[![:space:]]*}"}"
+        requested="${requested%"${requested##*[![:space:]]}"}"
+        found=0
+        for entry in "$@"; do
+            [ "${entry%%|*}" = "$requested" ] && found=1
+        done
+        if [ "$found" -ne 1 ]; then
+            IFS="$old_ifs"
+            echo "Error: unknown workload in RUN_WORKLOADS: $requested" >&2
+            echo "Available workloads:$available" >&2
+            return 2
+        fi
+    done
+    IFS="$old_ifs"
+}
+
+selected_workload_count() {
+    local entry count=0
+    for entry in "$@"; do
+        workload_selected "${entry%%|*}" && count=$((count + 1))
+    done
+    printf '%s' "$count"
+}
+
+wait_for_trace_file() {
+    local tracer_pid="$1"
+    local trace_file="$2"
+    local attempts="${3:-100}"
+    local attempt=0
+    while [ "$attempt" -lt "$attempts" ]; do
+        [ -s "$trace_file" ] && return 0
+        kill -0 "$tracer_pid" >/dev/null 2>&1 || return 1
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+run_kvcache_report() {
+    local python="$1"
+    local run_root="$2"
+    local log_path="$run_root/kvcache_report.log"
+    if ! find "$run_root" -mindepth 2 -maxdepth 2 -name messages.jsonl -print -quit |
+        grep -q .; then
+        echo "Skipping KV-cache report because no messages.jsonl was captured."
+        return 0
+    fi
+    echo "Generating run-level KV-cache report..."
+    "$python" -m agent_io_tracing.analysis.kvcache.report \
+        --results "$run_root" --runs . --dump-prefixes >"$log_path" 2>&1
+}
+
+return_results_ownership() {
+    local path="$1"
+    chmod -R a+rX "$path" || true
+    if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
+        chown -R "$SUDO_UID:$SUDO_GID" "$path" 2>/dev/null || true
+        echo "Returned ownership of $path to ${SUDO_USER:-uid=$SUDO_UID}"
+    fi
+}
+
 # Stop the bcc tracer started as `sudo -E env ... bcc_tracer ... &`.
 #
 # $1 is the PID of the *sudo wrapper*, not of the tracer itself. sudo does not

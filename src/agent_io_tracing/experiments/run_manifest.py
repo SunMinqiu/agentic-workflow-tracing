@@ -60,6 +60,11 @@ def main() -> int:
     p.add_argument("--workload", required=True)
     p.add_argument("--task-id", default=None)
     p.add_argument("--model", default=None)
+    p.add_argument("--vendor", default=os.environ.get("GENOMAS_VENDOR"))
+    p.add_argument(
+        "--api-base",
+        default=os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE"),
+    )
     p.add_argument("--api", default=None)
     p.add_argument("--temperature", default=os.environ.get("GENOMAS_TEMPERATURE"))
     p.add_argument("--seed", default=os.environ.get("GENOMAS_SEED"))
@@ -88,6 +93,8 @@ def main() -> int:
         "workload": args.workload,
         "task_id": args.task_id,
         "model": args.model,
+        "vendor": args.vendor,
+        "api_base": args.api_base,
         "api": args.api,
         "temperature": args.temperature,
         "seed": args.seed,

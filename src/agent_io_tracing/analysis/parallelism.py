@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from agent_io_tracing.analysis.summary import parse_tool_calls_log
+from agent_io_tracing.analysis.execution_units import (
+    annotate_parsed_execution_units,
+    load_execution_units,
+)
 
 
 @dataclass
@@ -296,6 +300,28 @@ def load_events(trace_dir: Path) -> dict[str, Event]:
     if not tools:
         tools = _load_tool_events_from_pi_events(events_path)
     events = {ev.run_id: ev for ev in [*llms, *tools]}
+    if not events:
+        for unit in load_execution_units(trace_dir):
+            start = unit.get("start_ts_ms")
+            end = unit.get("end_ts_ms")
+            unit_id = unit.get("execution_unit_id")
+            if not isinstance(unit_id, str) or not isinstance(start, (int, float)) \
+                    or not isinstance(end, (int, float)):
+                continue
+            events[unit_id] = Event(
+                run_id=unit_id,
+                kind="tool",
+                name=str(unit.get("stage") or "classic_task"),
+                start_ms=float(start),
+                end_ms=float(end),
+                role=str(unit.get("stage") or "classic_task"),
+                args={
+                    "task_id": unit.get("task_id") or unit_id,
+                    "dependencies": unit.get("dependencies") or [],
+                    "inputs": unit.get("inputs") or [],
+                    "outputs": unit.get("outputs") or [],
+                },
+            )
     if events and not any(ev.parent_run_id for ev in events.values()):
         _infer_parents_by_containment(events)
     return events
@@ -556,6 +582,14 @@ def _load_io_busy_worker_intervals(trace_dir: Path) -> tuple[list[tuple[float, f
     except (OSError, json.JSONDecodeError):
         return [], {"workers": 0, "events": 0}
 
+    annotate_parsed_execution_units(data, load_execution_units(trace_dir))
+    artifact_path = trace_dir / "lineage" / "artifacts.csv"
+    workload_paths: set[str] = set()
+    if artifact_path.is_file():
+        with artifact_path.open(newline="", encoding="utf-8") as handle:
+            workload_paths = {
+                row["path"] for row in csv.DictReader(handle) if row.get("path")
+            }
     tool_workers = _tool_worker_index(data)
     by_worker: dict[str, list[tuple[float, float]]] = defaultdict(list)
     events = 0
@@ -565,6 +599,9 @@ def _load_io_busy_worker_intervals(trace_dir: Path) -> tuple[list[tuple[float, f
             continue
         syscall = str(entry.get("syscall") or "")
         if syscall not in DATA_IO_SYSCALLS:
+            continue
+        path = entry.get("path") or ""
+        if workload_paths and path not in workload_paths:
             continue
         size = entry.get("actual_size") or entry.get("bytes_transferred") or 0
         if not isinstance(size, (int, float)) or size <= 0:

@@ -29,7 +29,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from agent_io_tracing.parsing.phases import PhaseAnalysis, load_phases
+from agent_io_tracing.parsing.phases import load_phases
+from agent_io_tracing.analysis.execution_units import (
+    annotate_parsed_execution_units,
+    load_execution_units,
+)
 
 
 # =============================================================================
@@ -285,6 +289,9 @@ def load_parsed_json(filepath: Path) -> StraceData:
 
     with open(filepath) as f:
         data = json.load(f)
+    annotate_parsed_execution_units(
+        data, load_execution_units(Path(filepath).resolve().parent)
+    )
 
     # Convert tool calls to DataFrame
     tool_calls = data["tool_calls"]
@@ -703,7 +710,6 @@ def create_io_rate_matplotlib(trace_dir: Path, output_path: Path) -> None:
     read_mask = syscalls.isin(["read", "pread64", "readv", "preadv", "preadv2"]) & (sizes > 0)
     write_mask = syscalls.isin(["write", "pwrite64", "writev", "pwritev", "pwritev2"]) & (sizes > 0)
 
-    llm_intervals: list[tuple[float, float]] = []
     llm_abs_intervals: list[tuple[float, float]] = []
     # (start_ms, end_ms, output_tokens) for calls that reported usage. Every
     # adapter's launcher records usage on message_end, so this works on every
@@ -735,7 +741,6 @@ def create_io_rate_matplotlib(trace_dir: Path, output_path: Path) -> None:
         t0_ms = min(abs_candidates)
         t1_ms = max(abs_candidates)
         fs_time_rel = (fs_abs_ms - t0_ms) / 1000.0
-        llm_intervals = [((s - t0_ms) / 1000.0, (e - t0_ms) / 1000.0) for s, e in llm_abs_intervals]
         duration_seconds = max((t1_ms - t0_ms) / 1000.0, 0.0)
     else:
         t0_ms = data.start_time.timestamp() * 1000.0
@@ -751,7 +756,6 @@ def create_io_rate_matplotlib(trace_dir: Path, output_path: Path) -> None:
                     "ebpf_events.log with the current parser."
                 )
         fs_time_rel = fs_df["time_rel"]
-        llm_intervals = [((s - t0_ms) / 1000.0, (e - t0_ms) / 1000.0) for s, e in llm_abs_intervals]
         duration_seconds = data.duration_seconds
 
     bin_size = 1.0 if duration_seconds <= 1800 else 2.0 if duration_seconds <= 7200 else 5.0
@@ -1242,17 +1246,21 @@ def create_directory_scan_matplotlib(trace_dir: Path, output_path: Path) -> None
 
 
 def create_inter_arrival_cdf_matplotlib(trace_dir: Path, output_path: Path) -> None:
-    """Axis 1: histogram of gaps between successive accesses to the same file."""
+    """Read/write histograms of gaps between accesses to the same file."""
     try:
         p1 = json.loads((trace_dir / "phase1_metrics.json").read_text())
     except Exception:
         p1 = {}
     ia = p1.get("inter_arrival") or {}
-    hist = ia.get("hist") or {}
+    read_hist = (ia.get("read") or {}).get("hist") or {}
+    write_hist = (ia.get("write") or {}).get("hist") or {}
+    combined_hist = ia.get("hist") or {}
     labels = ia.get("hist_bins") or ["<1s", "1-30s", "30s-5min", "5-30min", ">30min"]
-    counts = [int(hist.get(label, 0) or 0) for label in labels]
+    read_counts = [int(read_hist.get(label, 0) or 0) for label in labels]
+    write_counts = [int(write_hist.get(label, 0) or 0) for label in labels]
+    combined_counts = [int(combined_hist.get(label, 0) or 0) for label in labels]
     fig, ax = plt.subplots(1, 1, figsize=(9, 5))
-    if not any(counts):
+    if not any(read_counts) and not any(write_counts) and not any(combined_counts):
         _no_data_placeholder(
             ax, "Inter-arrival time — no data",
             "Fewer than 2 repeat accesses to any file were observed",
@@ -1263,13 +1271,88 @@ def create_inter_arrival_cdf_matplotlib(trace_dir: Path, output_path: Path) -> N
         return
 
     x = np.arange(len(labels))
-    ax.bar(x, counts, color="#1f77b4", edgecolor="black", linewidth=0.3)
+    if any(read_counts) or any(write_counts):
+        width = 0.38
+        ax.bar(x - width / 2, read_counts, width, color="#1f77b4", label="read")
+        ax.bar(x + width / 2, write_counts, width, color="#ff7f0e", label="write")
+        ax.legend()
+    else:
+        ax.bar(x, combined_counts, color="#7f8c8d")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=20, ha="right")
     ax.set_xlabel("gap between successive accesses to the same file", fontsize=10)
     ax.set_ylabel("# inter-arrival intervals", fontsize=10)
-    ax.set_title("Inter-arrival Time", fontsize=12)
+    ax.set_title("Same-file Inter-arrival Time by Direction", fontsize=12)
     ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def create_request_size_rw_cdf_matplotlib(trace_dir: Path, output_path: Path) -> None:
+    try:
+        p1 = json.loads((trace_dir / "phase1_metrics.json").read_text())
+    except Exception:
+        p1 = {}
+    req = p1.get("request_size_cdf") or {}
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    plotted = False
+    for kind, color in (("read", "#1f77b4"), ("write", "#ff7f0e")):
+        summary = req.get(kind) or {}
+        points = summary.get("cdf") or []
+        xs = [float(p["bytes"]) for p in points if p.get("bytes") is not None]
+        ys = [float(p["percentile"]) / 100.0 for p in points if p.get("bytes") is not None]
+        if not xs:
+            continue
+        ax.plot(xs, ys, color=color, linewidth=2, label=f"{kind} (n={summary.get('count', 0)})")
+        plotted = True
+    if not plotted:
+        _no_data_placeholder(ax, "Request-size CDF — no data", "No workload read/write requests")
+    else:
+        ax.set_xscale("log", base=2)
+        ax.set_ylim(0, 1.01)
+        ax.set_xlabel("requested bytes per operation")
+        ax.set_ylabel("CDF")
+        ax.set_title("Read and Write Request-size CDF")
+        ax.grid(True, which="both", alpha=0.25)
+        ax.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def create_byte_normalized_summary_matplotlib(trace_dir: Path, output_path: Path) -> None:
+    try:
+        p1 = json.loads((trace_dir / "phase1_metrics.json").read_text())
+    except Exception:
+        p1 = {}
+    normalized = ((p1.get("byte_normalized_summary") or {}).get("normalized") or {})
+    fields = [
+        ("read ops\n/R GiB", "read_ops_per_gib_read", "#1f77b4"),
+        ("write ops\n/W GiB", "write_ops_per_gib_write", "#ff7f0e"),
+        ("metadata ops\n/T GiB", "storage_metadata_ops_per_gib_total_io", "#5dade2"),
+        ("directory scans\n/T GiB", "directory_scans_per_gib_total_io", "#8e44ad"),
+        ("read files\n/R GiB", "read_files_per_gib_read", "#48c9b0"),
+        ("written files\n/W GiB", "written_files_per_gib_write", "#e67e22"),
+    ]
+    values = [normalized.get(key) for _label, key, _color in fields]
+    fig, ax = plt.subplots(figsize=(10, 5.2))
+    if not any(isinstance(v, (int, float)) and v > 0 for v in values):
+        _no_data_placeholder(ax, "Byte-normalized summary — no data", "Read/write byte denominator is zero")
+    else:
+        x = np.arange(len(fields))
+        heights = [float(v) if isinstance(v, (int, float)) and v > 0 else np.nan for v in values]
+        bars = ax.bar(x, heights, color=[color for _label, _key, color in fields])
+        ax.set_yscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels([label for label, _key, _color in fields])
+        ax.set_ylabel("count per GiB")
+        ax.set_title("Byte-normalized I/O Counts")
+        ax.grid(axis="y", which="both", alpha=0.25)
+        for bar, value in zip(bars, values):
+            if isinstance(value, (int, float)) and value > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2, value, f"{value:,.1f}",
+                        ha="center", va="bottom", fontsize=8, rotation=20)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
@@ -1287,7 +1370,7 @@ def create_effective_bandwidth_matplotlib(trace_dir: Path, output_path: Path) ->
         read = vals.get("read") or {}
         write = vals.get("write") or {}
         total_bytes = (read.get("bytes") or 0) + (write.get("bytes") or 0)
-        has_reliable_bw = isinstance(read.get("effective_Bps"), (int, float)) or isinstance(write.get("effective_Bps"), (int, float))
+        has_reliable_bw = isinstance(read.get("active_Bps"), (int, float)) or isinstance(write.get("active_Bps"), (int, float))
         if total_bytes > 0 and has_reliable_bw:
             rows.append((phase, read, write, total_bytes))
     rows.sort(key=lambda r: r[3], reverse=True)
@@ -1304,7 +1387,7 @@ def create_effective_bandwidth_matplotlib(trace_dir: Path, output_path: Path) ->
     y = np.arange(len(rows))
 
     def mbps(stat: dict) -> float:
-        v = stat.get("effective_Bps")
+        v = stat.get("active_Bps")
         return float(v) / (1024 * 1024) if isinstance(v, (int, float)) else 0.0
 
     read_vals = [mbps(r[1]) for r in rows]
@@ -1315,9 +1398,9 @@ def create_effective_bandwidth_matplotlib(trace_dir: Path, output_path: Path) ->
     ax.set_yticks(y)
     ax.set_yticklabels([r[0] for r in rows], fontsize=8)
     ax.invert_yaxis()
-    ax.set_xlabel("effective bandwidth (MiB/s)")
+    ax.set_xlabel("active bandwidth (MiB/s)")
     ax.grid(axis="x", alpha=0.25)
-    ax.set_title("Effective Bandwidth by Phase")
+    ax.set_title("Active Bandwidth by Phase")
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
@@ -1809,7 +1892,10 @@ def _load_agent_timeline_data_uncached(trace_dir: Path) -> dict | None:
     Load and align LLM segments, tool calls, subagent calls, and FS entries
     onto a single t=0 origin. Returns None if nothing is plottable.
     """
-    from agent_io_tracing.parsing.tool_log import parse_tool_calls_log as parse_log
+    from agent_io_tracing.parsing.tool_log import (
+        ToolCall,
+        parse_tool_calls_log as parse_log,
+    )
 
     events_path = trace_dir / "pi_events.jsonl"
     tool_log = trace_dir / "tool_calls.log"
@@ -1822,6 +1908,26 @@ def _load_agent_timeline_data_uncached(trace_dir: Path) -> dict | None:
     tool_calls = parse_log(tool_log) if tool_log.exists() else []
     subagent_calls = parse_log(sub_log) if sub_log.exists() else []
     strace_data = load_parsed_json(parsed_json) if parsed_json.exists() else None
+    if not tool_calls and strace_data is not None:
+        # Classic tasks are synthesized from execution_units.jsonl by
+        # load_parsed_json.  Feed those same intervals into the application
+        # timeline instead of treating a deliberately empty tool_calls.log as
+        # 100% unattributed agent overhead.
+        for row in strace_data.tool_calls_df.to_dict("records"):
+            start = row.get("start_time")
+            end = row.get("end_time")
+            if pd.isna(start) or pd.isna(end):
+                continue
+            tool_calls.append(
+                ToolCall(
+                    start_time=start.to_pydatetime() if hasattr(start, "to_pydatetime") else start,
+                    end_time=end.to_pydatetime() if hasattr(end, "to_pydatetime") else end,
+                    tool_name=str(row.get("tool_name") or "classic_task"),
+                    tool_id=str(row.get("tool_id") or ""),
+                    input_params=row.get("input_params")
+                    if isinstance(row.get("input_params"), dict) else {},
+                )
+            )
 
     # Date alignment.  parse_tool_calls_log uses datetime.now() to assign a
     # date to HMS-only tool/subagent times.  If the viz is run on a different
@@ -2755,7 +2861,7 @@ def create_agent_timeline_matplotlib(trace_dir: Path, output_path: Path) -> None
 # Index HTML Dashboard
 # =============================================================================
 
-def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
+def create_index_html(output_dir: Path) -> None:
     trace_dir = output_dir.parent
     lineage_dir = trace_dir / "lineage"
 
@@ -2831,7 +2937,9 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
 
     p1 = jload(trace_dir / "phase1_metrics.json")
     par = jload(trace_dir / "parallelism_summary.json")
+    quality = jload(trace_dir / "trace_quality.json")
     io_summary = jload(lineage_dir / "io_summary.json") or jload(trace_dir / "io_summary.json")
+    execution_summary = jload(lineage_dir / "execution_unit_summary.json")
     artifact_rows = load_artifact_rows()
     ratios = p1.get("metadata_data_ratio") or {}
     req = p1.get("request_size_cdf") or {}
@@ -2840,6 +2948,18 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
     amp = p1.get("analytical_optimum_amplification") or {}
     seq = p1.get("sequentiality") or {}
     wl = (io_summary.get("workload") or {})
+    if quality.get("ready_for_manual_review") is True:
+        quality_label = "READY FOR MANUAL REVIEW"
+        quality_class = "ready"
+        quality_message = "Trace passed automated checks and is ready for manual review."
+    elif quality.get("ready_for_manual_review") is False:
+        quality_label = "NOT READY"
+        quality_class = "failed"
+        quality_message = "Trace failed automated quality checks. Do not use it in comparison figures."
+    else:
+        quality_label = "QUALITY NOT RECOMPUTED"
+        quality_class = "pending"
+        quality_message = "Raw parsed trace is unavailable locally; this dashboard was regenerated from saved metrics."
 
     # Setup / Global only — descriptive aggregates that belong to no single
     # axis. Axis-specific numbers (file size, amplification, request size, …)
@@ -2856,6 +2976,10 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
     if isinstance(wall_s, (int, float)) and wall_s > 0 and isinstance(llm_s, (int, float)):
         llm_pct_wall = 100.0 * llm_s / wall_s
     headline = [
+        (
+            "trace quality",
+            quality_label,
+        ),
         ("read/write bytes", f"{fmt_bytes(wl.get('read_bytes'))} / {fmt_bytes(wl.get('write_bytes'))}"),
         ("distinct files (generated)", f"{fmt_num(wl.get('distinct_files'))} ({fmt_num(amp.get('actual_generated_files'))})"),
         ("distinct files / tool_call (mean, p95)", f"{fmt_num(files_per_tool.get('mean'))} / {fmt_num(files_per_tool.get('p95'))}"),
@@ -2952,15 +3076,6 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         "files with I/O bytes (RH+WH+RW denominator)"
     ).strip(" ·")
 
-    eo = p1.get("exploration_overhead") or {}
-    eo_ratio = eo.get("exploration_overhead_ratio")
-    eo_table = kv_table(["exploration overhead", "value"], [
-        ["overhead ratio", (fmt_num(eo_ratio * 100) + "%") if isinstance(eo_ratio, (int, float)) else "n/a"],
-        ["backtrack-phase bytes", fmt_bytes(eo.get("backtrack_phase_bytes"))],
-        ["dead-write bytes", fmt_bytes(eo.get("dead_write_bytes"))],
-        ["total data bytes", fmt_bytes(eo.get("total_data_bytes"))],
-    ])
-
     merge = seq.get("mergeability") or {}
     amp_table = kv_table(["I/O batching efficiency", "value"], [
         ["mergeable ops saved", f"{fmt_num(merge.get('saved_ops'), 0)} / {fmt_num(merge.get('actual_ops_with_offset'), 0)}"],
@@ -2975,23 +3090,12 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
     else:
         amp_note = merge.get("note") or ""
 
-    pc_counts = {"1-1": 0, "1-n": 0, "n-1": 0, "n-n": 0}
-    pc_total = 0
-    for _key, _n in ((io_summary.get("fanout") or {}).get("reader_writer_joint") or {}).items():
-        try:
-            _w, _r = (int(x) for x in str(_key).split(",", 1))
-            _n = int(_n)
-        except (TypeError, ValueError):
-            continue
-        pc_total += _n
-        if _w <= 1 and _r <= 1:
-            pc_counts["1-1"] += _n
-        elif _w <= 1:
-            pc_counts["1-n"] += _n
-        elif _r <= 1:
-            pc_counts["n-1"] += _n
-        else:
-            pc_counts["n-n"] += _n
+    pc_summary = ((io_summary.get("fanout") or {}).get("producer_consumer_classes") or {})
+    pc_counts = {
+        label: int((pc_summary.get(label) or {}).get("files") or 0)
+        for label in ("1-1", "1-n", "n-1", "n-n")
+    }
+    pc_total = sum(pc_counts.values())
     pc_table = kv_table(
         ["producer-consumer", "files", "share"],
         [
@@ -3014,6 +3118,16 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         ["I/O-busy workers / events", f"{fmt_num(io_pdeg.get('workers'), 0)} / {fmt_num(io_pdeg.get('events'), 0)}"],
         ["I/O bytes counted", fmt_bytes(io_pdeg.get("bytes"))],
     ])
+    execution_skew = execution_summary.get("skew") or {}
+    byte_skew = execution_skew.get("io_bytes") or {}
+    busy_skew = execution_skew.get("io_busy_s") or {}
+    execution_skew_table = kv_table(["execution-unit skew", "value"], [
+        ["units with I/O", fmt_num(execution_summary.get("execution_units_with_io"), 0)],
+        ["I/O bytes max/median", fmt_num(byte_skew.get("max_over_median"))],
+        ["I/O bytes p95/p50", fmt_num(byte_skew.get("p95_over_p50"))],
+        ["I/O-busy time max/median", fmt_num(busy_skew.get("max_over_median"))],
+        ["I/O-busy time p95/p50", fmt_num(busy_skew.get("p95_over_p50"))],
+    ]) if execution_summary else ""
 
     def links_for(base: str, rel_prefix: str = "") -> str:
         pieces = []
@@ -3098,7 +3212,6 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         }
 
     row_summary = artifact_summary_from_rows() if artifact_rows else {}
-    artifact_size_summary = io_summary.get("artifact_sizes") or row_summary.get("artifact_sizes") or {}
     write_read_gap = io_summary.get("write_read_gap_s") or {}
     lifecycle_summary = {
         **(row_summary.get("lifecycle") or {}),
@@ -3168,11 +3281,11 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
 
     def inter_arrival_caption() -> str:
         ia = p1.get("inter_arrival") or {}
+        read = ia.get("read") or {}
+        write = ia.get("write") or {}
         return caption_join([
-            f"n={fmt_num(ia.get('n_intervals'), 0)} re-access intervals",
-            f"p50={fmt_seconds(ia.get('p50_s'))}",
-            f"p95={fmt_seconds(ia.get('p95_s'))}",
-            f"<1s={fmt_num(ia.get('pct_lt_1s'))}%",
+            f"read n={fmt_num(read.get('n_intervals'), 0)}, p50={fmt_seconds(read.get('p50_s'))}",
+            f"write n={fmt_num(write.get('n_intervals'), 0)}, p50={fmt_seconds(write.get('p50_s'))}",
         ])
 
     def directory_caption() -> str:
@@ -3184,10 +3297,11 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         ])
 
     def file_size_caption() -> str:
+        read = req.get("read") or {}
+        write = req.get("write") or {}
         return caption_join([
-            f"Requests: <4KB={fmt_num(req.get('pct_lt_4kb'))}%",
-            f"<64KB={fmt_num(req.get('pct_lt_64kb'))}%",
-            f"bytes-weighted mean request={fmt_bytes(req.get('bytes_weighted_mean_request_bytes'))}",
+            f"read n={fmt_num(read.get('count'), 0)}, p50={fmt_bytes(read.get('p50_bytes'))}, p95={fmt_bytes(read.get('p95_bytes'))}",
+            f"write n={fmt_num(write.get('count'), 0)}, p50={fmt_bytes(write.get('p50_bytes'))}, p95={fmt_bytes(write.get('p95_bytes'))}",
         ])
 
     def access_pattern_caption() -> str:
@@ -3220,9 +3334,10 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         gread = glob.get("read") or {}
         gwrite = glob.get("write") or {}
         return caption_join([
-            f"Global read={fmt_bytes(gread.get('effective_Bps'))}/s",
-            f"global write={fmt_bytes(gwrite.get('effective_Bps'))}/s",
-            "effective bandwidth = bytes / sum(syscall duration; guarded by min ops and min I/O time).",
+            f"Global active read={fmt_bytes(gread.get('active_Bps'))}/s",
+            f"global active write={fmt_bytes(gwrite.get('active_Bps'))}/s",
+            f"wall read={fmt_bytes(gread.get('wall_Bps'))}/s, write={fmt_bytes(gwrite.get('wall_Bps'))}/s",
+            "active bandwidth = bytes / union of active syscall intervals.",
         ])
 
     def measured_interface_caption() -> str:
@@ -3246,6 +3361,8 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
     # --- Figures grouped by axis ------------------------------------------
     setup_figs = "".join([
         lineage_card("fig0_io_volume_summary.png", "I/O Volume Summary", io_volume_caption()),
+        viz_card("byte_normalized_summary", "Byte-normalized I/O Counts",
+                 "Counts normalized by measured read, write, or total transferred bytes."),
         viz_card("agent_timeline", "Agent Timeline"),
         viz_card("phase_breakdown", "Time Accounting"),
         external_card("../call_dag.html", "Call DAG with I/O"),
@@ -3271,12 +3388,13 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
                         measured_interface_caption())
     ax3_figs = lineage_card("fig4_lifecycle.png", lifecycle_title, lifecycle_caption)
     ax4_figs = "".join([
+        viz_card("request_size_rw_cdf", "Read/Write Request-size CDF", file_size_caption()),
         lineage_card("fig1_size_distribution.png", "File and Request Size", file_size_caption()),
         viz_card("access_pattern", "Access Pattern", access_pattern_caption()),
     ])
     ax5_figs = "".join([
         viz_card("io_rate", "I/O Rate Over Time", io_rate_caption()),
-        viz_card("effective_bandwidth", "Effective BW by Phase", effective_bw_caption()),
+        viz_card("effective_bandwidth", "Active BW by Phase", effective_bw_caption()),
         viz_card("io_autocorrelation", "I/O Autocorrelation"),
     ])
 
@@ -3315,6 +3433,7 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
             "I/O concurrency",
             io_pardeg_table,
         ),
+        panel("Execution-unit I/O skew", execution_skew_table) if execution_skew_table else "",
     )
 
     data_links = [
@@ -3322,6 +3441,9 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
         ("io_summary.json", "../lineage/io_summary.json"),
         ("artifacts.csv", "../lineage/artifacts.csv"),
         ("tool_call_attribution.csv", "../lineage/tool_call_attribution.csv"),
+        ("execution_unit_io.csv", "../lineage/execution_unit_io.csv"),
+        ("execution_unit_summary.json", "../lineage/execution_unit_summary.json"),
+        ("trace_quality.json", "../trace_quality.json"),
         ("generated_code.jsonl", "../generated_code.jsonl"),
         ("manifest.json", "../manifest.json"),
         ("call_dag.html", "../call_dag.html"),
@@ -3432,12 +3554,19 @@ def create_index_html(output_dir: Path, visualizations: list[str]) -> None:
     .attr-grid h3 {{ margin: 0 0 6px; font-size: 14px; }}
     .attr-summary {{ margin-top: 6px; }}
     .muted {{ color: #627d98; font-size: 12px; margin: 4px 0; }}
+    .quality {{ margin-top: 14px; padding: 10px 12px; border-radius: 8px; font-weight: 700; }}
+    .quality.ready {{ color: #146c43; background: #d1e7dd; border: 1px solid #a3cfbb; }}
+    .quality.failed {{ color: #842029; background: #f8d7da; border: 1px solid #f1aeb5; }}
+    .quality.pending {{ color: #664d03; background: #fff3cd; border: 1px solid #ffecb5; }}
   </style>
 </head>
 <body>
   <header>
     <div class="wrap">
       <h1>{esc(page_title)}</h1>
+      <div class="quality {quality_class}">
+        {esc(quality_message)}
+      </div>
       <div class="metrics">{''.join(metric(k, v) for k, v in headline)}</div>
       {latency_table}
     </div>
@@ -3492,6 +3621,8 @@ AGENT_VISUALIZATIONS = {
     "phase_breakdown": (create_phase_breakdown_plotly, create_phase_breakdown_matplotlib),
     "measured_interface_layers": (None, create_measured_interface_layers_matplotlib),
     "inter_arrival_cdf": (None, create_inter_arrival_cdf_matplotlib),
+    "request_size_rw_cdf": (None, create_request_size_rw_cdf_matplotlib),
+    "byte_normalized_summary": (None, create_byte_normalized_summary_matplotlib),
     "reread_attribution": (None, create_reread_attribution_matplotlib),
     "directory_scan": (None, create_directory_scan_matplotlib),
     "io_rate": (None, create_io_rate_matplotlib),
@@ -3671,7 +3802,7 @@ def generate_visualizations(
 
     # Create index dashboard
     print("Creating index.html dashboard...", file=sys.stderr)
-    create_index_html(output_dir, generated)
+    create_index_html(output_dir)
     
     print(f"\nVisualizations saved to {output_dir}/", file=sys.stderr)
     print(f"Open {output_dir}/index.html in a browser to view.", file=sys.stderr)
@@ -3720,19 +3851,25 @@ Examples:
     # Parse --only argument
     only = args.only.split(",") if args.only else None
 
-    # Cheap pre-check: if the trace produced 0 tool calls (agent likely
-    # crashed at startup before any tool fired), don't try to draw anything.
-    # Print a clear message and exit 0 so the orchestrator continues.
+    # Cheap pre-check for agent traces that crashed before any tool fired.
+    # Traditional traces intentionally have no agent tool calls; their
+    # execution_units.jsonl supplies the task/stage boundaries instead.
     parsed_json = args.trace_dir / "parsed.json"
     if parsed_json.exists():
         try:
             with open(parsed_json) as f:
                 _peek = json.load(f)
-            if not _peek.get("tool_calls"):
+            has_execution_units = (
+                args.trace_dir / "execution_units.jsonl"
+            ).is_file()
+            if not _peek.get("tool_calls") and not has_execution_units:
+                output_dir = args.trace_dir / "visualizations"
+                output_dir.mkdir(exist_ok=True)
+                create_index_html(output_dir)
                 print(
                     f"[visualize_strace] {args.trace_dir}: tool_calls is empty "
-                    f"— agent did not invoke any tool (likely crashed in init). "
-                    f"Skipping visualization. See sragent.err for the cause.",
+                    f"— generated a diagnostic index only. The trace is not "
+                    f"eligible for comparison figures.",
                     file=sys.stderr,
                 )
                 sys.exit(0)

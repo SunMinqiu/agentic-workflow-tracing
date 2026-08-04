@@ -279,8 +279,8 @@ uv pip install --python .venv/bin/python -e .
 # Post-processing extras used by visualize_strace.py.  SciLink's own deps
 # already include matplotlib + pandas + numpy; plotly is the only extra
 # the visualization layer needs that SciLink doesn't pull in itself.
-echo "  Installing visualization extras (plotly)..."
-uv pip install --python .venv/bin/python plotly
+echo "  Installing tracing analysis dependencies..."
+uv pip install --python .venv/bin/python Markdown plotly tiktoken
 
 # SciLink 6660c09 currently pulls edison-client -> ldp -> fhlmi.  ldp 0.48
 # imports the older lmi.config module, but fhlmi 0.43 exposes lmi without that

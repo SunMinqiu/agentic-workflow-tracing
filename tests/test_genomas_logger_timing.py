@@ -59,6 +59,7 @@ def test_genomas_logger_emits_real_stream_timing_events(tmp_path, monkeypatch):
         run_id="run-1",
         started_monotonic_ns=10,
         ended_monotonic_ns=20,
+        request_params={"temperature": 0, "max_tokens": 30},
     )
 
     events = _read_events(tmp_path / "pi_events.jsonl")
@@ -73,6 +74,15 @@ def test_genomas_logger_emits_real_stream_timing_events(tmp_path, monkeypatch):
     assert events[-1]["stream_timing_available"] is True
     assert events[-1]["provider_request_id"] == "req_test"
     assert events[-1]["message"]["usage"]["cacheRead"] == 896
+    prompts = _read_events(tmp_path / "messages.jsonl")
+    assert prompts[0]["request_params"] == {
+        "temperature": 0,
+        "max_tokens": 30,
+    }
+    assert prompts[0]["request"]["messages"] == [
+        {"role": "user", "content": "hello"}
+    ]
+    assert prompts[0]["response_text"] == "answer"
 
 
 def test_genomas_logger_does_not_fabricate_first_token(tmp_path, monkeypatch):

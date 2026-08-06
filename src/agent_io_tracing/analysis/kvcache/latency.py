@@ -12,7 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 LATENCY_TIMELINE_PNG = "kvcache_inference_latency_timeline.png"
-FRESH_INPUT_LATENCY_PNG = "kvcache_fresh_input_vs_latency.png"
+OUTPUT_LATENCY_PNG = "kvcache_output_vs_latency.png"
 TTFT_FRESH_INPUT_PNG = "kvcache_ttft_vs_fresh_input.png"
 LATENCY_BREAKDOWN_PNG = "kvcache_latency_breakdown.png"
 TTFT_PREFIX_AGE_PNG = "kvcache_ttft_vs_prefix_age.png"
@@ -77,6 +77,8 @@ def _stats(calls: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     return {
         "n": len(calls),
+        "total_output": sum(call["output"] for call in calls),
+        "mean_output": round(statistics.mean(call["output"] for call in calls), 1),
         "total_duration_s": round(sum(durations), 3),
         "mean_duration_s": round(statistics.mean(durations), 3),
         "median_duration_s": round(statistics.median(durations), 3),
@@ -206,26 +208,25 @@ def plot_inference_latency_timeline(summary: dict[str, Any], out_png: Path) -> N
     plt.close(fig)
 
 
-def plot_fresh_input_vs_latency(summary: dict[str, Any], out_png: Path) -> None:
+def plot_output_vs_latency(summary: dict[str, Any], out_png: Path) -> None:
     calls = summary["per_call"]
     colors = _role_colors(calls)
     fig, ax = plt.subplots(figsize=(9, 5.5))
     for role, color in colors.items():
         selected = [call for call in calls if call["role"] == role]
         ax.scatter(
-            [call["fresh_input"] for call in selected],
+            [call["output"] for call in selected],
             [call["duration_ms"] / 1000.0 for call in selected],
-            s=42,
+            s=48,
             color=color,
-            marker="o",
-            alpha=0.78,
+            alpha=0.8,
             edgecolor="white",
             linewidth=0.6,
             label=role,
         )
-    ax.set_xlabel("fresh input tokens (input − cacheRead)")
+    ax.set_xlabel("output tokens")
     ax.set_ylabel("end-to-end inference duration (s)")
-    ax.set_title("Fresh input vs. end-to-end latency")
+    ax.set_title("Output length vs. end-to-end latency")
     ax.legend(fontsize=7, ncol=2)
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
@@ -313,17 +314,17 @@ def plot_ttft_vs_prefix_age(summary: dict[str, Any], out_png: Path) -> None:
     calls = [
         call for call in summary["per_call"]
         if call.get("first_token_ms") is not None
-        and call.get("time_since_latest_compatible_prefix_s") is not None
+        and call.get("newest_possible_source_age_s") is not None
     ]
     fig, ax = plt.subplots(figsize=(9, 5.2))
     scatter = ax.scatter(
-        [max(call["time_since_latest_compatible_prefix_s"], 0.01) for call in calls],
+        [max(call["newest_possible_source_age_s"], 0.01) for call in calls],
         [(call["first_token_ms"] - call["start_ms"]) / 1000.0 for call in calls],
         c=[call.get("capture_rate") or 0 for call in calls],
         cmap="viridis", vmin=0, vmax=1, s=55,
     )
     ax.set_xscale("log")
-    ax.set_xlabel("time since latest compatible prefix (s)")
+    ax.set_xlabel("age of newest possible source (s)")
     ax.set_ylabel("TTFT (s)")
     ax.set_title("TTFT vs. prefix interval")
     fig.colorbar(scatter, ax=ax, label="capture rate")

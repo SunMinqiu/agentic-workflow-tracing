@@ -11,9 +11,9 @@ run that matches counts; the divergent tail is new):
                every previously-seen prompt would serve this share. A CEILING,
                backend-independent, computed here from the raw messages.
 
-  gap% = logical_128% − realized%  → reuse left on the table by the vendor's
-         TTL / eviction / routing (block-aligned so 128-token rounding is not
-         mistaken for waste).
+  gap% = logical_aligned% − realized%  → reuse left on the table by the
+         vendor's retention, eviction, or routing. Alignment uses the serving
+         arm's prefix-matching unit.
 
 Sub-agents / multiple roles: a real shared prefix cache is GLOBAL — any call
 whose prefix matches anything cached hits, regardless of which agent issued it.
@@ -40,6 +40,7 @@ tok_delta_pct and compare *fractions*, and assert logical ≥ realized.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import statistics
 from pathlib import Path
@@ -47,7 +48,7 @@ from typing import Any
 
 import tiktoken
 
-OPENAI_BLOCK = 128  # OpenAI prefix-cache block granularity (backend-dependent knob)
+LEGACY_MATCH_UNIT = 128
 CELL_JSON = "kvcache_logical.json"
 CACHE_WARMING_PNG = "kvcache_cache_warming.png"
 PREFIX_LINEAGE_PNG = "kvcache_prefix_lineage.png"
@@ -219,11 +220,123 @@ def _lcp_len(left: list[int], right: list[int]) -> int:
     return matched
 
 
-def _provider_aligned_tokens(tokens: int, input_tokens: int, our_tokens: int) -> int:
+def _provider_aligned_tokens(
+    tokens: int,
+    input_tokens: int,
+    our_tokens: int,
+    match_unit: int,
+) -> int:
     if tokens <= 0 or input_tokens <= 0 or our_tokens <= 0:
         return 0
     provider_estimate = tokens * input_tokens / our_tokens
-    return int(provider_estimate // OPENAI_BLOCK) * OPENAI_BLOCK
+    return int(provider_estimate // match_unit) * match_unit
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _cache_geometry(
+    calls: list[dict[str, Any]],
+    block_size: int | None,
+    prefix_match_unit: int | None,
+) -> tuple[int, int]:
+    """Resolve physical storage and prefix-match units from the arm manifest."""
+    observed: set[tuple[int | None, int | None]] = set()
+    for call in calls:
+        serving = (call.get("cache_config") or {}).get("serving") or {}
+        candidate = (
+            serving.get("resolved")
+            or serving.get("observed_config")
+            or serving.get("observed")
+            or serving
+        )
+        if isinstance(candidate, dict):
+            geometry = (
+                _positive_int(candidate.get("block_size")),
+                _positive_int(candidate.get("prefix_match_unit")),
+            )
+            if any(value is not None for value in geometry):
+                observed.add(geometry)
+    if len(observed) > 1:
+        raise ValueError(
+            "cell contains multiple cache geometries: "
+            f"{sorted(observed, key=repr)}"
+        )
+    observed_block, observed_match = next(iter(observed), (None, None))
+    physical = (
+        _positive_int(block_size)
+        or observed_block
+        or LEGACY_MATCH_UNIT
+    )
+    matching = (
+        _positive_int(prefix_match_unit)
+        or observed_match
+        or physical
+    )
+    return physical, matching
+
+
+def _cache_block_references(tokens: list[int], block_size: int) -> list[str]:
+    """Return stable identities for every complete prefix-cache block."""
+    references = []
+    parent = b""
+    for offset in range(0, len(tokens) - block_size + 1, block_size):
+        block = tokens[offset:offset + block_size]
+        payload = json.dumps(block, separators=(",", ":")).encode("ascii")
+        parent = hashlib.sha256(parent + b":" + payload).digest()
+        references.append(parent.hex())
+    return references
+
+
+def _reuse_distance_summary(references: list[str]) -> dict[str, Any]:
+    """Compute exact LRU stack distance with a Fenwick tree."""
+    size = len(references)
+    tree = [0] * (size + 1)
+
+    def add(index: int, delta: int) -> None:
+        index += 1
+        while index <= size:
+            tree[index] += delta
+            index += index & -index
+
+    def prefix_sum(index: int) -> int:
+        total = 0
+        while index > 0:
+            total += tree[index]
+            index -= index & -index
+        return total
+
+    latest: dict[str, int] = {}
+    histogram: dict[int, int] = {}
+    cold = 0
+    for index, key in enumerate(references):
+        previous = latest.get(key)
+        if previous is None:
+            cold += 1
+        else:
+            distance = prefix_sum(index) - prefix_sum(previous + 1)
+            histogram[distance] = histogram.get(distance, 0) + 1
+            add(previous, -1)
+        add(index, 1)
+        latest[key] = index
+    return {
+        "cumulative_unique_blocks": len(latest),
+        "block_references": size,
+        "cold_references": cold,
+        "reference_order": "request_start_then_prefix",
+        "reuse_distance_blocks": {
+            str(distance): count for distance, count in sorted(histogram.items())
+        },
+        "peak_resident_blocks": {
+            "policy": "unbounded",
+            "blocks": len(latest),
+        },
+    }
 
 
 def _candidate_class(call: dict[str, Any]) -> str:
@@ -256,7 +369,7 @@ def _temporal_metrics(per_call: list[dict[str, Any]]) -> dict[str, Any]:
     reusable = [
         call for call in per_call
         if call["logical_aligned"] > 0
-        and call["time_since_latest_compatible_prefix_s"] is not None
+        and call["newest_possible_source_age_s"] is not None
     ]
     uniquely_sourced = [
         call for call in reusable if call["source_candidate_count"] == 1
@@ -275,7 +388,7 @@ def _temporal_metrics(per_call: list[dict[str, Any]]) -> dict[str, Any]:
     ]:
         group = [
             call for call in reusable
-            if low <= call["time_since_latest_compatible_prefix_s"] < high
+            if low <= call["newest_possible_source_age_s"] < high
         ]
         logical_tokens = sum(call["logical_aligned"] for call in group)
         realized_tokens = sum(call["cacheRead"] for call in group)
@@ -292,14 +405,14 @@ def _temporal_metrics(per_call: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "longest_unique_source_age_s": (
             round(max(
-                call["time_since_latest_compatible_prefix_s"]
+                call["newest_possible_source_age_s"]
                 for call in uniquely_sourced
             ), 4)
             if uniquely_sourced else None
         ),
         "median_age_above_70pct_reuse_s": (
             round(statistics.median(
-                call["time_since_latest_compatible_prefix_s"]
+                call["newest_possible_source_age_s"]
                 for call in high_reuse
             ), 4)
             if high_reuse else None
@@ -319,18 +432,28 @@ def _candidate_count_table(per_call: list[dict[str, Any]]) -> list[dict[str, Any
             ) == label
         ]
         rows.append({
-            "compatible_candidates": label,
+            "possible_sources": label,
             "calls": len(group),
             "call_fraction": round(len(group) / len(per_call), 4) if per_call else None,
         })
     return rows
 
 
-def analyze_cell_logical(cell: Path, dump_prefixes: bool = False) -> dict[str, Any] | None:
+def analyze_cell_logical(
+    cell: Path,
+    dump_prefixes: bool = False,
+    block_size: int | None = None,
+    prefix_match_unit: int | None = None,
+) -> dict[str, Any] | None:
     calls = load_joined_calls(cell)
     if not calls:
         return None
 
+    physical_block_size, match_unit = _cache_geometry(
+        calls,
+        block_size,
+        prefix_match_unit,
+    )
     enc = _encoding_for(calls[0]["model"])
     prefix_lines: list[str] = []
     role_totals: dict[str, int] = {}
@@ -346,10 +469,11 @@ def analyze_cell_logical(cell: Path, dump_prefixes: bool = False) -> dict[str, A
 
     sum_input = sum_cacheread = 0
     sum_our_tokens = 0
-    sum_logical = sum_logical_128 = 0
+    sum_logical = sum_logical_aligned = 0
     sum_role_logical = 0
     per_call = []
     token_history: list[list[int]] = []
+    block_references: list[str] = []
     first_start_ms = calls[0]["start_ms"]
 
     for call_index, c in enumerate(calls):
@@ -363,7 +487,7 @@ def analyze_cell_logical(cell: Path, dump_prefixes: bool = False) -> dict[str, A
         g = max(lcp_lengths, default=0)
         if g != trie_match:
             raise AssertionError(f"prefix trie mismatch at call {call_index}: {trie_match} != {g}")
-        g128 = (g // OPENAI_BLOCK) * OPENAI_BLOCK
+        logical_match_aligned = (g // match_unit) * match_unit
         logical_candidates = [
             i for i, matched in enumerate(lcp_lengths) if g > 0 and matched == g
         ]
@@ -371,7 +495,12 @@ def analyze_cell_logical(cell: Path, dump_prefixes: bool = False) -> dict[str, A
             i
             for i, matched in enumerate(lcp_lengths)
             if c["cacheRead"] > 0
-            and _provider_aligned_tokens(matched, c["input"], n) >= c["cacheRead"]
+            and _provider_aligned_tokens(
+                matched,
+                c["input"],
+                n,
+                match_unit,
+            ) >= c["cacheRead"]
         ]
         exact_hash_sources = [
             i
@@ -401,7 +530,12 @@ def analyze_cell_logical(cell: Path, dump_prefixes: bool = False) -> dict[str, A
             (c["start_ms"] - calls[latest_completed_candidate]["end_ms"]) / 1000.0
             if latest_completed_candidate is not None else None
         )
-        logical_aligned = _provider_aligned_tokens(g, c["input"], n)
+        logical_aligned = _provider_aligned_tokens(
+            g,
+            c["input"],
+            n,
+            match_unit,
+        )
         capture_rate = (
             c["cacheRead"] / logical_aligned if logical_aligned > 0 else None
         )
@@ -417,7 +551,7 @@ def analyze_cell_logical(cell: Path, dump_prefixes: bool = False) -> dict[str, A
                 f"realized_sources={realized_candidates}  "
                 f"exact_hash_sources={exact_hash_sources}  "
                 f"latest_source_age_s={latest_start_age}  "
-                f"time_since_latest_compatible_prefix_s={latest_completion_gap} =====\n"
+                f"newest_possible_source_age_s={latest_completion_gap} =====\n"
                 f"--- REUSED PREFIX (served from cache) ---\n{_preview(enc, tokens[:g])}\n"
                 f"--- DIVERGES HERE → NEW TAIL BEGINS ---\n{new_head!r}\n"
             )
@@ -426,7 +560,7 @@ def analyze_cell_logical(cell: Path, dump_prefixes: bool = False) -> dict[str, A
         sum_cacheread += c["cacheRead"]
         sum_our_tokens += n
         sum_logical += g
-        sum_logical_128 += g128
+        sum_logical_aligned += logical_match_aligned
         sum_role_logical += r
         call_record = {
             "run_id": c["run_id"], "role": c["role"], "our_tokens": n,
@@ -458,7 +592,7 @@ def analyze_cell_logical(cell: Path, dump_prefixes: bool = False) -> dict[str, A
                 round(latest_completion_gap, 4)
                 if latest_completion_gap is not None else None
             ),
-            "time_since_latest_compatible_prefix_s": (
+            "newest_possible_source_age_s": (
                 round(latest_completion_gap, 4)
                 if latest_completion_gap is not None else None
             ),
@@ -469,6 +603,7 @@ def analyze_cell_logical(cell: Path, dump_prefixes: bool = False) -> dict[str, A
         call_record["reuse_band"] = _reuse_band(call_record)
         per_call.append(call_record)
         token_history.append(tokens)
+        block_references.extend(_cache_block_references(tokens, physical_block_size))
 
     denom = sum_our_tokens or 1
     in_denom = sum_input or 1
@@ -483,12 +618,19 @@ def analyze_cell_logical(cell: Path, dump_prefixes: bool = False) -> dict[str, A
         # fractions (the comparable numbers)
         "realized_frac": round(sum_cacheread / in_denom, 4),
         "logical_frac": round(sum_logical / denom, 4),
-        "logical_128_frac": round(sum_logical_128 / denom, 4),
-        "gap_frac": round(sum_logical_128 / denom - sum_cacheread / in_denom, 4),
+        "logical_aligned_frac": round(sum_logical_aligned / denom, 4),
+        "logical_128_frac": round(sum_logical_aligned / denom, 4),
+        "gap_frac": round(sum_logical_aligned / denom - sum_cacheread / in_denom, 4),
         "cross_agent_bonus_frac": round((sum_logical - sum_role_logical) / denom, 4),
         # absolute token totals (context)
         "cacheread_tokens": sum_cacheread,
         "logical_tokens": sum_logical,
+        "logical_aligned_tokens": sum_logical_aligned,
+        "cache_geometry": {
+            "block_size": physical_block_size,
+            "prefix_match_unit": match_unit,
+        },
+        "block_demand": _reuse_distance_summary(block_references),
         "source_class_counts": {
             source_class: sum(1 for c in per_call if c["source_class"] == source_class)
             for source_class in [
@@ -542,28 +684,27 @@ def _role_colors(roles: list[str]) -> dict[str, str]:
 
 
 def _lineage_parent_index(call: dict[str, Any]) -> int | None:
-    """Return the latest longest-prefix source for a realized cache hit."""
-    if call["cacheRead"] <= 0:
-        return None
+    """Return the latest source sharing the call's longest logical prefix."""
     candidates = call.get("logical_source_candidates") or []
     return max(candidates) if candidates else None
 
 
-def _cache_read_fraction(call: dict[str, Any]) -> float:
-    """Return cacheRead/input clamped to the visible percentage range."""
+def _logical_reuse_fraction(call: dict[str, Any]) -> float:
+    """Return aligned logical prefix reuse divided by input tokens."""
     input_tokens = int(call.get("input", 0) or 0)
     if input_tokens <= 0:
         return 0.0
-    return min(max(int(call.get("cacheRead", 0) or 0) / input_tokens, 0.0), 1.0)
+    logical_tokens = int(call.get("logical_aligned", 0) or 0)
+    return min(max(logical_tokens / input_tokens, 0.0), 1.0)
 
 
-def _lineage_marker_size(cache_fraction: float) -> float:
-    """Map a cache-read fraction to a Matplotlib scatter area."""
-    return 90.0 + 320.0 * min(max(cache_fraction, 0.0), 1.0)
+def _lineage_marker_size(reuse_fraction: float) -> float:
+    """Map a logical reuse fraction to a Matplotlib scatter area."""
+    return 90.0 + 320.0 * min(max(reuse_fraction, 0.0), 1.0)
 
 
 def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
-    """Plot only realized cache-hit lineage and the calls that supplied it."""
+    """Plot logical longest-prefix lineage across all reusable calls."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -616,7 +757,7 @@ def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
     if visible:
         ordered = sorted(visible)
         sizes = {
-            i: _lineage_marker_size(_cache_read_fraction(pc[i]))
+            i: _lineage_marker_size(_logical_reuse_fraction(pc[i]))
             for i in ordered
         }
         ax.scatter(
@@ -631,7 +772,7 @@ def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
     else:
         sizes = {}
         ax.text(
-            0.5, 0.5, "No realized cache hits",
+            0.5, 0.5, "No logical prefix reuse",
             transform=ax.transAxes, ha="center", va="center",
             color="#555555", fontsize=12,
         )
@@ -682,7 +823,7 @@ def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
     ]
     ax.legend(
         handles=size_legend,
-        title="cacheRead / input",
+        title="logical reuse / input",
         fontsize=8,
         loc="lower left",
         bbox_to_anchor=(1.01, 0.0),
@@ -691,8 +832,8 @@ def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
     ax.set_xlim(-1, max(len(pc), 1))
     ax.set_yticks([])
     ax.set_xlabel("global LLM call index")
-    ax.set_ylabel("realized cache branches")
-    ax.set_title("Realized KV-cache lineage")
+    ax.set_ylabel("logical prefix branches")
+    ax.set_title("Logical KV-cache lineage")
     ax.grid(True, axis="x", alpha=0.18)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150, bbox_inches="tight")

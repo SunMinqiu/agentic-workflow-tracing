@@ -53,6 +53,7 @@ from typing import Any
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 CTX_GROWTH_PNG = "kvcache_context_growth.png"
 CELL_JSON = "kvcache_demand.json"
@@ -339,6 +340,7 @@ def plot_context_growth(
     )
     ax2.set_ylabel("tokens")
     ax2.set_xlabel("LLM call index (chronological)")
+    ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax2.set_title("Input reuse composition")
     ax2.legend(fontsize=8, loc="upper left")
     ax2.grid(True, alpha=0.25)

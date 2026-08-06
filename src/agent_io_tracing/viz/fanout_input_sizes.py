@@ -20,17 +20,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from agent_io_tracing.viz.format_utils import jload
 
 
 AXIS1 = [("base", 1), ("a1_c2", 2), ("a1_c4", 4), ("a1_c8", 8)]
 AXIS2 = [("base", 1), ("a2_t2", 2), ("a2_t4", 4), ("a2_t8", 8)]
-
-
-def jload(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
 
 
 def cell_axis_param(cell: str) -> tuple[str, int]:

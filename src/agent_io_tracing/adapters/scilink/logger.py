@@ -43,9 +43,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from agent_io_tracing.adapters.trace_writer import TraceFileWriter, normalize_tool_name
 from agent_io_tracing.adapters.llm_trace import (
     EMPTY_USAGE,
     cache_key,
+    capture_messages,
+    capture_request_params,
+    capture_response,
     field,
     format_system_prompt as _format_system_prompt_entry,
     format_tool_log as _format_log_line,
@@ -54,6 +58,7 @@ from agent_io_tracing.adapters.llm_trace import (
     provider_request_id,
     runtime_vendor,
     strip_nocache_tag,
+    trace_cache_config,
 )
 
 try:
@@ -67,14 +72,6 @@ _current_parent: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 
 
 # ----- formatting helpers (mirror langchain_tool_logger.py exactly) ---------
-
-
-def _normalize_tool_name(name: str | None) -> str:
-    if not name:
-        return "Tool"
-    if name.lower() == "bash":
-        return "Bash"
-    return name[0].upper() + name[1:]
 
 
 # ----- usage normalization (litellm response shapes) ------------------------
@@ -149,14 +146,6 @@ def _to_epoch_ms(t: Any) -> float:
     return time.time() * 1000.0
 
 
-def _to_datetime(t: Any) -> datetime:
-    if isinstance(t, datetime):
-        return t
-    if isinstance(t, (int, float)):
-        return datetime.fromtimestamp(float(t) if t < 1e12 else t / 1000.0)
-    return datetime.now()
-
-
 def _infer_scilink_role(kwargs: dict[str, Any]) -> str:
     """Read the most specific agent name LiteLLM exposes in request metadata."""
     candidates = [
@@ -228,7 +217,7 @@ class _PendingTool:
         self.parent_run_id = parent_run_id
 
 
-class LiteLLMToolLogger:
+class LiteLLMToolLogger(TraceFileWriter):
     """
     Pi-compatible event logger for SciLink agent runs.
 
@@ -259,31 +248,6 @@ class LiteLLMToolLogger:
         self._system_prompt_captured = False
 
     # ----- internal IO ---------------------------------------------------
-
-    def _append_tool_log(self, line: str) -> None:
-        with self._lock:
-            with self._tool_log.open("a", encoding="utf-8") as f:
-                f.write(line)
-
-    def _append_system_prompt(self, entry: str) -> None:
-        with self._lock:
-            with self._system_prompt_log.open("a", encoding="utf-8") as f:
-                f.write(entry)
-
-    def _append_event(self, event: dict) -> None:
-        with self._lock:
-            with self._events_log.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
-
-    def _append_generated_code(self, record: dict) -> None:
-        with self._lock:
-            with self._generated_code_log.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-
-    def _append_messages(self, record: dict) -> None:
-        with self._lock:
-            with self._messages_log.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
     def capture_generated_code(
         self,
@@ -384,6 +348,12 @@ class LiteLLMToolLogger:
             start_ms = _to_epoch_ms(start_time)
             end_ms = _to_epoch_ms(end_time)
             first_token_ms = _first_token_ms(kwargs, start_ms, end_ms)
+            captured_params = capture_request_params(
+                kwargs.get("litellm_params"),
+                kwargs.get("optional_params"),
+                kwargs,
+            )
+            captured_response = capture_response(completion_response)
             cache_config = {
                 key: kwargs[key]
                 for key in (
@@ -399,7 +369,7 @@ class LiteLLMToolLogger:
                 "provider": provider,
                 "vendor": runtime_vendor(provider, model),
                 "model": str(model),
-                "cache_config": cache_config,
+                "cache_config": trace_cache_config(cache_config),
                 "phase": infer_phase(messages),
                 "cache_key": cache_key(provider, model, messages),
                 "provider_request_id": provider_request_id(completion_response),
@@ -457,6 +427,13 @@ class LiteLLMToolLogger:
                 "run_id": run_id,
                 "timestamp": _to_epoch_ms(start_time),
                 "messages": normalize_messages(messages),
+                "request": {
+                    "messages": capture_messages(messages),
+                    "parameters": captured_params,
+                },
+                "request_params": captured_params,
+                "response": captured_response,
+                "response_text": captured_response.get("text"),
                 "nocache_tag": nocache_tag,
             })
         except Exception as e:
@@ -476,10 +453,17 @@ class LiteLLMToolLogger:
             parent = _current_parent.get()
             model = kwargs.get("model") or "?"
             provider = _litellm_provider(kwargs, model)
+            captured_params = capture_request_params(
+                kwargs.get("litellm_params"),
+                kwargs.get("optional_params"),
+                kwargs,
+            )
             common = {
                 "agent_role": _infer_scilink_role(kwargs),
                 "provider": provider,
+                "vendor": runtime_vendor(provider, model),
                 "model": str(model),
+                "cache_config": trace_cache_config(),
                 "phase": infer_phase(messages),
                 "cache_key": cache_key(provider, model, messages),
                 "nocache": bool(nocache_tag),
@@ -514,6 +498,11 @@ class LiteLLMToolLogger:
                 "run_id": run_id,
                 "timestamp": _to_epoch_ms(start_time),
                 "messages": normalize_messages(messages),
+                "request": {
+                    "messages": capture_messages(messages),
+                    "parameters": captured_params,
+                },
+                "request_params": captured_params,
                 "nocache_tag": nocache_tag,
                 "error": repr(original_exception),
             })
@@ -525,7 +514,7 @@ class LiteLLMToolLogger:
 
     def on_tool_start(self, tool_name: str, args: dict, run_id: str) -> datetime:
         started_at = datetime.now()
-        norm_name = _normalize_tool_name(tool_name)
+        norm_name = normalize_tool_name(tool_name)
         parent = _current_parent.get()
         with self._lock:
             self._pending[run_id] = _PendingTool(
@@ -555,7 +544,7 @@ class LiteLLMToolLogger:
         with self._lock:
             pending = self._pending.pop(run_id, None)
         if pending is None:
-            norm_name = _normalize_tool_name(tool_name)
+            norm_name = normalize_tool_name(tool_name)
             args: Any = {}
             parent = None
         else:

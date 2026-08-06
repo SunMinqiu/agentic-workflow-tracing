@@ -13,6 +13,7 @@ import csv
 import html
 import json
 from pathlib import Path
+from agent_io_tracing.viz.format_utils import esc, fmt_bytes, jload
 
 
 # Display names for known figure files, in preferred display order.
@@ -51,13 +52,6 @@ DATA_LINKS = [
 ]
 
 
-def jload(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
 def fmt_num(value, digits: int = 2) -> str:
     if value is None or value == "":
         return "n/a"
@@ -66,24 +60,6 @@ def fmt_num(value, digits: int = 2) -> str:
             return f"{value:,.0f}"
         return f"{value:.{digits}f}".rstrip("0").rstrip(".")
     return str(value)
-
-
-def fmt_bytes(value) -> str:
-    if value is None or value == "":
-        return "n/a"
-    try:
-        x = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(x) < 1024 or unit == "TB":
-            return f"{x:.0f} {unit}" if unit == "B" else f"{x:.1f} {unit}"
-        x /= 1024.0
-    return f"{x:.1f} TB"
-
-
-def esc(value) -> str:
-    return html.escape(str(value), quote=True)
 
 
 def cell_metrics(cell_dir: Path) -> dict:

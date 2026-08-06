@@ -463,7 +463,6 @@ def load_data_io_events(trace_dir: Path) -> list[dict]:
     return out
 
 
-CREATE_SYSCALLS = {"openat", "mkdirat"}
 RENAME_SYSCALLS = {"rename", "renameat", "renameat2"}
 UNLINK_SYSCALLS = {"unlink", "unlinkat", "rmdir"}
 
@@ -615,22 +614,6 @@ REUSE_CLASSES = (
     "input_read_once",     # read-only input, one reader call
     "input_read_many",     # read-only input, >=2 reader calls (re-loaded)
 )
-REUSE_LABELS = {
-    "dead_write":         "written, never read (waste)",
-    "produced_read_once": "written, read once",
-    "produced_read_many": "written, read by many",
-    "input_read_once":    "input, read once",
-    "input_read_many":    "input, read by many",
-}
-REUSE_COLORS = {
-    "dead_write":         "#d62728",  # red  = waste
-    "produced_read_once": "#ff7f0e",  # orange
-    "produced_read_many": "#2ca02c",  # green = good reuse
-    "input_read_once":    "#9edae5",  # light cyan
-    "input_read_many":    "#1f77b4",  # blue
-}
-
-
 # Real dataset roots, used to recover the true size of GEO/TCGA input files
 # whose traced path is a symlink view (e.g. /tmp/genomas_fanout_views/...) that
 # no longer exists at analysis time. Override with LINEAGE_DATASET_ROOTS.
@@ -1510,16 +1493,6 @@ def fig_size_distribution(io_events: list[dict], per_artifact: dict, out_path: P
 
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-
-
-def _short(path: str, n: int = 48) -> str:
-    return path if len(path) <= n else "…" + path[-(n - 1):]
-
-
-def _category_legend(ax, cats):
-    from matplotlib.patches import Patch
-    handles = [Patch(facecolor=CATEGORY_COLORS[c], label=c) for c in cats]
-    ax.legend(handles=handles, fontsize=8, loc="lower right")
 
 
 def fig_reader_fanout(per_artifact: dict, out_path: Path):

@@ -121,7 +121,9 @@ try:
     for chunk in stream:
         delta = chunk.choices[0].delta if chunk.choices else None
         if delta is not None and (
-            delta.content or getattr(delta, "reasoning_content", None)
+            delta.content
+            or getattr(delta, "reasoning_content", None)
+            or getattr(delta, "reasoning", None)
         ) and first_token is None:
             first_token = time.time()
         if chunk.usage is not None:
@@ -326,7 +328,7 @@ done
 
 if [ "$CELL_IDX" -eq 0 ]; then
     echo "Error: RUN_WORKLOADS selected zero GenoMAS cells: ${RUN_WORKLOADS:-<empty>}" >&2
-    echo "Available cells: A_c1_w1,A_c2_w2,A_c3_w2,A_c4_w2,A_c4_w4,A_c8_w4,B_t1_w2,B_t2_w2,B_t4_w2" >&2
+    echo "Available cells: A_c1_w1,A_c2_w1,A_c2_w2,A_c3_w2,A_c4_w2,A_c4_w4,A_c8_w4,B_t1_w2,B_t2_w2,B_t4_w2" >&2
     exit 2
 fi
 

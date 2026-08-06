@@ -61,6 +61,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from agent_io_tracing.adapters.trace_writer import TraceFileWriter, normalize_tool_name
+
 try:
     from langchain_core.callbacks.base import BaseCallbackHandler
 except ImportError:
@@ -82,14 +84,6 @@ except ImportError:
 
 def _format_time(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S.%f")  # 6-digit microseconds
-
-
-def _normalize_tool_name(name: str | None) -> str:
-    if not name:
-        return "Tool"
-    if name.lower() == "bash":
-        return "Bash"
-    return name[0].upper() + name[1:]
 
 
 def _python_literal(value: Any) -> str:
@@ -206,7 +200,7 @@ class _PendingTool:
         self.args = args
 
 
-class LangChainToolLogger(BaseCallbackHandler):
+class LangChainToolLogger(TraceFileWriter, BaseCallbackHandler):
     """
     Pi-compatible tool / event logger for LangChain (and LangGraph) runs.
 
@@ -265,29 +259,8 @@ class LangChainToolLogger(BaseCallbackHandler):
 
     # ----- internal IO --------------------------------------------------
 
-    def _append_tool_log(self, line: str) -> None:
-        with self._lock:
-            with self._tool_log.open("a", encoding="utf-8") as f:
-                f.write(line)
-
     def _append_subagent_log(self, line: str) -> None:
-        with self._lock:
-            with self._subagent_log.open("a", encoding="utf-8") as f:
-                f.write(line)
-
-    def _append_system_prompt(self, entry: str) -> None:
-        with self._lock:
-            with self._system_prompt_log.open("a", encoding="utf-8") as f:
-                f.write(entry)
-
-    def _append_event(self, event: dict) -> None:
-        with self._lock:
-            with self._events_log.open("a", encoding="utf-8") as f:
-                # default=str so LangChain's HumanMessage / AIMessage / etc.
-                # (which appear in tool args for agent-handoff tools and aren't
-                # JSON-serializable by default) get stringified instead of
-                # raising TypeError mid-write.
-                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        self._append_text(self._subagent_log, line)
 
     # ----- subagent classification helpers ------------------------------
     # All helpers below assume `self._lock` is held.
@@ -468,7 +441,7 @@ class LangChainToolLogger(BaseCallbackHandler):
         inputs: dict | None = None,
         **kwargs: Any,
     ) -> None:
-        tool_name = _normalize_tool_name((serialized or {}).get("name"))
+        tool_name = normalize_tool_name((serialized or {}).get("name"))
         args = self._coerce_inputs(input_str, inputs)
         started_at = datetime.now()
         run_key = str(run_id)
@@ -507,7 +480,7 @@ class LangChainToolLogger(BaseCallbackHandler):
             pending = self._pending.pop(run_key, None)
         if pending is None:
             started_at = ended_at
-            tool_name = _normalize_tool_name(kwargs.get("name"))
+            tool_name = normalize_tool_name(kwargs.get("name"))
             args: Any = {}
         else:
             started_at = pending.started_at

@@ -19,6 +19,37 @@ _CACHE_REQUEST_KEYS = (
     "prompt_cache_options",
     "cache_control",
 )
+_CAPTURE_REQUEST_KEYS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "seed",
+    "stop",
+    "max_tokens",
+    "max_completion_tokens",
+    "min_tokens",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "n",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "response_format",
+    "reasoning_effort",
+    "thinking_token_budget",
+    "logprobs",
+    "top_logprobs",
+    "ignore_eos",
+    "add_generation_prompt",
+    "continue_final_message",
+    "chat_template",
+    "chat_template_kwargs",
+    "stream",
+    "stream_options",
+    "extra_body",
+)
 
 
 def field(obj: Any, *names: str) -> Any:
@@ -28,14 +59,6 @@ def field(obj: Any, *names: str) -> Any:
         if value is not None:
             return value
     return None
-
-
-def integer_field(obj: Any, *names: str) -> int:
-    value = field(obj, *names)
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def stable_json(value: Any) -> str:
@@ -54,6 +77,85 @@ def normalize_messages(messages: Any) -> list[dict[str, Any]]:
             "content": field(message, "content"),
         })
     return output
+
+
+def jsonable(value: Any) -> Any:
+    """Convert SDK and Pydantic values into stable JSON-compatible data."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(item) for item in value]
+    if hasattr(value, "model_dump"):
+        try:
+            return jsonable(value.model_dump())
+        except Exception:
+            pass
+    if hasattr(value, "dict"):
+        try:
+            return jsonable(value.dict())
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        try:
+            return {
+                str(key): jsonable(item)
+                for key, item in vars(value).items()
+                if not str(key).startswith("_")
+            }
+        except Exception:
+            pass
+    return str(value)
+
+
+def capture_messages(messages: Any) -> list[dict[str, Any]]:
+    """Preserve complete outgoing messages for chat-template replay."""
+    captured = jsonable(messages or [])
+    return captured if isinstance(captured, list) else []
+
+
+def capture_request_params(*sources: Any) -> dict[str, Any]:
+    """Merge replay-relevant, non-secret generation parameters."""
+    output: dict[str, Any] = {}
+    for source in sources:
+        value = jsonable(source)
+        if not isinstance(value, dict):
+            continue
+        for key in _CAPTURE_REQUEST_KEYS:
+            if key in value and value[key] is not None:
+                output[key] = value[key]
+    return output
+
+
+def capture_response(response: Any) -> dict[str, Any]:
+    """Capture comparable response text, reasoning, tools, and finish state."""
+    direct_text = field(response, "content", "text")
+    raw = field(response, "raw_response") or response
+    choices = field(raw, "choices") or []
+    choice = choices[0] if choices else None
+    message = field(choice, "message") if choice is not None else None
+    text = (
+        field(message, "content")
+        if message is not None else field(choice, "text")
+        if choice is not None else direct_text
+    )
+    reasoning = (
+        field(message, "reasoning_content", "reasoning")
+        if message is not None else None
+    )
+    tool_calls = field(message, "tool_calls") if message is not None else None
+    finish_reason = field(choice, "finish_reason") if choice is not None else None
+    captured = {
+        "text": jsonable(text),
+        "reasoning": jsonable(reasoning),
+        "tool_calls": jsonable(tool_calls),
+        "finish_reason": jsonable(finish_reason),
+    }
+    return {
+        key: value for key, value in captured.items()
+        if value is not None
+    }
 
 
 # No-cache arm ---------------------------------------------------------------
@@ -118,7 +220,7 @@ def cache_key(provider: Any, model: Any, messages: Any) -> str:
     payload = {
         "provider": str(provider or "?"),
         "model": str(model or "?"),
-        "messages": normalize_messages(messages),
+        "messages": capture_messages(messages),
     }
     return hashlib.sha256(stable_json(payload).encode("utf-8", "replace")).hexdigest()
 
@@ -128,6 +230,10 @@ def runtime_vendor(provider: Any, model: Any) -> str:
     explicit = os.environ.get("GENOMAS_VENDOR") or os.environ.get("SCILINK_VENDOR")
     if explicit:
         return explicit
+    serving = serving_config()
+    backend = str(serving.get("backend") or serving.get("engine") or "").lower()
+    if backend == "vllm":
+        return "vLLM"
     base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
     if base_url:
         host = (urlparse(base_url).hostname or base_url).lower()
@@ -142,6 +248,33 @@ def runtime_vendor(provider: Any, model: Any) -> str:
     return str(provider or "unknown")
 
 
+def serving_config() -> dict[str, Any]:
+    """Return the arm manifest supplied by the shared serving driver."""
+    raw = os.environ.get("KVCACHE_ARM_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {
+            "manifest_error": f"invalid KVCACHE_ARM_JSON: {exc.msg}",
+        }
+    if not isinstance(value, dict):
+        return {
+            "manifest_error": "KVCACHE_ARM_JSON must contain a JSON object",
+        }
+    return value
+
+
+def trace_cache_config(request_config: Any = None) -> dict[str, Any]:
+    """Combine request cache controls with the serving arm manifest."""
+    output = dict(request_config) if isinstance(request_config, dict) else {}
+    serving = serving_config()
+    if serving:
+        output["serving"] = serving
+    return output
+
+
 def cache_request_config(client: Any) -> dict[str, Any]:
     """Return only cache controls actually present in the outgoing request."""
     config = getattr(client, "config", None)
@@ -149,17 +282,6 @@ def cache_request_config(client: Any) -> dict[str, Any]:
     if not isinstance(params, dict):
         return {}
     return {key: params[key] for key in _CACHE_REQUEST_KEYS if key in params}
-
-
-def epoch_ms(value: Any) -> float:
-    if hasattr(value, "timestamp"):
-        try:
-            return float(value.timestamp()) * 1000.0
-        except Exception:
-            pass
-    if isinstance(value, (int, float)):
-        return float(value) * (1000.0 if value < 1e12 else 1.0)
-    return datetime.now().timestamp() * 1000.0
 
 
 def provider_request_id(response: Any) -> str | None:

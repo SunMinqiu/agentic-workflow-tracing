@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from agent_io_tracing.parsing.timefmt import parse_time
 
 
 TOOL_CALL_PATTERN = re.compile(
@@ -44,15 +45,6 @@ class LlmSegment:
     def duration_ms(self) -> float:
         return max(0.0, self.end_ms - self.start_ms)
 
-
-def parse_time(time_str: str) -> datetime:
-    parts = time_str.split(".")
-    time_part = parts[0]
-    micros = parts[1] if len(parts) > 1 else "0"
-    micros = micros[:6].ljust(6, "0")
-    base = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    hour, minute, second = map(int, time_part.split(":"))
-    return base.replace(hour=hour, minute=minute, second=second, microsecond=int(micros))
 
 
 def estimate_tokens_from_text(text: str) -> int:

@@ -34,6 +34,7 @@ from agent_io_tracing.analysis.execution_units import (
     annotate_parsed_execution_units,
     load_execution_units,
 )
+from agent_io_tracing.viz.format_utils import datetime_from_ms, esc, fmt_bytes, jload
 
 
 # =============================================================================
@@ -152,9 +153,6 @@ LLM_SUBAGENT_COLOR = "#A8E6A3"
 # here removes the duplicate-definition bug that allowed silent drift.
 category_colors = SYSCALL_CATEGORY_COLORS
 
-# Operation type colors (top 10) — used by other viz that aren't categorized.
-OPERATION_COLORS = px.colors.qualitative.Set3
-
 # Syscall category classification
 SYSCALL_CATEGORIES = {
     "metadata": {
@@ -228,32 +226,6 @@ def classify_syscall(syscall: str) -> str:
         if syscall in syscalls:
             return category
     return "other"
-
-
-def resource_for_syscall(syscall: str) -> str | None:
-    """Map a syscall name to the resource taxonomy used by time accounting.
-
-    Network is out of scope (None). Blocking maps to "Wait" so it is both shown
-    as its own segment AND subtracted from the CPU-compute residual (keeping CPU
-    honest). The sum pie bounds Wait per tool so it can't overcount.
-    """
-    category = classify_syscall(syscall)
-    if category == "network":
-        return None
-    if category == "control":
-        return "File-IO" if syscall in STORAGE_CONTROL_SYSCALLS else "Other"
-    return SYSCALL_CATEGORY_TO_RESOURCE.get(category)
-
-
-def _is_code_exec_tool(tool_name: str) -> bool:
-    return tool_name in {
-        "Bash",
-        "CodeExec",
-        "ScriptExec",
-        "SubprocessExec",
-        "PythonExec",
-        "ShellExec",
-    }
 
 
 # =============================================================================
@@ -346,341 +318,9 @@ def load_parsed_json(filepath: Path) -> StraceData:
 # Visualization: Timeline
 # =============================================================================
 
-PROCESS_SPAWN_SYSCALLS = {"clone", "clone3", "fork", "vfork"}
-
-
-def _extract_child_pid(entry: pd.Series) -> int | None:
-    """Extract child PID from a process-spawn syscall entry."""
-    return_value = entry.get("return_value")
-    if isinstance(return_value, (int, np.integer)) and return_value > 0:
-        return int(return_value)
-    if isinstance(return_value, float) and np.isfinite(return_value) and return_value.is_integer() and return_value > 0:
-        return int(return_value)
-
-    args = entry.get("args")
-    if isinstance(args, str):
-        match = re.search(r"child_pid=(\d+)", args)
-        if match:
-            return int(match.group(1))
-    return None
-
-
-def _build_process_info(data: StraceData) -> pd.DataFrame:
-    """Reconstruct process lifetimes and parent relationships from fs entries."""
-    from collections import deque as _deque
-
-    fs_df = data.fs_entries_df.copy()
-    if len(fs_df) == 0:
-        return pd.DataFrame(columns=[
-            "pid", "ppid", "first_seen", "last_seen", "lifespan_s",
-            "row_index", "is_main", "label", "depth",
-        ])
-
-    if "operation" not in fs_df.columns and "syscall" in fs_df.columns:
-        fs_df["operation"] = fs_df["syscall"]
-
-    lifespan_df = (
-        fs_df.groupby("pid", observed=True)["time_rel"]
-        .agg(first_seen="min", last_seen="max")
-        .reset_index()
-    )
-
-    parent_by_pid: dict[int, int] = {}
-    spawn_entries = fs_df[fs_df["operation"].isin(PROCESS_SPAWN_SYSCALLS)].sort_values("time_rel")
-    for _, entry in spawn_entries.iterrows():
-        parent_pid = entry.get("pid")
-        if not isinstance(parent_pid, (int, np.integer)):
-            continue
-        child_pid = _extract_child_pid(entry)
-        if child_pid is None or child_pid == int(parent_pid):
-            continue
-        # Keep the earliest observed parent assignment for stability.
-        parent_by_pid.setdefault(child_pid, int(parent_pid))
-
-    process_df = lifespan_df.copy()
-    process_df["ppid"] = process_df["pid"].map(parent_by_pid)
-    process_df["lifespan_s"] = process_df["last_seen"] - process_df["first_seen"]
-    process_df = process_df.sort_values(["first_seen", "pid"]).reset_index(drop=True)
-    process_df["row_index"] = np.arange(len(process_df))
-
-    main_pid = None
-    summary_pids = data.summary.get("pids", [])
-    if summary_pids:
-        main_pid = summary_pids[0]
-    elif len(process_df) > 0:
-        main_pid = int(process_df.iloc[0]["pid"])
-
-    process_df["is_main"] = process_df["pid"] == main_pid if main_pid is not None else False
-    process_df["label"] = process_df.apply(
-        lambda row: f"PID {int(row['pid'])}" + (" (main)" if row["is_main"] else ""),
-        axis=1,
-    )
-
-    # Compute tree depth via BFS from the main PID.
-    children_of: dict[int, list[int]] = {}
-    for _, row in process_df.iterrows():
-        ppid = row["ppid"]
-        if pd.notna(ppid):
-            children_of.setdefault(int(ppid), []).append(int(row["pid"]))
-
-    depth_map: dict[int, int] = {}
-    if main_pid is not None:
-        mp = int(main_pid)
-        depth_map[mp] = 0
-        queue = _deque([mp])
-        while queue:
-            cur = queue.popleft()
-            for ch in children_of.get(cur, []):
-                if ch not in depth_map:
-                    depth_map[ch] = depth_map[cur] + 1
-                    queue.append(ch)
-
-    fallback_depth = max(depth_map.values(), default=0) + 1
-    process_df["depth"] = process_df["pid"].apply(
-        lambda p: depth_map.get(int(p), fallback_depth)
-    )
-
-    # Add per-PID syscall event count for importance ranking.
-    event_counts = fs_df.groupby("pid", observed=True).size()
-    process_df["event_count"] = process_df["pid"].map(event_counts).fillna(0).astype(int)
-
-    # When the tree is flat (most non-main processes share one depth level),
-    # subdivide by activity so the collapse buttons offer a useful middle
-    # ground between "main only" and "all 150+ processes".
-    non_main = process_df[~process_df["is_main"]]
-    if len(non_main) > 20:
-        dominant_depth = non_main["depth"].mode().iloc[0] if len(non_main) > 0 else 1
-        same_depth_count = (non_main["depth"] == dominant_depth).sum()
-        if same_depth_count / len(non_main) > 0.8:
-            top_quartile = non_main["event_count"].quantile(0.75)
-            process_df["depth"] = process_df.apply(
-                lambda row: (
-                    row["depth"] if row["is_main"]
-                    else int(dominant_depth) if row["event_count"] >= top_quartile
-                    else int(dominant_depth) + 1
-                ),
-                axis=1,
-            )
-
-    return process_df
-
-
-
-
-
 # =============================================================================
 # Visualization: I/O Rate Timeline
 # =============================================================================
-
-def _get_tool_label(row: pd.Series, max_len: int = 40) -> str:
-    """Extract a short label for a tool call, showing up to max_len chars of the command."""
-    tool_name = row["tool_name"]
-    params = row["input_params"]
-
-    if tool_name == "Bash" and isinstance(params, dict):
-        cmd = params.get("command", "")
-        # Just show up to max_len characters of the command
-        cmd_trunc = cmd[:max_len] + ("..." if len(cmd) > max_len else "")
-        return f"{tool_name}: {cmd_trunc}"
-    elif isinstance(params, dict):
-        if "file_path" in params:
-            fp = params["file_path"]
-            name = Path(fp).name
-            if len(name) > max_len:
-                name = name[:max_len] + "..."
-            return f"{tool_name}: {name}"
-        elif "pattern" in params:
-            pat = params["pattern"]
-            if len(pat) > max_len:
-                pat = pat[:max_len] + "..."
-            return f"{tool_name}: {pat}"
-        elif "query" in params:
-            q = params["query"]
-            if len(q) > max_len:
-                q = q[:max_len] + "..."
-            return f"{tool_name}: {q}"
-    return tool_name
-
-
-def _syscall_size_hover_fragment(entry: pd.Series) -> str:
-    """Return a hover line for syscall size/bytes when present, else empty."""
-    # parse_ebpf.py writes `bytes_transferred`; keep `size` as a compatibility
-    # fallback for other parsed.json producers.
-    size_val = entry.get("bytes_transferred")
-    if pd.isna(size_val):
-        size_val = entry.get("size")
-    if pd.isna(size_val):
-        return ""
-
-    if isinstance(size_val, (int, np.integer)):
-        if int(size_val) <= 0:
-            return ""
-        size_text = f"{int(size_val)} bytes"
-    elif isinstance(size_val, float):
-        if not np.isfinite(size_val) or size_val <= 0:
-            return ""
-        if np.isfinite(size_val) and size_val.is_integer():
-            size_text = f"{int(size_val)} bytes"
-        else:
-            size_text = f"{size_val:g} bytes"
-    else:
-        size_text = str(size_val)
-
-    return f"Size: {size_text}<br>"
-
-
-def _syscall_access_mode_hover_fragment(entry: pd.Series) -> str:
-    """Return a hover line for openat access mode when present."""
-    op = entry.get("operation")
-    if pd.isna(op):
-        op = entry.get("syscall")
-    if op != "openat":
-        return ""
-
-    access_mode = entry.get("access_mode")
-    if pd.isna(access_mode) or not access_mode:
-        open_flags = entry.get("open_flags")
-        if pd.isna(open_flags) or not open_flags:
-            return ""
-        # parse_ebpf.py encodes open flags like "O_RDONLY|O_CLOEXEC|..."
-        access_mode = str(open_flags).split("|", 1)[0]
-
-    return f"Access mode: {access_mode}<br>"
-
-
-def _compute_label_positions(tc_df: pd.DataFrame, y_max: float, min_gap: float = 0.5) -> list[float]:
-    """Compute y positions for labels to avoid overlap.
-    
-    Uses alternating levels and checks for horizontal proximity.
-    """
-    positions = []
-    levels = [0.95, 0.85, 0.75, 0.65]  # Fractions of y_max
-    
-    for i, (_, row) in enumerate(tc_df.iterrows()):
-        start = row["start_rel"]
-        
-        # Find the best level that doesn't conflict with recent labels
-        best_level = 0
-        for level_idx, level in enumerate(levels):
-            # Check if any recent label at this level would overlap
-            conflict = False
-            for j in range(max(0, i - len(levels)), i):
-                if positions[j] == level * y_max:
-                    prev_end = tc_df.iloc[j]["end_rel"]
-                    if start - prev_end < min_gap:
-                        conflict = True
-                        break
-            if not conflict:
-                best_level = level_idx
-                break
-        
-        positions.append(levels[best_level] * y_max)
-    
-    return positions
-
-
-def create_io_rate_plotly(data: StraceData, output_path: Path) -> None:
-    """Create I/O rate over time chart with Plotly."""
-    fs_df = data.fs_entries_df.copy()
-    tc_df = data.tool_calls_df
-    
-    # Ensure errno column exists
-    if "errno" not in fs_df.columns:
-        fs_df["errno"] = None
-    
-    # Bin operations by time (100ms bins)
-    bin_size = 0.1  # seconds
-    bins = np.arange(0, data.duration_seconds + bin_size, bin_size)
-    fs_df["time_bin"] = pd.cut(fs_df["time_rel"], bins=bins)
-    
-    # Count per bin
-    bin_counts = fs_df.groupby("time_bin", observed=True).size()
-    bin_centers = [(b.left + b.right) / 2 for b in bin_counts.index]
-    
-    # Count errors per bin
-    error_counts = fs_df[fs_df["errno"].notna()].groupby("time_bin", observed=True).size()
-    
-    # Calculate max y for label positioning
-    y_max = bin_counts.max() if len(bin_counts) > 0 else 100
-    
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    # Add I/O rate line first (so vrects appear behind)
-    fig.add_trace(go.Scatter(
-        x=bin_centers,
-        y=bin_counts.values,
-        mode='lines',
-        name='Syscalls per 100ms',
-        line=dict(color='#2c3e50', width=2),
-        fill='tozeroy',
-        fillcolor='rgba(44, 62, 80, 0.3)',
-    ), secondary_y=False)
-    
-    # Add error rate as markers on secondary y-axis
-    if len(error_counts) > 0:
-        error_centers = [(b.left + b.right) / 2 for b in error_counts.index]
-        fig.add_trace(go.Scatter(
-            x=error_centers,
-            y=error_counts.values,
-            mode='markers',
-            name='Errors',
-            marker=dict(color='#e74c3c', size=10, symbol='x'),
-            hovertemplate="Time: %{x:.2f}s<br>Errors: %{y}<extra></extra>",
-        ), secondary_y=True)
-    
-    # Compute label positions to avoid overlap
-    label_y_positions = _compute_label_positions(tc_df, y_max, min_gap=0.3)
-    
-    # Add tool call regions as vertical bands (without annotations)
-    for i, (_, row) in enumerate(tc_df.iterrows()):
-        color = color_for_tool(row["tool_name"])
-        fig.add_vrect(
-            x0=row["start_rel"],
-            x1=row["end_rel"],
-            fillcolor=color,
-            opacity=0.2,
-            line_width=0,
-        )
-        
-        # Add label as a separate annotation with computed y position
-        label = _get_tool_label(row, max_len=35)
-        label_x = (row["start_rel"] + row["end_rel"]) / 2
-        label_y = label_y_positions[i]
-        
-        fig.add_annotation(
-            x=label_x,
-            y=label_y,
-            text=label,
-            showarrow=True,
-            arrowhead=2,
-            arrowsize=0.8,
-            arrowwidth=1,
-            arrowcolor=color,
-            ax=0,
-            ay=-20,
-            font=dict(size=9, color=color),
-            bgcolor="rgba(255,255,255,0.8)",
-            bordercolor=color,
-            borderwidth=1,
-            borderpad=2,
-            textangle=-30,  # Diagonal labels to prevent overlap
-        )
-    
-    fig.update_layout(
-        title="I/O Rate Over Time (with Error Markers)",
-        xaxis_title="Time (seconds from start)",
-        height=500,  # Increased height for labels
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        # Add margin at top for labels
-        margin=dict(t=80),
-    )
-    
-    fig.update_yaxes(title_text="Syscalls per 100ms", secondary_y=False)
-    fig.update_yaxes(title_text="Errors per 100ms", secondary_y=True, color='#e74c3c')
-    
-    fig.write_html(output_path)
-
 
 def create_io_rate_matplotlib(trace_dir: Path, output_path: Path) -> None:
     """Bytes/s read/write rate with inference intensity overlay."""
@@ -817,55 +457,6 @@ def create_io_rate_matplotlib(trace_dir: Path, output_path: Path) -> None:
 # =============================================================================
 # Visualization: Phase Breakdown
 # =============================================================================
-
-def _exclusive_role_wall_tiles(
-    role_intervals: dict[str, list[tuple[float, float]]],
-    e2e_s: float,
-) -> dict[str, float]:
-    """Tile wall clock into role-exclusive, Parallel, and Idle slices."""
-    points = {0.0, max(0.0, e2e_s)}
-    merged_by_role = {
-        role: _merge_intervals(intervals)
-        for role, intervals in role_intervals.items()
-        if intervals
-    }
-    for intervals in merged_by_role.values():
-        for s, e in intervals:
-            points.add(max(0.0, min(e2e_s, s)))
-            points.add(max(0.0, min(e2e_s, e)))
-
-    out = {role: 0.0 for role in merged_by_role}
-    out["Parallel"] = 0.0
-    out["Idle"] = 0.0
-    ordered = sorted(points)
-    for s, e in zip(ordered, ordered[1:]):
-        if e <= s:
-            continue
-        mid = (s + e) / 2.0
-        active = [
-            role for role, intervals in merged_by_role.items()
-            if any(a <= mid < b for a, b in intervals)
-        ]
-        duration = e - s
-        if len(active) == 0:
-            out["Idle"] += duration
-        elif len(active) == 1:
-            out[active[0]] += duration
-        else:
-            out["Parallel"] += duration
-    return {label: value for label, value in out.items() if value > 0 or label == "Idle"}
-
-
-def _fmt_stats_line(stats: dict) -> str:
-    """One-line monospace footer under the two pies."""
-    return (
-        f"n_llm={stats['n_llm']}  n_tool={stats['n_tool']}  "
-        f"LLM_union={stats['llm_union_s']:.1f}s  "
-        f"tool_union={stats['tool_union_s']:.1f}s  "
-        f"subagent_union={stats['subagent_union_s']:.1f}s  "
-        f"unaccounted={stats['unaccounted_s']:.1f}s"
-    )
-
 
 def _colors_for_labels(labels: list[str]) -> list[str]:
     fallback = "#95A5A6"
@@ -1004,9 +595,6 @@ _IO_LAYER_COLORS = {
     "mpiio": "#1f77b4",          # mpi4py MPI.File
     "vector_index": "#9467bd",   # FAISS/Chroma/Qdrant
 }
-_IO_LAYER_ORDER = ["stdio", "posix_raw", "structured", "mpiio", "vector_index"]
-
-
 def create_measured_interface_layers_matplotlib(trace_dir: Path, output_path: Path) -> None:
     """Measured I/O interface layers from eBPF syscalls and uprobes."""
     try:
@@ -1481,201 +1069,6 @@ def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, 
 _RASTER_PX = 2000
 
 
-def _rasterize_intervals(
-    intervals: list[tuple[float, float]],
-    span_s: float,
-    px: int = _RASTER_PX,
-) -> list[tuple[float, float]]:
-    """Quantize intervals to a sub-pixel time grid, then merge adjacent cells.
-
-    A busy trace produces hundreds of thousands of one-syscall intervals whose
-    sub-pixel gaps (futex between two reads, etc.) block plain union-merge, so
-    the bar count stays huge and the chart is both unrenderable and a solid
-    smear. Snapping each interval to a grid of ``px`` buckets and merging
-    consecutive occupied buckets bounds the output to O(px) bars per resource
-    while staying visually identical: every collapsed feature is narrower than
-    one on-screen pixel. Falls back to an exact union when the span is unknown.
-    """
-    if span_s <= 0 or not intervals:
-        return _merge_intervals(intervals)
-    bucket = span_s / px
-    occupied: set[int] = set()
-    for s, e in intervals:
-        if e <= s:
-            continue
-        i0 = int(s // bucket)
-        i1 = int(e // bucket)
-        for i in range(i0, i1 + 1):
-            occupied.add(i)
-    runs: list[list[int]] = []
-    for i in sorted(occupied):
-        if runs and i == runs[-1][1] + 1:
-            runs[-1][1] = i
-        else:
-            runs.append([i, i])
-    return [(r[0] * bucket, (r[1] + 1) * bucket) for r in runs]
-
-
-def _coalesce_intervals(
-    intervals: list[tuple[float, float]], eps: float = 0.0
-) -> list[tuple[float, float]]:
-    """Union of intervals, also bridging gaps smaller than ``eps``.
-
-    Like _merge_intervals but additionally joins intervals separated by a gap
-    < eps. Used by the System lane to draw syscalls at REAL width while bounding
-    the bar count: thousands of back-to-back microsecond reads (sub-pixel gaps)
-    coalesce into a few real-width runs, instead of one bar each (unrenderable)
-    OR pixel-inflated blocks (the bug where 1.7s of reads looked like 100s).
-    """
-    merged: list[tuple[float, float]] = []
-    for s, e in sorted(intervals):
-        if e <= s:
-            continue
-        if merged and s <= merged[-1][1] + eps:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-        else:
-            merged.append((s, e))
-    return merged
-
-
-def _subtract_many(
-    base: list[tuple[float, float]],
-    blockers: list[tuple[float, float]],
-) -> list[tuple[float, float]]:
-    """Subtract blocker intervals from a list of base intervals."""
-    remaining = base[:]
-    for bs, be in _merge_intervals(blockers):
-        next_remaining: list[tuple[float, float]] = []
-        for s, e in remaining:
-            if be <= s or bs >= e:
-                next_remaining.append((s, e))
-                continue
-            if s < bs:
-                next_remaining.append((s, max(s, bs)))
-            if be < e:
-                next_remaining.append((min(e, be), e))
-        remaining = next_remaining
-    return [(s, e) for s, e in remaining if e > s]
-
-
-def _intersect_intervals(
-    a: list[tuple[float, float]], b: list[tuple[float, float]]
-) -> list[tuple[float, float]]:
-    """Intersection of two interval lists (each merged first)."""
-    a = _merge_intervals(a)
-    b = _merge_intervals(b)
-    res: list[tuple[float, float]] = []
-    i = j = 0
-    while i < len(a) and j < len(b):
-        s = max(a[i][0], b[j][0])
-        e = min(a[i][1], b[j][1])
-        if e > s:
-            res.append((s, e))
-        if a[i][1] < b[j][1]:
-            i += 1
-        else:
-            j += 1
-    return res
-
-
-def _dominant_bucket_segments(
-    state_intervals: dict[str, list[tuple[float, float]]],
-    span_s: float,
-    px: int = _RASTER_PX,
-) -> list[dict]:
-    """Color each sub-pixel time bucket by the state with the MOST time in it.
-
-    Unlike presence-rasterization (any event paints the bucket), this assigns
-    each bucket to whichever state actually consumed the most wall-time in that
-    bucket, then merges consecutive same-state buckets. So a long tool region
-    with a few tiny reads stays "Tool-other", not "File-IO"; a region that is
-    mostly file-IO stays "File-IO". Buckets with no activity are left blank
-    (idle). Output is bounded to O(px) bars per state.
-    """
-    if span_s <= 0:
-        return []
-    bucket = span_s / px
-    acc: dict[int, dict[str, float]] = {}
-    for state, ivs in state_intervals.items():
-        for s, e in ivs:
-            if e <= s:
-                continue
-            i0 = int(s // bucket)
-            i1 = int(min(e, span_s) // bucket)
-            for i in range(i0, i1 + 1):
-                bs = i * bucket
-                ov = min(e, bs + bucket) - max(s, bs)
-                if ov > 0:
-                    acc.setdefault(i, {}).setdefault(state, 0.0)
-                    acc[i][state] += ov
-    chosen: dict[int, str] = {}
-    for i, states in acc.items():
-        chosen[i] = max(states.items(), key=lambda kv: kv[1])[0]
-    runs: list[list] = []
-    for i in sorted(chosen):
-        st = chosen[i]
-        if runs and runs[-1][2] == st and i == runs[-1][1] + 1:
-            runs[-1][1] = i
-        else:
-            runs.append([i, i, st])
-    return [
-        {"resource": st, "start": a * bucket, "end": (b + 1) * bucket, "label": st}
-        for a, b, st in runs
-    ]
-
-
-def _dominant_lane_segments(llm_iv, fileio_iv, tool_iv, span_s, px=_RASTER_PX):
-    """Per-bucket dominant state for one agent lane: LLM / File-IO / Tool-other.
-
-    Tool-other = tool time minus file-IO time, derived PER BUCKET (no O(n^2)
-    interval subtraction — that hung on 455k-syscall traces). Each bucket is
-    colored by whichever of LLM / File-IO / (tool−fileio) consumed the most time.
-    """
-    if span_s <= 0:
-        return []
-    bucket = span_s / px
-    L: dict[int, float] = {}
-    F: dict[int, float] = {}
-    T: dict[int, float] = {}
-
-    def _acc(ivs, d):
-        for s, e in ivs:
-            if e <= s:
-                continue
-            i0 = int(s // bucket)
-            i1 = int(min(e, span_s) // bucket)
-            for i in range(i0, i1 + 1):
-                bs = i * bucket
-                ov = min(e, bs + bucket) - max(s, bs)
-                if ov > 0:
-                    d[i] = d.get(i, 0.0) + ov
-
-    _acc(llm_iv, L)
-    _acc(fileio_iv, F)
-    _acc(tool_iv, T)
-    chosen: dict[int, str] = {}
-    for i in set(L) | set(F) | set(T):
-        opts = {"LLM": L.get(i, 0.0), "File-IO": F.get(i, 0.0),
-                "Tool-other": max(0.0, T.get(i, 0.0) - F.get(i, 0.0))}
-        best = max(opts.items(), key=lambda kv: kv[1])
-        if best[1] > 0:
-            chosen[i] = best[0]
-    runs: list[list] = []
-    for i in sorted(chosen):
-        st = chosen[i]
-        if runs and runs[-1][2] == st and i == runs[-1][1] + 1:
-            runs[-1][1] = i
-        else:
-            runs.append([i, i, st])
-    return [
-        {"resource": st, "start": a * bucket, "end": (b + 1) * bucket, "label": st}
-        for a, b, st in runs
-    ]
-
-
-
-
-
 # =============================================================================
 # Visualization: Agent Timeline (three-lane Gantt)
 # =============================================================================
@@ -1866,10 +1259,6 @@ def _time_union_seconds(intervals: list[tuple[float, float]]) -> float:
     return max(0.0, total)
 
 
-def _datetime_from_ms(ms: int) -> datetime:
-    return datetime.fromtimestamp(ms / 1000.0)
-
-
 # Bundle cache: phase_breakdown and agent_timeline both call
 # _load_agent_timeline_data(trace_dir) with the same argument and consume the
 # result read-only. Without caching, each recomputes the full alignment AND
@@ -1937,7 +1326,7 @@ def _load_agent_timeline_data_uncached(trace_dir: Path) -> dict | None:
     # Fix: rewrite tool/subagent dates to match the LLM events' true date.
     if llm_raw and (tool_calls or subagent_calls):
         import dataclasses as _dc
-        true_date = _datetime_from_ms(min(s["start_ms"] for s in llm_raw)).date()
+        true_date = datetime_from_ms(min(s["start_ms"] for s in llm_raw)).date()
 
         def _set_date(dt: datetime, d) -> datetime:
             return dt.replace(year=d.year, month=d.month, day=d.day)
@@ -1987,7 +1376,7 @@ def _load_agent_timeline_data_uncached(trace_dir: Path) -> dict | None:
     # TZ-skewed trace they differ by ≥1 hour.  Shift LLM event ms values to
     # bring them into the tool naive-time frame.
     if llm_raw:
-        first_llm_dt = _datetime_from_ms(min(s["start_ms"] for s in llm_raw))
+        first_llm_dt = datetime_from_ms(min(s["start_ms"] for s in llm_raw))
         anchor_candidates = []
         if tool_calls:
             anchor_candidates.append(min(tc.start_time for tc in tool_calls))
@@ -2023,7 +1412,7 @@ def _load_agent_timeline_data_uncached(trace_dir: Path) -> dict | None:
     # genuine beginning of activity.
     candidates: list[datetime] = []
     if llm_raw:
-        candidates.append(_datetime_from_ms(min(s["start_ms"] for s in llm_raw)))
+        candidates.append(datetime_from_ms(min(s["start_ms"] for s in llm_raw)))
     if tool_calls:
         candidates.append(min(tc.start_time for tc in tool_calls))
     if subagent_calls:
@@ -2039,8 +1428,8 @@ def _load_agent_timeline_data_uncached(trace_dir: Path) -> dict | None:
 
     llm_segments = []
     for seg in llm_raw:
-        s_rel = _to_rel(_datetime_from_ms(seg["start_ms"]))
-        e_rel = _to_rel(_datetime_from_ms(seg["end_ms"]))
+        s_rel = _to_rel(datetime_from_ms(seg["start_ms"]))
+        e_rel = _to_rel(datetime_from_ms(seg["end_ms"]))
         llm_segments.append({
             "start_rel": s_rel,
             "end_rel": e_rel,
@@ -2882,12 +2271,6 @@ def create_index_html(output_dir: Path) -> None:
     run_id, workload = infer_title_parts(trace_dir)
     page_title = f"{run_id} · {workload} · I/O Pattern"
 
-    def jload(path: Path) -> dict:
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
     def load_artifact_rows() -> list[dict]:
         path = lineage_dir / "artifacts.csv"
         if not path.is_file():
@@ -2911,26 +2294,10 @@ def create_index_html(output_dir: Path) -> None:
             return f"{value:.{digits}f}".rstrip("0").rstrip(".")
         return str(value)
 
-    def fmt_bytes(value) -> str:
-        if value is None or value == "":
-            return "n/a"
-        try:
-            x = float(value)
-        except (TypeError, ValueError):
-            return str(value)
-        for unit in ("B", "KB", "MB", "GB", "TB"):
-            if abs(x) < 1024 or unit == "TB":
-                return f"{x:.0f} {unit}" if unit == "B" else f"{x:.1f} {unit}"
-            x /= 1024.0
-        return f"{x:.1f} TB"
-
     def fmt_seconds(value) -> str:
         if value is None or value == "":
             return "not resolved"
         return fmt_num(value) + "s"
-
-    def esc(text) -> str:
-        return html.escape(str(text), quote=True)
 
     def metric(label: str, value: str) -> str:
         return f"<div class='metric'><span>{esc(label)}</span><strong>{esc(value)}</strong></div>"

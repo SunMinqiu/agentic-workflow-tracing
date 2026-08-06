@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agent_io_tracing.parsing._ebpf_impl import parse_tool_calls as parse_ebpf_tool_calls
+from agent_io_tracing.parsing.timefmt import parse_time
 
 
 TOOL_CALL_PATTERN = re.compile(
@@ -44,18 +45,6 @@ class ToolCall:
             "input_params": self.input_params,
         }
 
-
-def parse_time(time_str: str) -> datetime:
-    """Parse ``HH:MM:SS.ffffff`` using today's date as the anchor."""
-
-    parts = time_str.split(".")
-    time_part = parts[0]
-    microseconds = parts[1] if len(parts) > 1 else "0"
-    microseconds = microseconds[:6].ljust(6, "0")
-
-    base = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    h, m, s = map(int, time_part.split(":"))
-    return base.replace(hour=h, minute=m, second=s, microsecond=int(microseconds))
 
 
 def parse_tool_calls_log(filepath: Path) -> list[ToolCall]:

@@ -46,15 +46,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from agent_io_tracing.adapters.trace_writer import TraceFileWriter
 from agent_io_tracing.adapters.llm_trace import (
     apply_nocache_tag as _apply_nocache_tag,
     cache_request_config as _cache_request_config,
+    capture_messages as _capture_messages,
+    capture_request_params as _capture_request_params,
+    capture_response as _capture_response,
     format_system_prompt as _format_system_prompt_entry,
     format_tool_log as _format_log_line,
     make_nocache_tag as _make_nocache_tag,
     normalize_messages as _normalize_messages,
     runtime_vendor as _runtime_vendor,
     stable_json as _stable_json,
+    trace_cache_config as _trace_cache_config,
 )
 
 # I/O abstraction classifier (Phase 1 §3.3 / H1). Guard the
@@ -68,12 +73,6 @@ except Exception:  # pragma: no cover - best-effort
 # ---------------------------------------------------------------------------
 # pi-compat formatting helpers (mirror litellm_tool_logger.py byte-for-byte)
 # ---------------------------------------------------------------------------
-
-
-def _normalize_tool_name(name: str | None) -> str:
-    if not name:
-        return "LLMCall"
-    return name[0].upper() + name[1:]
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +267,7 @@ def _infer_role_from_stack() -> str:
 # ---------------------------------------------------------------------------
 
 
-class GenoMASToolLogger:
+class GenoMASToolLogger(TraceFileWriter):
     """pi-compatible event logger for GenoMAS agent runs.
 
     Construct once, then call `install_global(handler)` to monkey-patch
@@ -332,32 +331,9 @@ class GenoMASToolLogger:
 
     # ---- IO ------------------------------------------------------------
 
-    def _append_tool_log(self, line: str) -> None:
-        with self._lock:
-            with self._tool_log.open("a", encoding="utf-8") as f:
-                f.write(line)
-
-    def _append_system_prompt(self, entry: str) -> None:
-        with self._lock:
-            with self._system_prompt_log.open("a", encoding="utf-8") as f:
-                f.write(entry)
-
-    def _append_event(self, event: dict) -> None:
-        with self._lock:
-            with self._events_log.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
-
-    def _append_generated_code(self, record: dict) -> None:
-        with self._lock:
-            with self._generated_code_log.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-
-    def _append_messages(self, record: dict) -> None:
-        with self._lock:
-            with self._messages_log.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-
     def _append_llm_cache(self, record: dict) -> None:
+        # not TraceFileWriter._append_json: the cache path is redirectable and
+        # its directory may not exist yet
         with self._lock:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
             with self._cache_path.open("a", encoding="utf-8") as f:
@@ -418,6 +394,7 @@ class GenoMASToolLogger:
         ended_monotonic_ns: int | None = None,
         attempt: int = 1,
         nocache_tag: str | None = None,
+        request_params: Any = None,
     ) -> None:
         """One LLM call's start+end events, plus the tool_calls.log line."""
         try:
@@ -432,6 +409,19 @@ class GenoMASToolLogger:
             # model+provider live in the input dict, not the name.
             provider_request_id = _provider_request_id(result)
             timing = _stream_timing(result)
+            config_params = getattr(
+                getattr(client, "config", None),
+                "extra_message_params",
+                None,
+            )
+            captured_params = _capture_request_params(
+                config_params,
+                request_params,
+            )
+            captured_response = (
+                _capture_response(result)
+                if error is None and result is not None else {}
+            )
             common = {
                 "run_id": run_id,
                 "agent_role": role,
@@ -439,7 +429,7 @@ class GenoMASToolLogger:
                 "provider": provider,
                 "vendor": _runtime_vendor(provider, model),
                 "model": model,
-                "cache_config": _cache_request_config(client),
+                "cache_config": _trace_cache_config(_cache_request_config(client)),
                 "phase": phase,
                 "cache_key": cache_key,
                 "cache_hit": cache_hit,
@@ -519,6 +509,13 @@ class GenoMASToolLogger:
                     "model": model,
                     "timestamp": _epoch_ms(started_at),
                     "messages": _normalize_messages(messages),
+                    "request": {
+                        "messages": _capture_messages(messages),
+                        "parameters": captured_params,
+                    },
+                    "request_params": captured_params,
+                    "response": captured_response,
+                    "response_text": captured_response.get("text"),
                     "nocache_tag": nocache_tag,
                 })
 
@@ -561,6 +558,7 @@ def _make_async_wrapper(
                     run_id=run_id,
                     started_monotonic_ns=started_monotonic_ns,
                     ended_monotonic_ns=ended_monotonic_ns,
+                    request_params=kwargs,
                 )
                 return cached
             if handler._replay_strict:
@@ -573,6 +571,7 @@ def _make_async_wrapper(
                     run_id=run_id,
                     started_monotonic_ns=started_monotonic_ns,
                     ended_monotonic_ns=ended_monotonic_ns,
+                    request_params=kwargs,
                 )
                 raise err
         nocache_tag = _make_nocache_tag() if _nocache_enabled() else None
@@ -600,6 +599,7 @@ def _make_async_wrapper(
                 started_monotonic_ns=started_monotonic_ns,
                 ended_monotonic_ns=ended_monotonic_ns,
                 nocache_tag=nocache_tag,
+                request_params=kwargs,
             )
             return result
         except BaseException as e:
@@ -610,7 +610,8 @@ def _make_async_wrapper(
                                 run_id=run_id,
                                 started_monotonic_ns=started_monotonic_ns,
                                 ended_monotonic_ns=ended_monotonic_ns,
-                                nocache_tag=nocache_tag)
+                                nocache_tag=nocache_tag,
+                                request_params=kwargs)
             raise
     wrapper._genomas_patched = True  # type: ignore[attr-defined]
     return wrapper
@@ -678,7 +679,7 @@ def _install_openai_stream_timing(llm_mod: Any) -> bool:
                 delta = _field(choices[0], "delta") if choices else None
                 content = _field(delta, "content") if delta is not None else None
                 reasoning = (
-                    _field(delta, "reasoning_content")
+                    _field(delta, "reasoning_content", "reasoning")
                     if delta is not None else None
                 )
                 if content:

@@ -17,6 +17,7 @@ from agent_io_tracing.analysis.execution_units import (
     annotate_parsed_execution_units,
     load_execution_units,
 )
+from agent_io_tracing.viz.format_utils import datetime_from_ms
 
 
 @dataclass
@@ -43,10 +44,6 @@ class Event:
 
 def _dt_to_ms(dt: datetime) -> float:
     return dt.timestamp() * 1000.0
-
-
-def _datetime_from_ms(ms: float) -> datetime:
-    return datetime.fromtimestamp(ms / 1000.0)
 
 
 def _event_parent(ev: dict[str, Any]) -> str | None:
@@ -177,7 +174,7 @@ def _load_tool_events(
     # Tool logs only carry HH:MM:SS.ffffff. Put them on the LLM event date
     # when available so wall-clock arithmetic is stable across days.
     if llm_events:
-        true_date = _datetime_from_ms(min(ev.start_ms for ev in llm_events)).date()
+        true_date = datetime_from_ms(min(ev.start_ms for ev in llm_events)).date()
         calls = [
             type(tc)(
                 tool_id=tc.tool_id,
@@ -195,7 +192,7 @@ def _load_tool_events(
         ]
 
         # Correct common timezone skew between LLM unix timestamps and HMS logs.
-        first_llm = _datetime_from_ms(min(ev.start_ms for ev in llm_events))
+        first_llm = datetime_from_ms(min(ev.start_ms for ev in llm_events))
         first_tool = min(tc.start_time for tc in calls)
         gap_s = (first_tool - first_llm).total_seconds()
         if abs(gap_s) >= 1800:

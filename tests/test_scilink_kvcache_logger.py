@@ -2,7 +2,12 @@ import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-from agent_io_tracing.adapters.llm_trace import cache_key
+from agent_io_tracing.adapters.llm_trace import (
+    cache_key,
+    runtime_vendor,
+    serving_config,
+    trace_cache_config,
+)
 from agent_io_tracing.adapters.scilink.logger import LiteLLMToolLogger
 
 
@@ -25,6 +30,16 @@ def test_scilink_logger_writes_joinable_prompt_usage_and_timing(tmp_path):
     response = SimpleNamespace(
         id="request-1",
         model="gpt-4o-mini-2024-07-18",
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="analysis complete",
+                    reasoning="checked the spectrum",
+                    tool_calls=None,
+                ),
+                finish_reason="stop",
+            )
+        ],
         usage=SimpleNamespace(
             prompt_tokens=1200,
             completion_tokens=80,
@@ -37,6 +52,8 @@ def test_scilink_logger_writes_joinable_prompt_usage_and_timing(tmp_path):
         {
             "model": response.model,
             "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": 80,
             "metadata": {"agent_role": "AnalysisOrchestratorAgent"},
         },
         response,
@@ -53,6 +70,13 @@ def test_scilink_logger_writes_joinable_prompt_usage_and_timing(tmp_path):
     assert events[1]["agent_role"] == "AnalysisOrchestratorAgent"
     assert events[1]["message"]["timestamp"] - events[0]["message"]["timestamp"] == 2500
     assert prompts[0]["messages"] == messages
+    assert prompts[0]["request"]["messages"] == messages
+    assert prompts[0]["request_params"] == {
+        "temperature": 0.2,
+        "max_tokens": 80,
+    }
+    assert prompts[0]["response_text"] == "analysis complete"
+    assert prompts[0]["response"]["reasoning"] == "checked the spectrum"
 
 
 def test_full_prompt_cache_key_is_stable_for_mapping_key_order():
@@ -62,6 +86,39 @@ def test_full_prompt_cache_key_is_stable_for_mapping_key_order():
     assert cache_key("openai", "model", first) != cache_key(
         "openai", "other-model", first
     )
+
+
+def test_serving_arm_manifest_is_stamped_without_losing_request_controls(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "KVCACHE_ARM_JSON",
+        json.dumps({
+            "arm": "A1_prefix",
+            "backend": "vllm",
+            "resolved": {
+                "block_size": 16,
+                "prefix_match_unit": 16,
+                "kv_cache_memory_bytes": 4_000_000_000,
+            },
+        }),
+    )
+
+    config = trace_cache_config({"prompt_cache_key": "group-a"})
+
+    assert config["prompt_cache_key"] == "group-a"
+    assert config["serving"]["arm"] == "A1_prefix"
+    assert config["serving"]["resolved"]["block_size"] == 16
+    assert serving_config()["backend"] == "vllm"
+    assert runtime_vendor("openai", "Qwen3.6-27B") == "vLLM"
+
+
+def test_invalid_serving_manifest_is_visible_in_trace(monkeypatch):
+    monkeypatch.setenv("KVCACHE_ARM_JSON", "{bad json")
+
+    config = trace_cache_config()
+
+    assert "manifest_error" in config["serving"]
 
 
 def test_scilink_emits_litellm_first_token_timestamp(tmp_path):

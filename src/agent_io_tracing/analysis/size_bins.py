@@ -66,5 +66,3 @@ def darshan_bin_index(value: float) -> int:
     return len(DARSHAN_SIZE_LABELS) - 1
 
 
-def finite_darshan_edges() -> list[float]:
-    return [float(x) for x in DARSHAN_SIZE_BINS if not math.isinf(x)]

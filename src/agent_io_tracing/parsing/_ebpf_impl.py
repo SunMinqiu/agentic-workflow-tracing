@@ -21,6 +21,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from agent_io_tracing.parsing.timefmt import parse_time
 
 
 TOOL_CALL_PATTERN = re.compile(
@@ -416,15 +417,6 @@ class ProcessTree:
         return self._root_tool.get(pid)
 
 
-def parse_time(time_str: str) -> datetime:
-    parts = time_str.split(".")
-    hms = parts[0]
-    us = parts[1] if len(parts) > 1 else "0"
-    us = us[:6].ljust(6, "0")
-    base = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    h, m, s = map(int, hms.split(":"))
-    return base.replace(hour=h, minute=m, second=s, microsecond=int(us))
-
 
 def parse_tool_calls(tool_log: Path) -> list[ToolCall]:
     tool_calls: list[ToolCall] = []
@@ -546,10 +538,6 @@ def ns_to_datetime(ts_ns: int) -> datetime:
 
 def ns_to_epoch_ms(ts_ns: int) -> float:
     return ts_ns / 1_000_000.0
-
-
-def in_any_tool_window(ts: datetime, tool_calls: list[ToolCall]) -> bool:
-    return any(tc.contains(ts) for tc in tool_calls)
 
 
 def get_active_tool_calls(ts: datetime, tool_calls: list[ToolCall]) -> list[ToolCall]:

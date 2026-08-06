@@ -33,6 +33,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from agent_io_tracing.viz.format_utils import jload
 
 AXIS1 = [
     (("A_c1_w1", "base"), 1),
@@ -46,13 +47,6 @@ AXIS2 = [
     (("B_t4_w2", "a2_t4"), 4),
     (("B_t8_w2", "a2_t8"), 8),
 ]  # x = T traits
-
-
-def jload(p: Path) -> dict:
-    try:
-        return json.loads(p.read_text())
-    except Exception:
-        return {}
 
 
 def _dataset_io(cell_dir: Path) -> tuple[float, float]:

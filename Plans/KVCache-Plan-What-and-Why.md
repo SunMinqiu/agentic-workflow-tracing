@@ -2,7 +2,7 @@
 
 ## Implementation status
 
-Audited against the repository on 2026-07-29. Status reflects executable code and tests, not statements elsewhere in this plan. Completed items have been removed; what remains is open work.
+Audited against the repository on 2026-08-04. Status reflects executable code and tests, not statements elsewhere in this plan. Completed items have been removed; what remains is open work.
 
 Legend: 🟡 partially implemented or awaiting real instrumentation · ⬜ not implemented.
 
@@ -11,14 +11,15 @@ Legend: 🟡 partially implemented or awaiting real instrumentation · ⬜ not i
 | Item | Status | Current implementation or missing work |
 | --- | --- | --- |
 | Q4 source decomposition | ⬜ | Messages are persisted, but reusable tokens are not attributed to system instructions, conversation history, tool output, handoff, retry, or data-derived spans. Phase labels are heuristic and are not token-source accounting. |
-| Q6 workflow ranking | 🟡 | The root report sorts cells by total input volume and displays realized and logical reuse, but there is no explicit combined ranking score for high volume and low realized capture. |
-| TTFT and TPOT analysis | 🟡 | Metrics and figures exist and are emitted only when real first-token and last-token events exist. Current GenoMAS and SciLink provider integrations do not yet produce those streaming timestamps during normal runs. No values are fabricated. |
+| Q6 workflow ranking | 🟡 | `build_report` sorts cells by total input volume and displays realized, logical, and gap percentages, but there is no explicit combined ranking score for high volume and low realized capture. |
+| TTFT and TPOT analysis | 🟡 | Done for GenoMAS: `_install_openai_stream_timing` replaces the OpenAI-compatible call with a `stream_options.include_usage` stream, so first-token and last-token timestamps are real, and three cells in `phase4_20260729_124254` carry measured TTFT and TPOT. The two remaining cells in that run were traced before the patch and print the unavailable notice. SciLink reads `completion_start_time` from litellm and is covered by a test, but no SciLink run with `stream=True` exists yet, so its reports still print the unavailable notice. |
 
 ### Phase 2 experiment infrastructure
 
 | Planned factor or experiment | Status | Current implementation or missing work |
 | --- | --- | --- |
-| A. Multi-tier offload, approximate reuse, compression, and eviction ladder | ⬜ | No local serving stack or cache mechanism implementations are connected. |
+| A. Rung 0 to rung 1, no cache versus exact prefix caching | 🟡 | Runnable through vendor APIs. `apply_nocache_tag` in `adapters/llm_trace.py` prepends a per-call random tag so no provider prefix cache can hit, `GENOMAS_NOCACHE` and `SCILINK_NOCACHE` select the arm, and the untagged prompt is what gets logged so logical reuse stays comparable across arms. `phase4_20260729_124254` holds matched cached and no-cache cells on both OpenAI and FreeInference; the no-cache cells score realized 0% as designed. Missing: pairing arms at equal call counts, since the cells currently differ in length. |
+| A. Multi-tier offload, approximate reuse, compression, and eviction ladder | ⬜ | Rungs above exact prefix caching still need a local serving stack. None is connected. |
 | B. Capacity, TTL, eviction policy, and block-size sweeps | ⬜ | Prefix interval and a fixed 128-token alignment are analyzed offline, but no cache simulator or controlled sweep exists. |
 | C. HBM, DRAM, NVMe, and shared-storage tiers | ⬜ | eBPF traces general file I/O, but no KV-cache tier is deployed or identified in the trace. |
 | D. Workflow concurrency | 🟡 | GenoMAS includes matched `A_c4_w2` and `A_c4_w4` cells, but this changes agent workers rather than serving replicas or cache routing. |
@@ -32,7 +33,7 @@ Legend: 🟡 partially implemented or awaiting real instrumentation · ⬜ not i
 
 | Response | Status | Current implementation or missing work |
 | --- | --- | --- |
-| TTFT | 🟡 | Analysis is ready, but normal provider runs lack real first-token timestamps. |
+| TTFT | 🟡 | Real for GenoMAS. `plot_ttft_vs_fresh_input`, `plot_latency_breakdown`, and `plot_ttft_vs_prefix_age` are emitted whenever `has_stream_timing` holds, and three cells in `phase4_20260729_124254` report median TTFT of 0.71s to 1.66s with median TPOT of 4.6ms to 29ms per token. Those three are all no-cache cells; the cached cells predate the patch and must be re-run before a cached-versus-uncached TTFT delta exists. SciLink needs one streaming run. |
 | Prefill compute saved | 🟡 | Reused and fresh token counts provide a token proxy, but no model-side prefill compute counters are collected. |
 | KV-related I/O bytes and bandwidth | ⬜ | General eBPF I/O exists, but KV objects, cache loads, and cache writes are not labeled or separated. |
 | GPU memory footprint | ⬜ | No GPU memory sampler is connected. |
@@ -42,8 +43,8 @@ Legend: 🟡 partially implemented or awaiting real instrumentation · ⬜ not i
 
 | Hypothesis | Status | What can be tested now and what remains |
 | --- | --- | --- |
-| H1 retention binds before capacity | 🟡 | Prefix interval and capture by age are measurable. A controlled TTL-versus-capacity sweep is missing. |
-| H2 multi-agent prompt assembly discards sharing | 🟡 | `x-agent%` directly measures current cross-agent opportunity. Prompt-assembly normalization experiments across workflows are missing. |
+| H1 retention binds before capacity | 🟡, and currently **not supported** | Measured, not just measurable. `_temporal_metrics` bins every call by age since the latest compatible prefix and reports capture rate per bin. The measurement contradicts half the hypothesis: the long gaps are real, up to 248s, but capture does not decay across them on either vendor. See Early findings. What remains is to sweep flush interval downward on a local stack to find where retention *starts* to bind. |
+| H2 multi-agent prompt assembly discards sharing | 🟡 | `cross_agent_bonus_frac` is exactly 0.0 in all five cells of `phase4_20260729_124254`, spanning two vendors, two models, and two cohort counts. The zero is no longer a single-run observation. Prompt-assembly normalization experiments that would show the sharing is recoverable are still missing. |
 | H3 avoidable construction choices cause misses | ⬜ | No construction-choice sweep or token-source attribution exists. |
 | H4 mid-context insertion limits exact prefix reuse | ⬜ | Exact-prefix opportunity is measured, but content-level reuse and insertion-position metrics are not. |
 | H5 cache capacity turns compute savings into I/O | ⬜ | No tiered KV cache, KV-specific I/O attribution, or TTFT-versus-tier experiment exists. |
@@ -96,9 +97,14 @@ Legend: 🟡 partially implemented or awaiting real instrumentation · ⬜ not i
 
 - Per-call prompt stays at 10k–13k tokens, peaks at 20k–30k; scale comes from more calls, not a bigger single prompt → cache the fixed prefix that recurs across calls.
 
+- Logical reuse sits at 60% to 67% of input tokens across every cell measured so far, and it barely moves between vendors, models, or cohort counts. That stability is the argument that logical reuse is a workload property while `cached_tokens` is a vendor artifact.
+- The realized-versus-logical gap is where vendors differ: 4% on OpenAI `gpt-4o-mini`, 11% on FreeInference `qwen3.6-35b`, for the same workflow at similar scale. Same demand, different capture.
+- Reuse gaps are long but retention is not costing us anything yet. The age of the latest compatible prefix reaches 248s in `A_c2_w2` and 127s in `A_c4_w2`, confirming that minutes of non-LLM computation do sit between reusable calls. Capture rate across the five age bins is nonetheless flat — 82%, 77%, 80%, 95%, 87% on FreeInference and 93%, 96%, 95%, 44%, 82% on OpenAI, where the 44% bin holds four calls and 4,992 tokens and is noise. This is a negative result for H1 as originally stated and it reframes the retention question as a threshold to locate rather than a bottleneck to demonstrate.
+
 **SciLink** — a reference point, not the target
 
 - On an OpenAI backend with automatic prefix caching, ~18% of prompt tokens are reclaimed with zero changes.
+- The later 4-cell run inverts the sign: realized 5% to 12% against logical 1% to 2%, a negative gap. SciLink's prompts carry large images and long single-shot contexts, so the vendor hits on structure that the token-level prefix matcher does not count as reusable. Worth explaining before quoting either number, because a negative gap means the two metrics are measuring different things rather than one bounding the other.
 
 ---
 
@@ -106,11 +112,12 @@ Legend: 🟡 partially implemented or awaiting real instrumentation · ⬜ not i
 
 ## Remaining priorities
 
-1. Implement Q4 token-source decomposition and tool-output-to-prompt provenance.
-2. Capture real streaming timestamps from GenoMAS and SciLink to populate TTFT and TPOT.
-3. Add deterministic SciLink replay and local vLLM or SGLang prompt replay.
-4. Build the controlled Phase 2 cache mechanism, retention, capacity, tier, routing, and context-construction sweeps.
-5. Add KV-specific I/O attribution, GPU memory sampling, and output-quality evaluation.
+1. Re-run the cached arm of `phase4` under the current logger so both arms carry stream timing, then fit the TTFT slope per 1k uncached tokens. Cheapest remaining item and it unblocks every seconds-denominated result.
+2. Run SciLink once with `stream=True` to populate its TTFT and TPOT, and explain its negative realized-minus-logical gap.
+3. Implement Q4 token-source decomposition and tool-output-to-prompt provenance.
+4. Add deterministic SciLink replay and local vLLM or SGLang prompt replay.
+5. Build the controlled Phase 2 cache mechanism, retention, capacity, tier, routing, and context-construction sweeps.
+6. Add KV-specific I/O attribution, GPU memory sampling, and output-quality evaluation.
 
 ---
 
@@ -142,7 +149,7 @@ Groups A through D are not reachable through OpenAI or FreeInference. Both are h
 
 | Knob | OpenAI | FreeInference | What it lets us vary |
 | --- | --- | --- | --- |
-| Cache enable/disable | Not available; automatic | Not available; automatic | Nothing. No-cache must come from a local serving stack. |
+| Cache enable/disable | No API flag, but defeatable request-side | Same | Implemented. A per-call random tag in front of the first token makes every prefix unique, which forces a 0% hit rate on any prefix cache without a local serving stack. Verified: every `_nocache` cell reports realized 0%. |
 | `prompt_cache_key` | Available; groups requests so they land on the same cache | Unverified; OpenAI-compatible endpoints usually ignore unknown fields | Approximates group D routing without owning the router |
 | Minimum cacheable prefix and alignment | ~1024-token minimum, 128-token increments | Backend-defined, likely vLLM or SGLang block size | Sets the alignment constant used in `logical.py` |
 | Retention | Vendor-controlled, minutes of inactivity | Undocumented | Nothing directly; only observable through prefix-interval bins |
@@ -150,11 +157,15 @@ Groups A through D are not reachable through OpenAI or FreeInference. Both are h
 | Model choice | Changes KV bytes per token and cache eligibility | Changes backend entirely | Confounds vendor comparison; never mix vendors in one cell |
 | `cached_tokens` readout | `usage.prompt_tokens_details.cached_tokens` | Verified present | Realized reuse only |
 
-The consequence for the plan: with vendor APIs alone, only group E is a real experiment, and the retention question in H1 can only be observed opportunistically rather than swept. Groups A through D require the local vLLM or SGLang replay harness listed under prerequisites. Confirm `prompt_cache_key` support on FreeInference empirically before relying on it, and verify the current OpenAI minimum and increment against live documentation rather than this table.
+The consequence for the plan: with vendor APIs alone, group E is a real experiment, the rung 0 to rung 1 step of group A is now a real experiment through the no-cache tag, and the retention question in H1 is observable through the prefix-age capture table but not sweepable. The higher rungs of A and all of B, C, and D require the local vLLM or SGLang replay harness listed under prerequisites. Confirm `prompt_cache_key` support on FreeInference empirically before relying on it, and verify the current OpenAI minimum and increment against live documentation rather than this table.
 
 ## Baseline positioning
 
 A no-cache configuration is an instrument, not a comparison arm. Every serving stack has enabled prefix caching by default since 2023, so reporting a speedup against no-cache is a straw man. It is retained for two things nothing else provides: the denominator for logical reuse, and the TTFT-per-1k-uncached-token slope that converts every token-denominated result into seconds. It belongs in the methodology section; the comparison arms start at exact prefix caching.
+
+The arm is now built and run. `phase4_20260729_124254` pairs cached and no-cache cells on both vendors, and the no-cache cells land at realized 0% against logical 61% to 67%, which is the intended behaviour of the tag: the prompt still logically repeats itself, and the cache is simply forbidden to notice. The matched cached cells realize 48% on FreeInference and 55% on OpenAI. The gap between logical and realized reuse is now bracketed by a measured floor rather than inferred from a single arm.
+
+The seconds-per-uncached-token conversion is not yet fittable from this run. Only the three no-cache cells carry stream timing, because the two cached cells were traced before the streaming patch landed. Re-running the cached arm under the current logger is the smallest step that unlocks a paired TTFT delta.
 
 ## Experiment lines
 
@@ -174,9 +185,11 @@ Hit rate in tokens, TTFT, end-to-end wall clock, prefill compute saved, KV-relat
 
 ## Hypotheses
 
-**H1 — Retention, not capacity, is the binding constraint.** Reuse distance has a long tail exceeding commercial cache TTLs, because minutes of non-LLM computation sit between consecutive calls. Sweep TTL against capacity in B and compare curve steepness.
+**H1 — Retention, not capacity, is the binding constraint.** Stated premise: reuse distance has a long tail exceeding commercial cache TTLs, because minutes of non-LLM computation sit between consecutive calls.
 
-**H2 — Multi-agent systems discard structural sharing at assembly time.** The current run reports `x-agent% = 0`: GEOAgent, CodeReviewerAgent, and DomainExpertAgent are prefix-isolated, and all reuse is intra-agent history accumulation. These agents share task background and data schema and should share prefix; the framework gives each its own assembled system prompt and throws that away. Verify whether the zero is intrinsic or an artifact of prompt assembly before building on it. If it holds across workflows, the finding indicts framework design, which is stronger than showing cache-aware routing helps.
+The premise holds and the conclusion does not, on the evidence so far. The tail is real — prefix ages reach 248s — but capture rate is flat across every age bin on both OpenAI and FreeInference, so neither vendor's retention is losing us anything at this run length. Restate the hypothesis as a threshold question rather than a claim: **how much retention does this workload require?** Sweep a global flush interval downward on the local stack until capture degrades, and report the interval at which it does. That number transfers to any serving system; "the vendor we used was good enough" does not.
+
+**H2 — Multi-agent systems discard structural sharing at assembly time.** `x-agent% = 0` in every GenoMAS cell measured so far, across both vendors and both cohort counts: GEOAgent, CodeReviewerAgent, and DomainExpertAgent are prefix-isolated, and all reuse is intra-agent history accumulation. These agents share task background and data schema and should share prefix; the framework gives each its own assembled system prompt and throws that away. The zero is now robust enough to build on, so the open question moves from "is it real" to "is it recoverable": normalize the assembled system prompts so the shared background sits at the head of every agent's prefix, and measure how much of the 0 turns into a hit. That result indicts framework design, which is stronger than showing cache-aware routing helps.
 
 **H3 — Most misses trace to avoidable construction choices.** Sweep E against the A ladder and compare the two effect sizes.
 

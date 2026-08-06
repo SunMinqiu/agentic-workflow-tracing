@@ -41,6 +41,9 @@ agent-trace-w0 = "agent_io_tracing.experiments.w0_microbench:main"
 agent-trace-manifest = "agent_io_tracing.experiments.run_manifest:main"
 agent-trace-lustre-counters = "agent_io_tracing.tracing.lustre_counters:main"
 agent-trace-kvcache = "agent_io_tracing.analysis.kvcache.report:main"
+agent-trace-vllm-check = "agent_io_tracing.serving.vllm_endpoint:main"
+agent-trace-replay-bundle = "agent_io_tracing.replay.bundle:main"
+agent-trace-replay-run = "agent_io_tracing.replay.runner:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

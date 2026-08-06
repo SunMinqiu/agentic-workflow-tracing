@@ -1,365 +1,107 @@
-# Agentic Scientific Workflow I/O：研究概述与追踪手册
+# Agentic Scientific Workflow I/O：运行手册与研究概述
 
-本文先说明如何在 CloudLab 上运行工作流并使用 eBPF/BCC 采集 I/O，再定义研究问题、分析框架和预期贡献。
+## 第一部分：运行手册
 
-## 第一部分：eBPF/BCC 追踪操作手册
+### 0. 从当前状态开始
 
-> `$SSH_USER`、`$CLIENT_NODE`、API key、base URL 和模型名称均来自本地且不纳入 Git 的 `cloudlab_env.sh`。更换节点或 Provider 时只修改该文件。
+三台机器的职责如下。
 
-三个已接入系统使用不同的运行依赖和 Provider 配置。不要混用。
+| 机器 | 变量 | 职责 |
+| --- | --- | --- |
+| Mac | 无 | 发起操作并拉回结果 |
+| Workflow cluster | `WORKFLOW_NODE` | 运行 workflow、BCC 和后处理 |
+| vLLM cluster | `VLLM_NODE` | 运行 vLLM server |
 
+现有脚本读取 `CLIENT_NODE`。本手册始终令 `CLIENT_NODE="$WORKFLOW_NODE"`。
 
-| 系统                     | 配置文件                           | 远端 env 文件                         | key 变量             | 模型                             | Provider           |
-| ---------------------- | ------------------------------ | --------------------------------- | ------------------ | ------------------------------ | ------------------ |
-| **SciLink**            | `config/config_scilink.env`    | `.env.scilink`                    | `OPENAI_API_KEY`   | `gpt-4o-mini`                  | litellm + OpenAI   |
-| **GenoMAS**            | `config/config_genomas.env`    | `.env.genomas` + `~/GenoMAS/.env` | `OPENAI_API_KEY_1` | `qwen3.6-35b`（FreeInference，默认）/ `gpt-4o-mini-2024-07-18`（OpenAI，可选） | OpenAI-compatible SDK，vendor 由 base URL 决定 |
-| **1000genome classic** | `config/config_1000genome.env` | 可选 `.env.1000genome`              | 不需要                | 不适用                            | 本地 Python DAG，支持离线 |
+根据当前状态选择入口，然后按章节编号向后执行。
 
+| 当前状态 | 执行顺序 |
+| --- | --- |
+| 新 Workflow cluster，GenoMAS 使用 OpenAI | 1 → 2.1 → 2.2 → 4.1 → 6.1 → 7 → 8 |
+| 新 Workflow cluster，GenoMAS 使用 FreeInference | 1 → 2.1 → 2.2 → 4.2 → 6.1 → 7 → 8 |
+| 新 Workflow cluster，GenoMAS 或 SciLink 使用 vLLM | 1 → 2.1 → 2.2 → 3 → 4.3 → 6 → 7 → 8 |
+| 新 Workflow cluster，SciLink 使用 OpenAI | 1 → 2.1 → 2.2 → 4.1 → 6.2 → 7 → 8 |
+| 新 Workflow cluster，运行 1000 Genomes | 1 → 2.1 → 2.3 → 5 → 6.3 → 7 → 8 |
+| 新 Workflow cluster，运行 Montage | 1 → 2.1 → 2.3 → 2.4 → 5 → 6.4 → 7 → 8 |
+| 两个 cluster 已配置，新开 Mac terminal | 1 → 4.4 → 6 → 7 → 8 |
+| 只改了代码 | 1 → 5 → 6 → 7 → 8 |
+| 只换了 API key、后端或模型 | 1 → 4 → 6 → 7 → 8 |
+| 只换了 Workflow cluster | 按上方对应的新 Workflow cluster 路径执行 |
+| 只换了 vLLM cluster | 1 → 3 → 4 → 6 → 7 → 8 |
+| 只运行新实验 | 1 → 4.4 → 6 → 7 → 8 |
+| 实验正在运行 | 1 → 7 → 8 |
+| 实验已经完成 | 1 → 8 |
 
-SciLink 使用 OpenAI。GenoMAS 默认使用 FreeInference 的 `qwen3.6-35b`，配置来自本地的 `GENOMAS_OPENAI_API_KEY` 和 `GENOMAS_BASE_URL`。FreeInference 已实测返回 `cached_tokens`。GenoMAS 也可以切换到 OpenAI 的 `gpt-4o-mini-2024-07-18`。两种 vendor 的缓存资格、粒度和保留策略可能不同，不能把两个 vendor 的 cell 放在同一个比较实验中。1000 Genomes classic 不使用 Provider 或 API key。
+### 1. 每个新 Mac terminal
 
-执行频率如下：
-
-- 🟥 首次部署或更换节点时执行一次。
-- 🟨 每次打开新终端时执行一次。
-- 🟩 每次实验运行时执行。
-- 🔧 仅在对应配置或代码发生变化时执行。
-
-除非标题注明在 CloudLab 节点执行，以下命令均在 Mac 上执行。
-
-### 1. 配置环境
-
-
-
-#### 🟨 每次打开新终端
-
-```zsh
-source cloudlab_env.sh
-REMOTE_HOME=$(ssh "$SSH_USER@$CLIENT_NODE" 'printf %s "$HOME"')
-```
-
-成功标准：终端输出 `[cloudlab_env] keys OK` 和当前的 `CLIENT=…`。
-
-#### 🔧 修改代码后同步代码
-
-`.env*` 只保存在远端并包含 API key，因此同步代码时会明确排除这些文件。
-
-```zsh
-rsync -az --delete \
-  --exclude '.git/' --exclude '__pycache__/' --exclude '*.pyc' \
-  --exclude 'results/' --exclude '.venv/' --exclude '.env*' \
-  ./ "$SSH_USER@$CLIENT_NODE:pi-ebpf-tracing-handoff/"
-```
-
-
-
-#### 🔧 修改 Provider、API key 或模型后同步环境变量
-
-`rsync` 不会修改远端的 `.env.*`。以下命令只替换 Provider 相关字段，保留 Python 和数据路径，并删除旧的重复配置。
+在 Mac 的仓库根目录执行：
 
 ```zsh
 source cloudlab_env.sh
-
-# SciLink：OpenAI key，不设置 FreeInference base URL
-ssh "$SSH_USER@$CLIENT_NODE" \
-  "sed -i -E '/^(export )?(OPENAI_API_KEY|OPENAI_BASE_URL|OPENAI_API_BASE|SCILINK_MODEL)=/d' pi-ebpf-tracing-handoff/.env.scilink; cat >> pi-ebpf-tracing-handoff/.env.scilink; chmod 600 pi-ebpf-tracing-handoff/.env.scilink" <<EOF
-export OPENAI_API_KEY="$OPENAI_API_KEY"
-export SCILINK_MODEL="$SCILINK_MODEL"
-EOF
-
-# GenoMAS：FreeInference 专用 key/base URL；模型使用裸名
-ssh "$SSH_USER@$CLIENT_NODE" \
-  "sed -i -E '/^(export )?(OPENAI_API_KEY_1|OPENAI_ORGANIZATION_1|OPENAI_BASE_URL|OPENAI_API_BASE|GENOMAS_MODEL|GENOMAS_VENDOR|GENOMAS_CAPTURE_STREAM_TIMING)=/d' pi-ebpf-tracing-handoff/.env.genomas; cat >> pi-ebpf-tracing-handoff/.env.genomas; chmod 600 pi-ebpf-tracing-handoff/.env.genomas" <<EOF
-export OPENAI_API_KEY_1="$GENOMAS_OPENAI_API_KEY"
-export OPENAI_BASE_URL="$GENOMAS_BASE_URL"
-export OPENAI_API_BASE="$GENOMAS_BASE_URL"
-export GENOMAS_MODEL="qwen3.6-35b"
-export GENOMAS_VENDOR="FreeInference"
-export GENOMAS_CAPTURE_STREAM_TIMING=1
-EOF
-ssh "$SSH_USER@$CLIENT_NODE" \
-  "sed -i -E '/^(export )?(OPENAI_API_KEY_1|OPENAI_BASE_URL|OPENAI_API_BASE)=/d' GenoMAS/.env; cat >> GenoMAS/.env; chmod 600 GenoMAS/.env" <<EOF
-OPENAI_API_KEY_1=$GENOMAS_OPENAI_API_KEY
-OPENAI_BASE_URL=$GENOMAS_BASE_URL
-OPENAI_API_BASE=$GENOMAS_BASE_URL
-EOF
+export WORKFLOW_NODE="${WORKFLOW_NODE:-$CLIENT_NODE}"
+export CLIENT_NODE="$WORKFLOW_NODE"
+ssh "$SSH_USER@$WORKFLOW_NODE" true
+printf 'WORKFLOW=%s\nVLLM=%s\n' "$WORKFLOW_NODE" "${VLLM_NODE:-not-set}"
 ```
 
-上面是 GenoMAS 的默认 FreeInference 配置。模型必须使用裸名 `qwen3.6-35b`。`GENOMAS_VENDOR` 用于报告显示真实服务商，不能用 SDK 中的 `provider=openai` 代替，因为 FreeInference 也走 OpenAI-compatible SDK。
+看到 `[cloudlab_env] keys OK`，且 SSH 没有报错，即可继续。
 
-如需改用 OpenAI，执行下面的完整切换命令。它会删除 FreeInference base URL，并明确固定 vendor 和模型。
+### 2. 第一次拿到 Workflow cluster
+
+本节只在新节点执行。部署会创建虚拟环境。代码更新不得执行本节。
+
+#### 2.1 公共配置
+
+检查 Lustre：
 
 ```zsh
-source cloudlab_env.sh
-
-ssh "$SSH_USER@$CLIENT_NODE" \
-  "sed -i -E '/^(export )?(OPENAI_API_KEY_1|OPENAI_ORGANIZATION_1|OPENAI_BASE_URL|OPENAI_API_BASE|GENOMAS_MODEL|GENOMAS_VENDOR|GENOMAS_CAPTURE_STREAM_TIMING)=/d' pi-ebpf-tracing-handoff/.env.genomas; cat >> pi-ebpf-tracing-handoff/.env.genomas; chmod 600 pi-ebpf-tracing-handoff/.env.genomas" <<EOF
-export OPENAI_API_KEY_1="$OPENAI_API_KEY"
-export OPENAI_ORGANIZATION_1="$OPENAI_ORGANIZATION"
-export GENOMAS_MODEL="gpt-4o-mini-2024-07-18"
-export GENOMAS_VENDOR="OpenAI"
-export GENOMAS_CAPTURE_STREAM_TIMING=1
-EOF
-ssh "$SSH_USER@$CLIENT_NODE" \
-  "sed -i -E '/^(export )?(OPENAI_API_KEY_1|OPENAI_ORGANIZATION_1|OPENAI_BASE_URL|OPENAI_API_BASE)=/d' GenoMAS/.env; cat >> GenoMAS/.env; chmod 600 GenoMAS/.env" <<EOF
-OPENAI_API_KEY_1=$OPENAI_API_KEY
-OPENAI_ORGANIZATION_1=$OPENAI_ORGANIZATION
-EOF
+ssh "$SSH_USER@$WORKFLOW_NODE" "mountpoint -q '$MOUNT_PATH'"
 ```
 
-写入后运行 GenoMAS API 预检。只有看到 `GENOMAS_PREFLIGHT_OK`、非空 usage 和 `FIRST_TOKEN_MS` 才能开始追踪。流式预检保证后续运行能产生真实 TTFT 和 TPOT 图。
+失败时先执行：
 
 ```zsh
-ssh "$SSH_USER@$CLIENT_NODE" 'cd "$HOME/pi-ebpf-tracing-handoff" && bash -lc '\''
-  set -a; source .env.genomas; set +a
-  cd "$GENOMAS_REPO"
-  "$AGENT_PYTHON" - <<"PY"
-import os, time
-from openai import OpenAI
-c = OpenAI(api_key=os.environ["OPENAI_API_KEY_1"], organization=os.environ.get("OPENAI_ORGANIZATION_1") or None)
-started = time.time()
-stream = c.chat.completions.create(
-    model=os.environ["GENOMAS_MODEL"],
-    messages=[{"role": "user", "content": "Reply exactly OK"}],
-    max_tokens=8,
-    stream=True,
-    stream_options={"include_usage": True},
-)
-first = None
-usage = None
-for chunk in stream:
-    if chunk.choices and chunk.choices[0].delta.content and first is None:
-        first = time.time()
-    if chunk.usage is not None:
-        usage = chunk.usage
-assert first is not None and usage is not None
-print("GENOMAS_PREFLIGHT_OK", usage.total_tokens, "FIRST_TOKEN_MS", round((first-started)*1000, 1))
-PY
-'\''
+bash scripts/setup_lustre_simple.sh
 ```
 
-若 GenoMAS 改用 FreeInference，预检要带 `base_url`（其余相同）：
+安装 BCC：
 
 ```zsh
-ssh "$SSH_USER@$CLIENT_NODE" 'cd "$HOME/pi-ebpf-tracing-handoff" && bash -lc '\''
-  set -a; source .env.genomas; set +a
-  cd "$GENOMAS_REPO"
-  "$AGENT_PYTHON" - <<"PY"
-import os, time
-from openai import OpenAI
-c = OpenAI(api_key=os.environ["OPENAI_API_KEY_1"], base_url=os.environ["OPENAI_BASE_URL"])
-started = time.time()
-stream = c.chat.completions.create(
-    model=os.environ["GENOMAS_MODEL"],
-    messages=[{"role": "user", "content": "Reply exactly OK"}],
-    max_tokens=8,
-    stream=True,
-    stream_options={"include_usage": True},
-)
-first = None
-usage = None
-for chunk in stream:
-    delta = chunk.choices[0].delta if chunk.choices else None
-    if delta is not None and (delta.content or getattr(delta, "reasoning_content", None)) and first is None:
-        first = time.time()
-    if chunk.usage is not None:
-        usage = chunk.usage
-assert first is not None and usage is not None
-print("GENOMAS_PREFLIGHT_OK", usage.total_tokens, "FIRST_TOKEN_MS", round((first-started)*1000, 1))
-PY
-'\''
+ssh "$SSH_USER@$WORKFLOW_NODE" '
+  sudo dnf install -y --setopt=install_weak_deps=False \
+    bcc-tools python3-bcc "kernel-devel-$(uname -r)" git curl rsync &&
+  /usr/bin/python3 -c "from bcc import BPF"
+'
 ```
 
+#### 2.2 Agentic workflow
 
-
-#### 🟥 首次部署或更换节点后执行全量部署
+部署所需 workflow：
 
 ```zsh
-bash scripts/deploy_scilink_to_client.sh    # 或 deploy_genomas_to_client.sh
+bash scripts/deploy_genomas_to_client.sh
+bash scripts/deploy_scilink_to_client.sh
 ```
 
-此命令中的 `uv venv --clear` 会重建整个虚拟环境，通常需要数分钟。仅更换 API key、模型或 Provider 时，应执行上一节的环境变量同步命令。
-
-### 2. 运行实验
-
-所有运行命令都使用 `nohup … >log 2>&1 </dev/null &`。SSH 返回提示符后，任务会继续在节点后台运行，此时可以断开连接。使用逗号分隔的 `RUN_WORKLOADS` 选择工作负载子集；留空表示运行全部工作负载。
-
-#### GenoMAS
-
-当前矩阵共 9 个 cell。`A_c{1,2,3,4,8}_w*` 是 cohort sweep，`B_t{1,2,4}_w2` 是 trait-count sweep。`A_c4_w2` 和 `A_c4_w4` 使用相同的 4-cohort 输入，专门比较 2 workers 与 4 workers。最小测试使用 `A_c1_w1`。
+只执行需要的一行。两个都需要时依次执行。分别检查：
 
 ```zsh
-ssh "$SSH_USER@$CLIENT_NODE" \
-  'cd pi-ebpf-tracing-handoff || exit 1
-   sudo -n true || exit 1
-   nohup sudo -n -E env \
-     GENOMAS_VENDOR="FreeInference" \
-     GENOMAS_MODEL="qwen3.6-35b" \
-     GENOMAS_CAPTURE_STREAM_TIMING=1 \
-     RUN_WORKLOADS="A_c1_w1" \
-     bash scripts/trace_script_bcc_genomas.sh \
-     >"$HOME/genomas_run.log" 2>&1 </dev/null &
-   echo "GenoMAS PID $!"'
+ssh "$SSH_USER@$WORKFLOW_NODE" 'test -x "$HOME/GenoMAS/.venv/bin/python"'
+ssh "$SSH_USER@$WORKFLOW_NODE" 'test -x "$HOME/SciLink/.venv/bin/python"'
 ```
 
-运行多组时只改逗号分隔的 `RUN_WORKLOADS`，例如 `A_c1_w1,A_c2_w2,B_t2_w2`。删除 `RUN_WORKLOADS` 可运行全部 9 个 cell。不要删除命令中的 `GENOMAS_VENDOR` 和 `GENOMAS_MODEL`，它们保证一个结果目录内不会因远端残留环境变量而混用 vendor 或模型。脚本会在所有 cell 后处理完成后自动生成根目录下的 `kvcache_report.md` 和 `kvcache_report.html`。比较 4-cohort 并发度时使用 `RUN_WORKLOADS="A_c4_w2,A_c4_w4"`。
+只检查已经部署的 workflow。
 
-使用 OpenAI 时，先执行上一节的 OpenAI 环境切换命令，再把运行命令中的两行改为：
+使用 OpenAI 或 FreeInference 时前往第 4 节。使用 vLLM 时前往第 3 节。
+
+#### 2.3 1000 Genomes
+
+在 Workflow cluster 执行一次：
 
 ```zsh
-GENOMAS_VENDOR="OpenAI" \
-GENOMAS_MODEL="gpt-4o-mini-2024-07-18" \
+ssh "$SSH_USER@$WORKFLOW_NODE"
 ```
-
-
-#### SciLink
-
-
-| workload                       | 类型      | 内容                                                                                       |
-| ------------------------------ | ------- | ---------------------------------------------------------------------------------------- |
-| `eels_plasmons_basic`          | analyze | EELS 等离激元 mapping                                                                        |
-| `eels_identification_basic`    | analyze | 1D EELS 谱识别                                                                              |
-| `polycrystalline_grains_basic` | analyze | 2D 晶粒分割                                                                                  |
-| `planning_critical_materials`  | plan    | 规划 agent，使用实验数据、知识目录和 embedding |
-
-
-```zsh
-ssh "$SSH_USER@$CLIENT_NODE" \
-  'cd pi-ebpf-tracing-handoff || exit 1
-   sudo -n true || exit 1
-   nohup sudo -n -E env RUN_WORKLOADS="polycrystalline_grains_basic" \
-     bash scripts/trace_script_bcc_scilink.sh \
-     >"$HOME/scilink_run.log" 2>&1 </dev/null &
-   echo "SciLink PID $!"'
-```
-
-运行多组时使用逗号分隔，例如 `RUN_WORKLOADS="eels_plasmons_basic,eels_identification_basic,polycrystalline_grains_basic"`。加入 `planning_critical_materials` 可同时测 planning workflow。脚本会先检查 SciLink 子命令和全部输入路径，然后才启动 BCC。每个 inference 会记录 `messages.jsonl`、token usage、`cacheRead`、provider request ID 和端到端时间。运行结束后会自动生成 KV-cache JSON、图表、Markdown 和 HTML 报告。
-
-SSH 输出 PID 并返回提示符后，任务已脱离终端，可以断开连接。`sudo -n true` 失败表示当前节点需要先建立 sudo 凭据，命令不会静默启动一个无法运行的后台任务。
-
-#### 查看并拉回 GenoMAS 和 SciLink 结果
-
-查看日志：
-
-```zsh
-# GenoMAS
-ssh "$SSH_USER@$CLIENT_NODE" 'tail -f "$HOME/genomas_run.log"'
-
-# SciLink
-ssh "$SSH_USER@$CLIENT_NODE" 'tail -f "$HOME/scilink_run.log"'
-```
-
-`Ctrl-C` 只退出 `tail`，不会停止实验。查看进程：
-
-```zsh
-# GenoMAS
-ssh "$SSH_USER@$CLIENT_NODE" \
-  "pgrep -af '[t]race_script_bcc_genomas|adapters.[g]enomas.launcher|[b]cc_tracer|analysis.[p]hase1_metrics|viz.[t]race' || true"
-
-# SciLink
-ssh "$SSH_USER@$CLIENT_NODE" \
-  "pgrep -af '[t]race_script_bcc_scilink|adapters.[s]cilink.launcher|[b]cc_tracer|analysis.[p]hase1_metrics|viz.[t]race' || true"
-```
-
-没有输出表示该系统已无运行中的工作流、tracer 或后处理进程。GenoMAS 日志出现 `Results in:`，或 SciLink 日志出现 `All done. Results in:`，才表示后处理、KV-cache 报告和 Index 已完成。
-
-以下函数从指定日志读取结果目录，拉回结果，检查完整性，并打开每个 cell 的 Index。
-
-```zsh
-pull_agentic_run() {
-  local remote_log="$1"
-  local remote_run remote_cells local_out cell required failed=0 cells=0
-
-  remote_run=$(ssh "$SSH_USER@$CLIENT_NODE" \
-    "sed -n 's/^Output dir: //p' \"\$HOME/$remote_log\" | head -1")
-  if [[ -z "$remote_run" ]]; then
-    echo "ERROR: result path not found in $remote_log" >&2
-    return 1
-  fi
-  remote_cells=$(ssh "$SSH_USER@$CLIENT_NODE" \
-    "find '$remote_run' -mindepth 2 -maxdepth 2 -type f -name manifest.json | wc -l")
-  if (( remote_cells == 0 )); then
-    echo "ERROR: remote run contains zero result cells: $remote_run" >&2
-    return 1
-  fi
-
-  local_out="results/$(basename "$remote_run")"
-  mkdir -p "$local_out"
-  rsync -az --progress --checksum --partial \
-    --exclude 'work/' --exclude 'bcc.out' \
-    "$SSH_USER@$CLIENT_NODE:$remote_run/" "$local_out/"
-
-  echo "Regenerating the KV report locally so figures match local code."
-  PYTHONPATH=src python -m agent_io_tracing.analysis.kvcache.report \
-    --results "$local_out" --runs . --dump-prefixes || return 1
-
-  for cell in "$local_out"/*; do
-    [[ -f "$cell/manifest.json" ]] || continue
-    ((cells += 1))
-    for required in \
-      ebpf_events.log parsed.json manifest.json pi_events.jsonl tool_calls.log \
-      messages.jsonl kvcache_demand.json kvcache_logical.json \
-      kvcache_report.md kvcache_report.html \
-      phase1_metrics.json parallelism_summary.json trace_quality.json \
-      lineage/artifacts.csv lineage/execution_unit_io.csv \
-      visualizations/file_access_volume.png visualizations/rw_asymmetry.png \
-      visualizations/request_size_rw_cdf.png \
-      visualizations/byte_normalized_summary.png visualizations/index.html; do
-      if [[ ! -s "$cell/$required" ]]; then
-        echo "ERROR: missing or empty: $cell/$required" >&2
-        failed=1
-      fi
-    done
-    if [[ ! -f "$cell/bcc.err" ]] || ! tail -1 "$cell/bcc.err" | grep -q 'lost_events=0'; then
-      echo "ERROR: lost-event check failed: $cell/bcc.err" >&2
-      failed=1
-    fi
-  done
-
-  for required in kvcache_report.md kvcache_report.html; do
-    if [[ ! -s "$local_out/$required" ]]; then
-      echo "ERROR: missing or empty: $local_out/$required" >&2
-      failed=1
-    fi
-  done
-
-  (( cells > 0 )) || failed=1
-  if (( failed == 0 )); then
-    open "$local_out"/*/visualizations/index.html
-    open "$local_out/kvcache_report.html"
-  else
-    echo "Result pull failed integrity checks; not opening incomplete output." >&2
-    return 1
-  fi
-}
-```
-
-定义函数后，按系统执行一行：
-
-```zsh
-pull_agentic_run genomas_run.log
-pull_agentic_run scilink_run.log
-```
-
-每次只需运行其中一行。函数使用日志记录的 `Output dir`，不会根据目录时间猜测，因此不会误拉 1000 Genomes 或 Montage 结果。
-
-### 3. 1000 Genomes classic baseline
-
-该路径不使用 Pegasus、HTCondor 或 LLM。`run_1000genome.py` 先执行 `individuals → individuals_merge` 和并行的 `sifting` 分支，再执行 `mutation_overlap` 与 `frequency`。每个 task 使用独立 sandbox，整个 DAG 共享一个全局 worker 上限。
-
-默认矩阵为 1、2、4 个 chromosome，各重复 3 次：
-
-```text
-classic_chr1_r1  classic_chr1_r2  classic_chr1_r3
-classic_chr2_r1  classic_chr2_r2  classic_chr2_r3
-classic_chr4_r1  classic_chr4_r2  classic_chr4_r3
-```
-
-默认固定 `INDIVIDUAL_JOBS=2`、`MAX_WORKERS=4`、`POPULATIONS=ALL`。
-
-#### 首次联网准备【CloudLab client，只做一次】
-
-运行阶段不会下载数据；必须先把代码、Python 依赖和解压后的输入准备好：
 
 ```bash
 LUSTRE_USER_DIR="${MOUNT_PATH:-/mnt/lustrefs}/$USER"
@@ -367,473 +109,445 @@ mkdir -p "$LUSTRE_USER_DIR"
 git clone https://github.com/pegasus-isi/1000genome-workflow.git \
   "$LUSTRE_USER_DIR/1000genome-workflow"
 cd "$LUSTRE_USER_DIR/1000genome-workflow"
-
-# upstream 脚本假定这个目录已经存在。
 mkdir -p data/20130502/sifting
 bash prepare_input.sh
-
-# 不安装 Pegasus/HTCondor。使用兼容当前 Python 的科学计算包；不要强制
-# 安装 upstream 为旧 Python 固定的版本号。
 curl -LsSf https://astral.sh/uv/install.sh | sh
 "$HOME/.local/bin/uv" venv --python 3.10 .venv
 "$HOME/.local/bin/uv" pip install --python .venv/bin/python \
   numpy matplotlib pillow pandas plotly
+exit
 ```
 
-开始前必须存在：
+运行前必须存在所选 chromosome 的主 VCF 和 annotation VCF。文件必须解压为 `.vcf`。
 
-```text
-$WORKFLOW_REPO/bin/{individuals,individuals_merge,sifting,mutation_overlap,frequency}.py
-$DATASET_DIR/columns.txt
-$DATASET_DIR/ALL.chr1.250000.vcf
-$DATASET_DIR/sifting/ALL.chr1.phase3_shapeit2_mvncall_integrated_v5.20130502.sites.annotation.vcf
-$POPULATION_DIR/ALL
-```
+完成后前往第 5 节。
 
-2-chromosome 和 4-chromosome cell 还需要 chr2 或 chr2 至 chr4 的两类 VCF。输入必须是解压后的 `.vcf`，不能只保留 `.vcf.gz`。
+#### 2.4 Montage
 
-#### 隔离的小规模追踪
-
-以下测试只读取原始 VCF，并在独立的 `BASE_OUT` 下创建 task sandbox、trace、指标、图和 `visualizations/index.html`。测试不会修改 upstream checkout、原始数据或已有结果。不要并发运行这些测试，否则 I/O 竞争会污染对比。
-
-运行时间仅是目标区间。首次运行应先用最小档测量当前节点速度，再决定是否运行后两档。
-
-#### 1. 最小：1 chromosome × 300 VCF lines，目标约 5 分钟
+Montage 使用 1000 Genomes 的 Python 创建独立环境。在 Mac 执行一次：
 
 ```zsh
-ssh "$SSH_USER@$CLIENT_NODE" '
-  cd "$HOME/pi-ebpf-tracing-handoff"
-  REPO="/mnt/lustrefs/$USER/1000genome-workflow"
-  OUT="/mnt/lustrefs/$USER/pi-ebpf-tracing-handoff/results/classic_smoke_$(date +%Y%m%d_%H%M%S)"
-  sudo -E env \
-    BASE_OUT="$OUT" \
-    WORKFLOW_REPO="$REPO" \
-    DATASET_DIR="$REPO/data/20130502" \
-    POPULATION_DIR="$REPO/data/populations" \
-    AGENT_PYTHON="$REPO/.venv/bin/python" \
-    POST_PYTHON="$REPO/.venv/bin/python" \
-    CLASSIC_OFFLINE=1 \
-    BCC_PERF_PAGES=1024 \
-    RUN_WORKLOADS=classic_chr1_r1 \
-    ROWS_PER_CHROMOSOME=300 \
-    CLASSIC_VCF_RECORD_LIMIT=300 \
-    INDIVIDUAL_JOBS=1 \
-    MAX_WORKERS=1 \
-    nohup bash scripts/trace_script_bcc_1000genome.sh \
-      > "$HOME/classic_smoke.log" 2>&1 < /dev/null &
-'
-```
-
-
-
-#### 2. 小：1 chromosome × 750 VCF lines，目标约 5–10 分钟
-
-```zsh
-ssh "$SSH_USER@$CLIENT_NODE" '
-  cd "$HOME/pi-ebpf-tracing-handoff"
-  REPO="/mnt/lustrefs/$USER/1000genome-workflow"
-  OUT="/mnt/lustrefs/$USER/pi-ebpf-tracing-handoff/results/classic_small_$(date +%Y%m%d_%H%M%S)"
-  sudo -E env \
-    BASE_OUT="$OUT" \
-    WORKFLOW_REPO="$REPO" \
-    DATASET_DIR="$REPO/data/20130502" \
-    POPULATION_DIR="$REPO/data/populations" \
-    AGENT_PYTHON="$REPO/.venv/bin/python" \
-    POST_PYTHON="$REPO/.venv/bin/python" \
-    CLASSIC_OFFLINE=1 \
-    BCC_PERF_PAGES=1024 \
-    RUN_WORKLOADS=classic_chr1_r1 \
-    ROWS_PER_CHROMOSOME=750 \
-    CLASSIC_VCF_RECORD_LIMIT=750 \
-    INDIVIDUAL_JOBS=1 \
-    MAX_WORKERS=2 \
-    nohup bash scripts/trace_script_bcc_1000genome.sh \
-      > "$HOME/classic_small.log" 2>&1 < /dev/null &
-'
-```
-
-
-
-#### 3. 中：1 chromosome × 2,000 VCF lines，目标约 10–20 分钟
-
-```zsh
-ssh "$SSH_USER@$CLIENT_NODE" '
-  cd "$HOME/pi-ebpf-tracing-handoff"
-  REPO="/mnt/lustrefs/$USER/1000genome-workflow"
-  OUT="/mnt/lustrefs/$USER/pi-ebpf-tracing-handoff/results/classic_medium_$(date +%Y%m%d_%H%M%S)"
-  sudo -E env \
-    BASE_OUT="$OUT" \
-    WORKFLOW_REPO="$REPO" \
-    DATASET_DIR="$REPO/data/20130502" \
-    POPULATION_DIR="$REPO/data/populations" \
-    AGENT_PYTHON="$REPO/.venv/bin/python" \
-    POST_PYTHON="$REPO/.venv/bin/python" \
-    CLASSIC_OFFLINE=1 \
-    BCC_PERF_PAGES=1024 \
-    RUN_WORKLOADS=classic_chr1_r1 \
-    ROWS_PER_CHROMOSOME=2000 \
-    CLASSIC_VCF_RECORD_LIMIT=2000 \
-    INDIVIDUAL_JOBS=1 \
-    MAX_WORKERS=2 \
-    nohup bash scripts/trace_script_bcc_1000genome.sh \
-      > "$HOME/classic_medium.log" 2>&1 < /dev/null &
-'
-```
-
-`CLASSIC_VCF_RECORD_LIMIT` 会同时截取 main VCF 和 annotation VCF 并保留 header。副本写入本次 `BASE_OUT`，截取过程在 eBPF tracer 启动前完成。1000 Genomes 的 `individuals.py` 会逐列处理约 2,504 个样本，因此 2,000 行并非最小测试。
-
-三个档位用于验证 tracing、DAG 并发和指标链路，不作为正式科学结果。目标时间以当前节点首次正确部署后的实测为准。
-
-每次运行结束后必须确认 `bcc.err` 的最后一行是 `lost_events=0`。否则该 trace 只能用于调试和估算运行成本，不能进入正式对比。
-
-运行完整的 9-cell 矩阵时，使用默认值 `ROWS_PER_CHROMOSOME=250000` 和 `CLASSIC_VCF_RECORD_LIMIT=0`，并删除 `RUN_WORKLOADS` 或将其设为空字符串。
-
-#### 完全离线运行
-
-“离线”表示运行期间不访问公网且不调用 API。CloudLab 内部的 Lustre 挂载和 SSH 控制连接仍可使用。Classic runner 本身没有下载或网络调用，并默认设置 `CLASSIC_OFFLINE=1`。该标记会写入 `manifest.json` 和 `work/classic_run_summary.json`，便于审计。
-
-在隔离节点执行前，从可联网机器一次性传入以下内容：
-
-- `1000genome-workflow` checkout，包括 `bin/`、`data/populations/`、`columns.txt` 和所需的全部解压 VCF
-- 可直接使用的 Python 3.10+ 环境，或包含 `numpy`、`matplotlib`、`pillow`、`pandas`、`plotly` 及其依赖的本地 wheelhouse
-- 系统级 BCC 包和与当前 kernel 匹配的 headers。普通 Python wheelhouse 无法替代 BCC
-
-如果使用 wheelhouse，在离线节点安装时禁止访问索引：
-
-```bash
-python3.10 -m venv "$WORKFLOW_REPO/.venv"
-"$WORKFLOW_REPO/.venv/bin/pip" install \
-  --no-index --find-links /path/to/wheelhouse \
-  numpy matplotlib pillow pandas plotly
-```
-
-确认输入和依赖已落盘后，执行上一节的命令。不需要 API key、`.env.genomas` 或 `.env.scilink`。Trace 脚本会在启动 tracer 前检查 repo、Python、`columns.txt`、population 文件和每个 chromosome 的两个 VCF。缺少任何一项时脚本会直接失败，不会尝试联网补齐。
-
-每个成功 cell 应至少生成：
-
-```text
-ebpf_events.log
-parsed.json
-artifact_sizes.json
-manifest.json
-work/classic_run_summary.json
-execution_units.jsonl
-phase1_metrics.json
-parallelism_summary.json
-trace_quality.json
-lineage/artifacts.csv
-lineage/execution_unit_io.csv
-lineage/execution_unit_summary.json
-visualizations/file_access_volume.png
-visualizations/rw_asymmetry.png
-visualizations/request_size_rw_cdf.png
-visualizations/byte_normalized_summary.png
-visualizations/index.html
-```
-
-Classic run 不生成 LLM summary。Universal lineage、parallelism、metrics 和 dashboard 与 agentic trace 使用同一套后处理。
-
-#### 查看过程并判断结束
-
-按正在运行的档位选择对应日志：
-
-```zsh
-# 300-line smoke
-ssh "$SSH_USER@$CLIENT_NODE" 'tail -f "$HOME/classic_smoke.log"'
-
-# 750-line small
-ssh "$SSH_USER@$CLIENT_NODE" 'tail -f "$HOME/classic_small.log"'
-
-# 2,000-line medium
-ssh "$SSH_USER@$CLIENT_NODE" 'tail -f "$HOME/classic_medium.log"'
-```
-
-`Ctrl-C` 只退出 `tail`，不会停止远端实验。查看 tracer、workflow 和后处理进程：
-
-```zsh
-ssh "$SSH_USER@$CLIENT_NODE" \
-  "pgrep -af 'trace_script_bcc_1000genome|run_1000genome.py|phase1_metrics|visualize' || true"
-```
-
-查看当前日志记录的远端结果目录：
-
-```zsh
-ssh "$SSH_USER@$CLIENT_NODE" '
-  for log in "$HOME/classic_smoke.log" "$HOME/classic_small.log" "$HOME/classic_medium.log"; do
-    [[ -f "$log" ]] || continue
-    printf "%s: " "$(basename "$log")"
-    awk "/^Output:/ {print \$2; found=1; exit} END {if (!found) print \"output path not written yet\"}" "$log"
-  done
-'
-```
-
-日志最后出现以下内容才表示整个 trace 和后处理完成：
-
-```text
-Results: /mnt/lustrefs/.../results/classic_...
-```
-
-只出现 `=== Classic post-processing ===` 表示工作流已完成，但指标、图或 Index 仍在生成。进程列表为空且日志没有 `Results:` 时，脚本已经异常退出，应先查看日志末尾。
-
-```zsh
-ssh "$SSH_USER@$CLIENT_NODE" 'tail -100 "$HOME/classic_smoke.log"'
-```
-
-将 `classic_smoke.log` 替换为实际运行的 `classic_small.log` 或 `classic_medium.log`。
-
-#### 拉回、校验并打开结果
-
-以下命令选择最新的 `classic_*` 结果，不会误选 SciLink、GenoMAS 或 Montage：
-
-```zsh
-REMOTE_RUN=$(ssh "$SSH_USER@$CLIENT_NODE" \
-  'ls -1dt /mnt/lustrefs/$USER/pi-ebpf-tracing-handoff/results/classic_*/ 2>/dev/null | head -1')
-if [[ -z "$REMOTE_RUN" ]]; then
-  echo "ERROR: no classic result found" >&2
-else
-  LOCAL="results/$(basename "$REMOTE_RUN")"
-  mkdir -p "$LOCAL"
-  rsync -az --progress --checksum --partial \
-    --exclude 'work/' --exclude 'bcc.out' \
-    "$SSH_USER@$CLIENT_NODE:$REMOTE_RUN" "$LOCAL/"
-
-  failed=0
-  cells=0
-  for cell in "$LOCAL"/*; do
-    [[ -f "$cell/manifest.json" ]] || continue
-    ((cells += 1))
-    for required in \
-      ebpf_events.log parsed.json artifact_sizes.json manifest.json \
-      execution_units.jsonl phase1_metrics.json parallelism_summary.json \
-      trace_quality.json lineage/artifacts.csv \
-      lineage/execution_unit_io.csv lineage/execution_unit_summary.json \
-      visualizations/file_access_volume.png visualizations/rw_asymmetry.png \
-      visualizations/request_size_rw_cdf.png \
-      visualizations/byte_normalized_summary.png visualizations/index.html; do
-      if [[ ! -s "$cell/$required" ]]; then
-        echo "ERROR: missing or empty: $cell/$required" >&2
-        failed=1
-      fi
-    done
-    for required in pi_events.jsonl tool_calls.log; do
-      if [[ ! -f "$cell/$required" ]]; then
-        echo "ERROR: missing: $cell/$required" >&2
-        failed=1
-      fi
-    done
-    if [[ ! -f "$cell/bcc.err" ]] || ! tail -1 "$cell/bcc.err" | grep -q 'lost_events=0'; then
-      echo "ERROR: lost-event check failed: $cell/bcc.err" >&2
-      failed=1
-    fi
-  done
-
-  if (( cells == 0 )); then
-    echo "ERROR: no completed cells found under $LOCAL" >&2
-    failed=1
-  fi
-  if (( failed == 0 )); then
-    open "$LOCAL"/*/visualizations/index.html
-  else
-    echo "1000 Genomes pull failed integrity checks; not opening incomplete output." >&2
-  fi
-fi
-```
-
-指定某次实验时，不要使用“最新结果”查找。直接设置完整路径：
-
-```zsh
-REMOTE_RUN="/mnt/lustrefs/$SSH_USER/pi-ebpf-tracing-handoff/results/classic_smoke_YYYYMMDD_HHMMSS/"
-```
-
-
-
-### 4. Montage traditional baseline
-
-日常运行包含两个步骤。更换节点时还需执行一次环境配置。
-
-1. 在 trace 开始前下载并冻结 FITS 输入。
-2. 运行正式 eBPF trace，生成本项目的 metrics、lineage、I/O 图和 Index。
-
-`mosaic.png` 是 Montage 的科学结果，不是 characterization 图。正式结果应查看 `visualizations/index.html`。当前节点已完成 `0.10°` 输入准备和正式 smoke。重复运行 `0.10°` 实验时，直接从“最小正式 eBPF trace”开始。
-
-当前节点没有 HTCondor，正式实验使用项目内的 direct stage driver。该 driver 保留 11 个 Montage stage 及其依赖，并记录每个 stage 的 PID 和时间区间。Pegasus 不进入被测进程。
-
-#### 1. 配置正式环境【更换节点时执行一次】
-
-当前节点已经配置完成，无需重复执行。更换节点时，使用 1000 Genomes 的 Python 解释器创建独立的 Montage venv。此过程不会修改 1000 Genomes 环境，所有新文件都写入 Lustre。
-
-```zsh
-ssh "$SSH_USER@$CLIENT_NODE" 'bash -s' <<'REMOTE'
+ssh "$SSH_USER@$WORKFLOW_NODE" 'bash -s' <<'REMOTE'
 set -euo pipefail
-
 ROOT="/mnt/lustrefs/$USER/montage"
 BASE_PYTHON="/mnt/lustrefs/$USER/1000genome-workflow/.venv/bin/python"
 TRACE_VENV="$ROOT/trace-venv"
-[[ -x "$BASE_PYTHON" ]] || { echo "Missing Python 3.10+ runtime: $BASE_PYTHON" >&2; exit 1; }
-
-mkdir -p \
-  "$ROOT/tmp" "$ROOT/logs" "$ROOT/input" \
-  "$ROOT/cache/pip" "$ROOT/cache/python" \
-  "$ROOT/cache/matplotlib" "$ROOT/cache/xdg" "$ROOT/cache/config"
-export TMPDIR="$ROOT/tmp"
-export PIP_CACHE_DIR="$ROOT/cache/pip"
-export PYTHONPYCACHEPREFIX="$ROOT/cache/python"
-export MPLCONFIGDIR="$ROOT/cache/matplotlib"
-export XDG_CACHE_HOME="$ROOT/cache/xdg"
-export XDG_CONFIG_HOME="$ROOT/cache/config"
-
+test -x "$BASE_PYTHON"
+mkdir -p "$ROOT"/{tmp,logs,input,cache/pip,cache/python,cache/matplotlib,cache/xdg,cache/config}
 "$BASE_PYTHON" -m venv "$TRACE_VENV"
-"$TRACE_VENV/bin/python" -m pip install --upgrade pip
 "$TRACE_VENV/bin/python" -m pip install \
   MontagePy astropy numpy matplotlib pillow pandas plotly importlib_resources
-"$TRACE_VENV/bin/python" --version
 "$TRACE_VENV/bin/python" -c 'import MontagePy, numpy, pandas, plotly'
 REMOTE
 ```
 
-修改代码后只需执行“一、配环境”中的“改了代码 → 推代码”，不需要重建 venv。
+完成后前往第 5 节。
 
-#### 2. 准备固定输入【每个规模执行一次】
+### 3. 第一次使用或更换 vLLM cluster
 
-当前节点的 `0.10°` 输入已经准备完成，无需重复下载。准备新规模时只修改第一行的 `SIZE`。下载、manifest 和校验都写入 Lustre，并在追踪开始前完成。
+本仓库不启动 vLLM server。保持 vLLM 的 `srun` terminal 运行，在新的 Mac terminal 设置计算节点：
 
 ```zsh
-SIZE=0.25
-ssh "$SSH_USER@$CLIENT_NODE" "bash -s -- $SIZE" <<'REMOTE'
-set -euo pipefail
+export VLLM_NODE="<运行 vLLM 的 Perlmutter compute node>"
+```
 
+建立 Perlmutter 到 Mac 的 tunnel。该 terminal 保持运行：
+
+```zsh
+ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=60 \
+  -L "18000:$VLLM_NODE:8000" \
+  mqsun@perlmutter.nersc.gov
+```
+
+在另一个 Mac terminal 建立 Mac 到 Workflow cluster 的 reverse tunnel。该 terminal 也保持运行：
+
+```zsh
+source cloudlab_env.sh
+export WORKFLOW_NODE="${WORKFLOW_NODE:-$CLIENT_NODE}"
+export CLIENT_NODE="$WORKFLOW_NODE"
+
+ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=60 \
+  -R 18080:127.0.0.1:18000 \
+  "$SSH_USER@$WORKFLOW_NODE"
+```
+
+在第三个 Mac terminal 检查 endpoint：
+
+```zsh
+source cloudlab_env.sh
+export WORKFLOW_NODE="${WORKFLOW_NODE:-$CLIENT_NODE}"
+export CLIENT_NODE="$WORKFLOW_NODE"
+
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "curl --connect-timeout 5 --max-time 10 -fsS \
+  http://127.0.0.1:18080/v1/models | python3 -m json.tool"
+```
+
+将返回结果中的 `data[0].id` 设为模型：
+
+```zsh
+export VLLM_URL="http://127.0.0.1:18080"
+export VLLM_SERVED_MODEL="<data[0].id>"
+unset VLLM_API_KEY
+```
+
+连接路径为 `Workflow cluster:18080 → Mac:18000 → Perlmutter compute node:8000`。更换 vLLM compute node 后重建第一个 tunnel。更换 Workflow cluster 后重建第二个 tunnel。成功后执行第 4.3 节。
+
+### 4. 配置推理后端
+
+GenoMAS 支持三种后端。SciLink 的图像 workload 需要视觉模型。
+
+| 后端 | Key | Base URL | Model |
+| --- | --- | --- | --- |
+| OpenAI | `OPENAI_API_KEY` | 不设置 | OpenAI 模型 |
+| FreeInference | `GENOMAS_OPENAI_API_KEY` | `GENOMAS_BASE_URL` | 模型裸名 |
+| vLLM | `VLLM_API_KEY` 或占位值 | `VLLM_URL/v1` | served model |
+
+#### 4.1 OpenAI
+
+在 Mac 设置模型：
+
+```zsh
+export GENOMAS_MODEL="gpt-4o-mini-2024-07-18"
+export SCILINK_MODEL="gpt-4o-mini"
+```
+
+写入 Workflow cluster：
+
+```zsh
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "if [ -f pi-ebpf-tracing-handoff/.env.genomas ]; then sed -i -E '/^(export )?(OPENAI_API_KEY_1|OPENAI_ORGANIZATION_1|OPENAI_BASE_URL|OPENAI_API_BASE|GENOMAS_MODEL|GENOMAS_VENDOR)=/d' pi-ebpf-tracing-handoff/.env.genomas; cat >> pi-ebpf-tracing-handoff/.env.genomas; chmod 600 pi-ebpf-tracing-handoff/.env.genomas; fi" <<EOF
+export OPENAI_API_KEY_1="$OPENAI_API_KEY"
+export OPENAI_ORGANIZATION_1="$OPENAI_ORGANIZATION"
+export GENOMAS_MODEL="$GENOMAS_MODEL"
+export GENOMAS_VENDOR="OpenAI"
+EOF
+
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "if [ -f pi-ebpf-tracing-handoff/.env.scilink ]; then sed -i -E '/^(export )?(OPENAI_API_KEY|OPENAI_BASE_URL|OPENAI_API_BASE|SCILINK_MODEL|SCILINK_VENDOR)=/d' pi-ebpf-tracing-handoff/.env.scilink; cat >> pi-ebpf-tracing-handoff/.env.scilink; chmod 600 pi-ebpf-tracing-handoff/.env.scilink; fi" <<EOF
+export OPENAI_API_KEY="$OPENAI_API_KEY"
+export SCILINK_MODEL="$SCILINK_MODEL"
+export SCILINK_VENDOR="OpenAI"
+EOF
+```
+
+#### 4.2 FreeInference
+
+在 Mac 设置：
+
+```zsh
+export GENOMAS_MODEL="qwen3.6-35b"
+```
+
+写入 Workflow cluster：
+
+```zsh
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "test -f pi-ebpf-tracing-handoff/.env.genomas && sed -i -E '/^(export )?(OPENAI_API_KEY_1|OPENAI_ORGANIZATION_1|OPENAI_BASE_URL|OPENAI_API_BASE|GENOMAS_MODEL|GENOMAS_VENDOR)=/d' pi-ebpf-tracing-handoff/.env.genomas && cat >> pi-ebpf-tracing-handoff/.env.genomas && chmod 600 pi-ebpf-tracing-handoff/.env.genomas" <<EOF
+export OPENAI_API_KEY_1="$GENOMAS_OPENAI_API_KEY"
+export OPENAI_BASE_URL="$GENOMAS_BASE_URL"
+export OPENAI_API_BASE="$GENOMAS_BASE_URL"
+export GENOMAS_MODEL="$GENOMAS_MODEL"
+export GENOMAS_VENDOR="FreeInference"
+EOF
+```
+
+FreeInference 不用于当前 SciLink 图像 workload。
+
+#### 4.3 vLLM
+
+在 Mac 执行：
+
+```zsh
+source config/config_vllm_endpoint.env
+```
+
+写入 Workflow cluster：
+
+```zsh
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "if [ -f pi-ebpf-tracing-handoff/.env.genomas ]; then sed -i -E '/^(export )?(OPENAI_API_KEY_1|OPENAI_ORGANIZATION_1|OPENAI_BASE_URL|OPENAI_API_BASE|GENOMAS_MODEL|GENOMAS_VENDOR)=/d' pi-ebpf-tracing-handoff/.env.genomas; cat >> pi-ebpf-tracing-handoff/.env.genomas; chmod 600 pi-ebpf-tracing-handoff/.env.genomas; fi" <<EOF
+export OPENAI_API_KEY_1="$OPENAI_API_KEY_1"
+export OPENAI_ORGANIZATION_1="local-vllm"
+export OPENAI_BASE_URL="$OPENAI_BASE_URL"
+export OPENAI_API_BASE="$OPENAI_API_BASE"
+export GENOMAS_MODEL="$GENOMAS_MODEL"
+export GENOMAS_VENDOR="vLLM"
+EOF
+
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "if [ -f pi-ebpf-tracing-handoff/.env.scilink ]; then sed -i -E '/^(export )?(OPENAI_API_KEY|OPENAI_BASE_URL|OPENAI_API_BASE|SCILINK_MODEL|SCILINK_VENDOR)=/d' pi-ebpf-tracing-handoff/.env.scilink; cat >> pi-ebpf-tracing-handoff/.env.scilink; chmod 600 pi-ebpf-tracing-handoff/.env.scilink; fi" <<EOF
+export OPENAI_API_KEY="$OPENAI_API_KEY"
+export OPENAI_BASE_URL="$OPENAI_BASE_URL"
+export OPENAI_API_BASE="$OPENAI_API_BASE"
+export SCILINK_MODEL="$SCILINK_MODEL"
+export SCILINK_VENDOR="vLLM"
+EOF
+```
+
+#### 4.4 每次运行前检查
+
+查看当前后端：
+
+```zsh
+ssh "$SSH_USER@$WORKFLOW_NODE" '
+  for file in .env.genomas .env.scilink; do
+    path="$HOME/pi-ebpf-tracing-handoff/$file"
+    [[ -f "$path" ]] || continue
+    set -a; source "$path"; set +a
+    printf "%s vendor=%s model=%s base=%s\n" \
+      "$file" "${GENOMAS_VENDOR:-${SCILINK_VENDOR:-}}" \
+      "${GENOMAS_MODEL:-${SCILINK_MODEL:-}}" "${OPENAI_BASE_URL:-default}"
+    unset GENOMAS_VENDOR SCILINK_VENDOR GENOMAS_MODEL SCILINK_MODEL OPENAI_BASE_URL
+  done
+'
+```
+
+OpenAI：
+
+```zsh
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  '! grep -q "^export OPENAI_BASE_URL=" pi-ebpf-tracing-handoff/.env.genomas &&
+   ! grep -q "^export OPENAI_BASE_URL=" pi-ebpf-tracing-handoff/.env.scilink'
+```
+
+FreeInference 或 vLLM：
+
+```zsh
+ssh "$SSH_USER@$WORKFLOW_NODE" '
+  set -a
+  source pi-ebpf-tracing-handoff/.env.genomas
+  set +a
+  curl -fsS "${OPENAI_BASE_URL%/}/models" >/dev/null
+'
+```
+
+后端检查通过后，代码未变化时前往第 6 节。代码变化时先执行第 5 节。
+
+### 5. 修改代码后同步整个仓库
+
+在 Mac 执行。该命令以整个仓库为同步范围，不重建虚拟环境，不覆盖 key 和结果：
+
+```zsh
+rsync -az --delete \
+  --exclude '.git/' --exclude '__pycache__/' --exclude '*.pyc' \
+  --exclude 'results/' --exclude '.venv/' --exclude '.env*' \
+  ./ "$SSH_USER@$WORKFLOW_NODE:pi-ebpf-tracing-handoff/"
+```
+
+检查远端脚本：
+
+```zsh
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  'cd pi-ebpf-tracing-handoff && bash -n scripts/trace_script_bcc_genomas.sh scripts/trace_script_bcc_scilink.sh'
+```
+
+成功后前往第 6 节。
+
+### 6. 每次运行
+
+下面以 GenoMAS、vLLM 和 `A_c2_w1` 为例。运行其他组合时修改前三行：
+
+```zsh
+WORKFLOW="genomas"
+BACKEND="vllm"
+WORKLOAD_TAG="A_c2_w1"
+RUN_NAME="${WORKFLOW}__${BACKEND}__${WORKLOAD_TAG}__$(date +%Y%m%d_%H%M%S)"
+REMOTE_RUN="$MOUNT_PATH/$SSH_USER/pi-ebpf-tracing-handoff/results/$RUN_NAME"
+REMOTE_LOG="logs/$RUN_NAME.log"
+ssh "$SSH_USER@$WORKFLOW_NODE" 'mkdir -p "$HOME/logs"'
+```
+
+运行名只使用字母、数字、点、下划线和连字符。
+
+#### 6.1 GenoMAS
+
+可选 workload：
+
+```text
+A_c1_w1,A_c2_w1,A_c2_w2,A_c3_w2,A_c4_w2,A_c4_w4,A_c8_w4
+B_t1_w2,B_t2_w2,B_t4_w2
+```
+
+在 Mac 设置并启动：
+
+```zsh
+RUN_WORKLOADS="A_c2_w1"
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "cd pi-ebpf-tracing-handoff &&
+   sudo -n true &&
+   nohup sudo -n -E env BASE_OUT='$REMOTE_RUN' RUN_WORKLOADS='$RUN_WORKLOADS' \
+     bash scripts/trace_script_bcc_genomas.sh \
+     >\"\$HOME/$REMOTE_LOG\" 2>&1 </dev/null &
+   echo PID=\$! LOG=\$HOME/$REMOTE_LOG RESULTS='$REMOTE_RUN'"
+```
+
+空的 `RUN_WORKLOADS` 运行全部 10 个 cell。
+
+#### 6.2 SciLink
+
+可选 workload：
+
+```text
+eels_plasmons_basic
+eels_identification_basic
+polycrystalline_grains_basic
+planning_critical_materials
+```
+
+在 Mac 设置并启动：
+
+```zsh
+RUN_WORKLOADS="polycrystalline_grains_basic"
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "cd pi-ebpf-tracing-handoff &&
+   sudo -n true &&
+   nohup sudo -n -E env BASE_OUT='$REMOTE_RUN' RUN_WORKLOADS='$RUN_WORKLOADS' \
+     bash scripts/trace_script_bcc_scilink.sh \
+     >\"\$HOME/$REMOTE_LOG\" 2>&1 </dev/null &
+   echo PID=\$! LOG=\$HOME/$REMOTE_LOG RESULTS='$REMOTE_RUN'"
+```
+
+#### 6.3 1000 Genomes
+
+该 workflow 不使用第 4 节。先运行最小 cell：
+
+```zsh
+RUN_WORKLOADS="classic_chr1_r1"
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "cd pi-ebpf-tracing-handoff &&
+   sudo -n true &&
+   nohup sudo -n -E env \
+     BASE_OUT='$REMOTE_RUN' \
+     WORKFLOW_REPO='$MOUNT_PATH/$SSH_USER/1000genome-workflow' \
+     DATASET_DIR='$MOUNT_PATH/$SSH_USER/1000genome-workflow/data/20130502' \
+     POPULATION_DIR='$MOUNT_PATH/$SSH_USER/1000genome-workflow/data/populations' \
+     AGENT_PYTHON='$MOUNT_PATH/$SSH_USER/1000genome-workflow/.venv/bin/python' \
+     POST_PYTHON='$MOUNT_PATH/$SSH_USER/1000genome-workflow/.venv/bin/python' \
+     CLASSIC_OFFLINE=1 RUN_WORKLOADS='$RUN_WORKLOADS' \
+     bash scripts/trace_script_bcc_1000genome.sh \
+     >\"\$HOME/$REMOTE_LOG\" 2>&1 </dev/null &
+   echo PID=\$! LOG=\$HOME/$REMOTE_LOG RESULTS='$REMOTE_RUN'"
+```
+
+默认矩阵包含 1、2、4 个 chromosome，各重复三次。正式运行前先确认所需 VCF 已准备。
+
+#### 6.4 Montage
+
+该 workflow 不使用第 4 节。每个规模先准备一次固定输入：
+
+```zsh
+SIZE=0.10
+ssh "$SSH_USER@$WORKFLOW_NODE" "bash -s -- $SIZE" <<'REMOTE'
+set -euo pipefail
 SIZE="$1"
 ROOT="/mnt/lustrefs/$USER/montage"
 TAG="${SIZE/./p}deg"
 cd "$HOME/pi-ebpf-tracing-handoff"
-
-export TMPDIR="$ROOT/tmp"
-export PIP_CACHE_DIR="$ROOT/cache/pip"
-export PYTHONPYCACHEPREFIX="$ROOT/cache/python"
-export MPLCONFIGDIR="$ROOT/cache/matplotlib"
-export XDG_CACHE_HOME="$ROOT/cache/xdg"
-export XDG_CONFIG_HOME="$ROOT/cache/config"
-
 PYTHONPATH="$PWD/src" "$ROOT/trace-venv/bin/python" \
   -m agent_io_tracing.adapters.montage.prepare_input \
-  --size-deg "$SIZE" \
-  --output "$ROOT/input/m17_${TAG}"
+  --size-deg "$SIZE" --output "$ROOT/input/m17_${TAG}"
 REMOTE
 ```
 
-准备顺序为 `0.10`、`0.25`、`0.50`。已存在的输入只做 checksum 校验，不会覆盖。
-
-#### 3. 运行最小正式 eBPF trace
-
-以下命令只运行 `0.10° × 0.10°` 的第 1 次重复。结果、运行日志、cache 和临时文件都写入 Lustre。
+准备完成后启动：
 
 ```zsh
-ssh "$SSH_USER@$CLIENT_NODE" 'bash -s' <<'REMOTE'
-set -euo pipefail
-
-cd "$HOME/pi-ebpf-tracing-handoff"
-ROOT="/mnt/lustrefs/$USER/montage"
-OUT="/mnt/lustrefs/$USER/pi-ebpf-tracing-handoff/results/classic_montage_smoke_$(date +%Y%m%d_%H%M%S)"
-LOG="$ROOT/logs/montage_trace_$(date +%Y%m%d_%H%M%S).log"
-mkdir -p "$ROOT/logs"
-ln -sfn "$LOG" "$ROOT/latest_trace_log"
-
-sudo -E env \
-  BASE_OUT="$OUT" \
-  MONTAGE_ROOT="$ROOT" \
-  MONTAGE_INPUT_ROOT="$ROOT/input" \
-  MONTAGE_PYTHON="$ROOT/trace-venv/bin/python" \
-  AGENT_PYTHON="$ROOT/trace-venv/bin/python" \
-  POST_PYTHON="$ROOT/trace-venv/bin/python" \
-  MONTAGE_OFFLINE=1 \
-  BCC_PERF_PAGES=1024 \
-  RUN_WORKLOADS=montage_m17_0p10_r1 \
-  nohup bash scripts/trace_script_bcc_montage.sh \
-    > "$LOG" 2>&1 < /dev/null &
-printf 'RESULTS=%s\nLOG=%s\n' "$OUT" "$LOG"
-REMOTE
+RUN_WORKLOADS="montage_m17_0p10_r1"
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "cd pi-ebpf-tracing-handoff &&
+   sudo -n true &&
+   nohup sudo -n -E env \
+     BASE_OUT='$REMOTE_RUN' \
+     MONTAGE_ROOT='$MOUNT_PATH/$SSH_USER/montage' \
+     MONTAGE_INPUT_ROOT='$MOUNT_PATH/$SSH_USER/montage/input' \
+     MONTAGE_PYTHON='$MOUNT_PATH/$SSH_USER/montage/trace-venv/bin/python' \
+     AGENT_PYTHON='$MOUNT_PATH/$SSH_USER/montage/trace-venv/bin/python' \
+     POST_PYTHON='$MOUNT_PATH/$SSH_USER/montage/trace-venv/bin/python' \
+     MONTAGE_OFFLINE=1 RUN_WORKLOADS='$RUN_WORKLOADS' \
+     bash scripts/trace_script_bcc_montage.sh \
+     >\"\$HOME/$REMOTE_LOG\" 2>&1 </dev/null &
+   echo PID=\$! LOG=\$HOME/$REMOTE_LOG RESULTS='$REMOTE_RUN'"
 ```
 
-从小到大只需替换 `RUN_WORKLOADS`：
+规模为 `0p10`、`0p25` 和 `0p50`。每个规模有 `r1`、`r2` 和 `r3`。
 
+启动成功后保留当前 terminal 中的 `RUN_NAME`、`REMOTE_RUN` 和 `REMOTE_LOG`，前往第 7 节。
 
-| 规模      | 第一次运行                 | 三次重复                                                          |
-| ------- | --------------------- | ------------------------------------------------------------- |
-| `0.10°` | `montage_m17_0p10_r1` | `montage_m17_0p10_r1,montage_m17_0p10_r2,montage_m17_0p10_r3` |
-| `0.25°` | `montage_m17_0p25_r1` | `montage_m17_0p25_r1,montage_m17_0p25_r2,montage_m17_0p25_r3` |
-| `0.50°` | `montage_m17_0p50_r1` | `montage_m17_0p50_r1,montage_m17_0p50_r2,montage_m17_0p50_r3` |
+### 7. 查看进度
 
-
-该 trace 包含 `header → raw_table → projection → projected_table → overlaps → difference_fitting → background_model → background_correction → corrected_table → coadd → render`。每个 stage 都写入 `execution_units.jsonl`，并进入统一的 lineage、metrics、figures 和 Index。
-
-#### 4. 查看过程
+查看日志：
 
 ```zsh
-ssh "$SSH_USER@$CLIENT_NODE" '
-  LOG="$(readlink -f "/mnt/lustrefs/$USER/montage/latest_trace_log")"
-  tail -f "$LOG"
-'
+ssh "$SSH_USER@$WORKFLOW_NODE" "tail -f \"\$HOME/$REMOTE_LOG\""
 ```
 
-查看 tracer、workflow 和后处理进程：
+`Ctrl-C` 只停止查看。检查 workflow、tracer 和后处理：
 
 ```zsh
-ssh "$SSH_USER@$CLIENT_NODE" \
-  "pgrep -af 'trace_script_bcc_montage|run_montage|phase1_metrics|visualize' || true"
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "pgrep -af 'trace_script_bcc_|bcc_tracer|phase1_metrics|viz.trace|run_1000genome|run_montage' || true"
 ```
 
-日志最后出现 `Results: /mnt/lustrefs/.../classic_montage_smoke_...` 才表示工具图和 Index 已生成。只出现 `=== Montage post-processing ===` 表示后处理仍在运行。
-
-#### 5. 拉回结果并打开 Index
+日志出现 `Results:`、`Results in:` 或 `All done. Results in:`，且进程列表为空，表示完成。进程为空但没有完成标记，表示失败：
 
 ```zsh
-REMOTE_RUN=$(ssh "$SSH_USER@$CLIENT_NODE" \
-  'ls -1dt /mnt/lustrefs/$USER/pi-ebpf-tracing-handoff/results/classic_montage_*/ 2>/dev/null | head -1')
-if [[ -z "$REMOTE_RUN" ]]; then
-  echo "ERROR: no formal Montage trace found" >&2
-else
-  LOCAL="results/$(basename "$REMOTE_RUN")"
-  mkdir -p "$LOCAL"
-  rsync -az --progress --checksum --partial \
-    --exclude 'work/' --exclude 'bcc.out' \
-    "$SSH_USER@$CLIENT_NODE:$REMOTE_RUN" "$LOCAL/"
-
-  failed=0
-  cells=0
-  for cell in "$LOCAL"/*; do
-    [[ -f "$cell/manifest.json" ]] || continue
-    ((cells += 1))
-    for required in \
-      ebpf_events.log parsed.json manifest.json execution_units.jsonl \
-      phase1_metrics.json parallelism_summary.json trace_quality.json \
-      lineage/artifacts.csv lineage/execution_unit_io.csv \
-      visualizations/file_access_volume.png visualizations/rw_asymmetry.png \
-      visualizations/request_size_rw_cdf.png \
-      visualizations/byte_normalized_summary.png visualizations/index.html; do
-      if [[ ! -s "$cell/$required" ]]; then
-        echo "ERROR: missing or empty: $cell/$required" >&2
-        failed=1
-      fi
-    done
-    if [[ ! -f "$cell/bcc.err" ]] || ! tail -1 "$cell/bcc.err" | grep -q 'lost_events=0'; then
-      echo "ERROR: lost-event check failed: $cell/bcc.err" >&2
-      failed=1
-    fi
-  done
-  (( cells > 0 )) || failed=1
-  if (( failed == 0 )); then
-    open "$LOCAL"/*/visualizations/index.html
-  else
-    echo "Formal Montage pull failed integrity checks; not opening incomplete output." >&2
-  fi
-fi
+ssh "$SSH_USER@$WORKFLOW_NODE" "tail -100 \"\$HOME/$REMOTE_LOG\""
 ```
 
-`mosaic.png` 不在上述拉取清单中。命令打开的是本项目生成的 `visualizations/index.html` 和 I/O characterization 图。
+完成后前往第 8 节。
+
+### 8. 拉回结果
+
+#### 8.1 GenoMAS 和 SciLink
+
+```zsh
+bash scripts/pull_agentic_run.sh "$REMOTE_LOG"
+```
+
+脚本读取日志中的精确结果目录，拉回到 `results/$RUN_NAME`，检查必需文件和 `lost_events=0`，再打开报告。
+
+#### 8.2 1000 Genomes 和 Montage
+
+```zsh
+LOCAL_RUN="results/$RUN_NAME"
+mkdir -p "$LOCAL_RUN"
+rsync -az --progress --checksum --partial \
+  --exclude 'work/' --exclude 'bcc.out' \
+  "$SSH_USER@$WORKFLOW_NODE:$REMOTE_RUN/" "$LOCAL_RUN/"
+```
+
+检查每个 cell：
+
+```zsh
+failed=0
+cells=0
+for cell in "$LOCAL_RUN"/*; do
+  [[ -f "$cell/manifest.json" ]] || continue
+  ((cells += 1))
+  [[ -s "$cell/parsed.json" ]] || failed=1
+  [[ -s "$cell/phase1_metrics.json" ]] || failed=1
+  [[ -s "$cell/visualizations/index.html" ]] || failed=1
+  tail -1 "$cell/bcc.err" | grep -q 'lost_events=0' || failed=1
+done
+(( cells > 0 )) || failed=1
+(( failed == 0 )) && open "$LOCAL_RUN"/*/visualizations/index.html
+```
+
+不要按目录时间猜测结果。若当前 terminal 已关闭，先从运行日志找回精确路径：
+
+```zsh
+REMOTE_LOG="logs/<run-name>.log"
+REMOTE_RUN=$(ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "sed -n -E 's/^(Output dir: |Results: |Results in: |All done\\. Results in: )//p' \"\$HOME/$REMOTE_LOG\" | tail -1")
+RUN_NAME=$(basename "$REMOTE_RUN")
+```
 
 ---
-
-
 
 ## 第二部分：研究概述
 

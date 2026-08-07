@@ -11,6 +11,49 @@ default_lustre_results_root() {
     printf '%s/%s/pi-ebpf-tracing-handoff/results' "$mount_root" "$owner"
 }
 
+# The one place a run directory is named: <Workflow>_<what ran>_<timestamp>.
+# Every trace script calls this instead of pasting its own prefix, which is how
+# GenoMAS runs ended up stamped "phase4" years after that phase ended.
+#
+#   run_dir_name GenoMAS A_c2_w1        -> GenoMAS_A_c2_w1_20260806_101500
+#   run_dir_name GenoMAS A_c2_w1 A_c4_w2 -> GenoMAS_2tasks_20260806_101500
+#   RUN_LABEL=fanout run_dir_name GenoMAS ... -> GenoMAS_fanout_20260806_101500
+#
+# RUN_LABEL is for a study whose name says more than its task list does.
+run_dir_name() {
+    local workflow="$1"; shift
+    local stamp="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
+    if [ -n "${RUN_LABEL:-}" ]; then
+        printf '%s_%s_%s' "$workflow" "$RUN_LABEL" "$stamp"
+    elif [ "$#" -eq 1 ]; then
+        printf '%s_%s_%s' "$workflow" "$1" "$stamp"
+    elif [ "$#" -eq 0 ]; then
+        printf '%s_%s' "$workflow" "$stamp"
+    else
+        printf '%s_%dtasks_%s' "$workflow" "$#" "$stamp"
+    fi
+}
+
+# Task names the run will actually execute: the first field of every WORKLOADS
+# entry, kept only if RUN_WORKLOADS selects it. Same filter the run loop uses,
+# so the directory name cannot disagree with what is inside it.
+selected_task_names() {
+    local entry name
+    # fanout builds its cells from axis variables and defines no WORKLOADS; it
+    # names its runs with RUN_LABEL instead
+    [ "${#WORKLOADS[@]}" -gt 0 ] 2>/dev/null || return 0
+    for entry in "${WORKLOADS[@]}"; do
+        name="${entry%%|*}"
+        if [ -n "${RUN_WORKLOADS:-}" ]; then
+            case " ${RUN_WORKLOADS//,/ } " in
+                *" $name "*) ;;
+                *) continue ;;
+            esac
+        fi
+        printf '%s\n' "$name"
+    done
+}
+
 require_lustre_base_out() {
     local path="$1"
     local mount_root="${MOUNT_PATH:-/mnt/lustrefs}"

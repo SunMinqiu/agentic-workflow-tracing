@@ -37,7 +37,7 @@ fi
 
 mkdir -p "$WORK_DIR"
 mkdir -p "$DATA_DIR" || { echo "Error: cannot create DATA_DIR=$DATA_DIR" >&2; exit 1; }
-BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/chemgraph_$(date +%Y%m%d_%H%M%S)}"
+BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/$(run_dir_name ChemGraph $(selected_task_names))}"
 require_lustre_base_out "$BASE_OUT"
 BASE_OUT="$(cd "$BASE_OUT" && pwd)"
 DATA_DIR="$(cd "$DATA_DIR" && pwd)"

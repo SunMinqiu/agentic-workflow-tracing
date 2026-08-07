@@ -24,7 +24,6 @@ from agent_io_tracing.analysis.kvcache.latency import (
     plot_latency_breakdown,
     plot_output_vs_latency,
     plot_ttft_vs_fresh_input,
-    plot_ttft_vs_prefix_age,
 )
 from agent_io_tracing.analysis.kvcache.report import build_report
 
@@ -133,16 +132,14 @@ def test_stream_timing_plots_write_pngs(tmp_path: Path) -> None:
                 "last_token_ms": 2400.0 + i * 3000,
                 "end_ms": 2500.0 + i * 3000,
                 "newest_possible_source_age_s": float(i + 1),
-                "capture_rate": cache_read / 1024,
             }
             for i, cache_read in enumerate([0, 256, 768, 1024])
         ]
     }
-    outputs = [tmp_path / f"stream-{i}.png" for i in range(3)]
+    outputs = [tmp_path / f"stream-{i}.png" for i in range(2)]
 
     plot_ttft_vs_fresh_input(summary, outputs[0])
     plot_latency_breakdown(summary, outputs[1])
-    plot_ttft_vs_prefix_age(summary, outputs[2])
 
     assert all(path.is_file() and path.stat().st_size > 0 for path in outputs)
 

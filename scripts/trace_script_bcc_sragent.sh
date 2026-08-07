@@ -92,7 +92,7 @@ if [ "${#WORKLOADS[@]}" -eq 0 ]; then
     exit 1
 fi
 
-BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/$(date +%Y%m%d_%H%M%S)}"
+BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/$(run_dir_name SRAgent $(selected_task_names))}"
 require_lustre_base_out "$BASE_OUT"
 BASE_OUT="$(cd "$BASE_OUT" && pwd)"
 

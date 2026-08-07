@@ -3,14 +3,11 @@ from pathlib import Path
 
 from agent_io_tracing.analysis.kvcache.segments import (
     SEGMENTS_CSV,
-    SEGMENTS_MD,
     analyze_cell_segments,
     _content_breakdown,
     attach_realized,
-    classify_content,
     build_radix_trie,
     collect_segments,
-    write_markdown,
     write_tables,
 )
 
@@ -77,42 +74,74 @@ def test_divergent_prompts_share_nothing():
     assert all(s["reuse_tokens"] == 0 for s in segments)
 
 
-def test_content_tag_takes_the_most_volatile_thing_present():
-    """A block of fixed boilerplate is unrepeatable once an output lands in it."""
-    assert classify_content("just some standing instructions")[0] == "system prompt"
-    assert classify_content("STEP 3 [Chosen action unit]: x")[0] == "history dialog"
-    assert classify_content("STEP 3\n[Code]:\nimport pandas")[0] == "code"
-    assert classify_content("STEP 3\n[Code]: x\n[Output]:\n3.14159")[0] == "raw data"
+def test_sample_elides_the_middle_of_long_text():
+    from agent_io_tracing.analysis.kvcache.segments import _sample
+    text = "A" * 2000 + "B" * 2000
+    kept = _sample(text)
+    assert kept.startswith("AAAA") and kept.endswith("BBBB")
+    assert len(kept) < len(text)
+    assert _sample("short") == "short"
 
 
-def test_raw_data_share_counts_measurements_not_step_numbers():
-    _, plain = classify_content("STEP 3 of 12, attempt 2, year 2026")
-    assert plain == 0.0
-    _, dense = classify_content("[1.500529793, 7.306074269] GSM3721554 '1552263_at'")
-    assert dense > 0.5
+def _seg(tag_tokens, realized=None):
+    return {
+        "hit_by_tag": dict(tag_tokens),
+        "hit_tag": max(tag_tokens, key=lambda t: tag_tokens[t]) if tag_tokens else None,
+        "realized_tokens": realized if realized is not None else sum(tag_tokens.values()),
+    }
 
 
-def test_content_breakdown_shares_and_leverage():
-    segments = [
-        {"content_tag": "system prompt", "tokens": 10, "realized_tokens": 90,
-         "raw_data_share": 0.0},
-        {"content_tag": "raw data", "tokens": 90, "realized_tokens": 10,
-         "raw_data_share": 0.9},
-    ]
-    cb = _content_breakdown(segments)
-    boiler = cb["by_tag"]["system prompt"]
-    output = cb["by_tag"]["raw data"]
-    assert boiler["cache_share"] == 0.1 and boiler["realized_share"] == 0.9
-    assert boiler["leverage"] == 9.0, "cheap content returning most hits"
-    assert output["leverage"] == 0.11
+TAGS = ["instructions", "code", "raw data", "history dialog", "unlabeled"]
 
 
-def test_unmatched_share_flags_a_corpus_the_markers_do_not_fit():
-    segments = [
-        {"content_tag": "system prompt", "tokens": 100, "realized_tokens": 0,
-         "raw_data_share": 0.0},
-    ]
-    assert _content_breakdown(segments)["unmatched_share"] == 1.0
+def test_token_shares_add_up_to_one_whole():
+    """Tokens are split across the sections a hit covers, never double-counted."""
+    segments = [_seg({"instructions": 90}), _seg({"raw data": 10})]
+    cb = _content_breakdown(segments, TAGS)
+    assert cb["by_tag"]["instructions"]["realized_share"] == 0.9
+    assert cb["by_tag"]["raw data"]["realized_share"] == 0.1
+    assert sum(cb["by_tag"][t]["realized_tokens"] for t in TAGS) == 100
+
+
+def test_one_hit_spanning_two_types_pays_into_both():
+    segments = [_seg({"code": 60, "raw data": 40})]
+    cb = _content_breakdown(segments, TAGS)
+    assert cb["by_tag"]["code"]["realized_tokens"] == 60
+    assert cb["by_tag"]["raw data"]["realized_tokens"] == 40
+    # one segment, counted under both types: segment shares exceed 100%
+    assert cb["n_served_segments"] == 1
+    assert cb["by_tag"]["code"]["segment_share"] == 1.0
+    assert cb["by_tag"]["raw data"]["segment_share"] == 1.0
+
+
+def test_every_type_with_tokens_gets_its_own_example():
+    """A type in the table and nothing under it in the details is a bug."""
+    from agent_io_tracing.analysis.kvcache.segments import examples_by_tag
+    segments = [{
+        "hit_by_tag": {"code": 60, "raw data": 40},
+        "hit_samples": {
+            "code": {"section": "Code", "chars": 9, "sample": "import os"},
+            "raw data": {"section": "Output", "chars": 4, "sample": "3.14"},
+        },
+        "tokens": 100, "first_call": 0, "realized_hits": 1,
+        "realized_tokens": 100, "n_calls": 2,
+    }]
+    ex = examples_by_tag(segments, TAGS)
+    assert ex["code"][0]["hit_sample"] == "import os"
+    assert ex["raw data"][0]["hit_sample"] == "3.14", "the label decides the text"
+    assert ex["code"][0]["tag_tokens"] == 60
+    assert ex["instructions"] == []
+
+
+def test_never_served_segments_stay_out_of_the_segment_count():
+    cb = _content_breakdown([_seg({}, realized=0), _seg({"code": 5})], TAGS)
+    assert cb["n_served_segments"] == 1
+
+
+def test_unlabeled_share_reports_what_the_grammar_missed():
+    cb = _content_breakdown([_seg({"unlabeled": 40, "code": 60})], TAGS)
+    assert cb["unlabeled_share"] == 0.4
+
 
 
 def _calls(cache_reads, lengths):
@@ -140,7 +169,15 @@ def test_realized_prefix_ending_mid_segment_is_counted_partially():
     out = attach_realized(segments, _calls([0, 3], [8, 8]), sequences)
     assert segments[0]["realized_tokens"] == 3
     assert segments[0]["gap_tokens"] == 5
-    assert out["capture_rate"] == 0.375
+    assert out["gap_tokens"] == 5
+
+
+def test_hit_tokens_is_the_longest_prefix_any_call_was_served():
+    sequences = [[1, 2, 3, 4, 5, 6, 7, 8]] * 3
+    segments = _segments(sequences)
+    attach_realized(segments, _calls([0, 3, 6], [8, 8, 8]), sequences)
+    assert segments[0]["hit_tokens"] == 6, "the deepest hit, not the sum"
+    assert segments[0]["realized_tokens"] == 9, "but the total still sums"
 
 
 def test_creating_call_is_never_credited_as_a_hit():
@@ -151,12 +188,11 @@ def test_creating_call_is_never_credited_as_a_hit():
     assert segments[0]["realized_hits"] == 0
 
 
-def test_zero_cache_reads_give_zero_capture():
+def test_zero_cache_reads_leave_the_whole_reuse_as_gap():
     sequences = [[1, 2, 3], [1, 2, 3]]
     segments = _segments(sequences)
     out = attach_realized(segments, _calls([0, 0], [3, 3]), sequences)
     assert out["realized_reuse_tokens"] == 0
-    assert out["capture_rate"] == 0.0
     assert out["gap_tokens"] == 3
 
 
@@ -210,10 +246,17 @@ def test_analyze_cell_segments_end_to_end(tmp_path):
     )
     assert summary["resend_ratio"] > 1.0
 
+    # the whole point of splitting by section: the parts add back up
+    for s in summary["segments"]:
+        assert sum(s["hit_by_tag"].values()) == s["realized_tokens"]
+    cb = summary["content_breakdown"]
+    assert (
+        sum(cb["by_tag"][t]["realized_tokens"] for t in cb["tags"])
+        == cb["realized_tokens_total"]
+    )
+
     write_tables(summary, cell)
-    write_markdown(summary, cell)
     assert (cell / SEGMENTS_CSV).read_text(encoding="utf-8").count("\n") > 1
-    assert "KV cache contents" in (cell / SEGMENTS_MD).read_text(encoding="utf-8")
 
 
 def test_empty_cell_is_handled(tmp_path):

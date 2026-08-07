@@ -34,20 +34,20 @@ from agent_io_tracing.analysis.kvcache.logical import (
     CELL_JSON as LOGICAL_JSON, CACHE_WARMING_PNG,
     PREFIX_LINEAGE_PNG, PREFIX_DUMP,
 )
+from agent_io_tracing.analysis.kvcache.summary import (
+    PAGE_CSS, token_table, time_table,
+)
+from agent_io_tracing.analysis.results_index import write_results_index
 from agent_io_tracing.analysis.kvcache.segments import (
-    CONTENT_TAGS,
     analyze_cell_segments,
-    write_markdown as write_segments_markdown,
     write_tables as write_segments_tables,
 )
 from agent_io_tracing.analysis.kvcache.latency import (
     analyze_latency, plot_inference_latency_timeline,
     plot_output_vs_latency, has_stream_timing,
     plot_ttft_vs_fresh_input, plot_latency_breakdown,
-    plot_ttft_vs_prefix_age,
     LATENCY_TIMELINE_PNG, OUTPUT_LATENCY_PNG,
     TTFT_FRESH_INPUT_PNG, LATENCY_BREAKDOWN_PNG,
-    TTFT_PREFIX_AGE_PNG,
 )
 import json
 
@@ -61,15 +61,6 @@ def _fmt(n: Any) -> str:
 
 def _pct(x: Any) -> str:
     return f"{x:.0%}" if isinstance(x, (int, float)) else "n/a"
-
-
-def _dur(seconds: Any) -> str:
-    """Seconds as m:ss above a minute, plain seconds below it."""
-    if not isinstance(seconds, (int, float)):
-        return "n/a"
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    return f"{int(seconds) // 60}m{int(seconds) % 60:02d}s"
 
 
 def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
@@ -107,7 +98,6 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
         if has_stream_timing(lg):
             plot_ttft_vs_fresh_input(lg, viz / TTFT_FRESH_INPUT_PNG)
             plot_latency_breakdown(lg, viz / LATENCY_BREAKDOWN_PNG)
-            plot_ttft_vs_prefix_age(lg, viz / TTFT_PREFIX_AGE_PNG)
         row.update({
             "logical_frac": lg["logical_frac"],
             "logical_aligned_frac": lg["logical_aligned_frac"],
@@ -132,17 +122,14 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
     seg = analyze_cell_segments(cell)
     if seg["n_calls"]:
         write_segments_tables(seg, cell)
-        write_segments_markdown(seg, cell)
         row["segments"] = {
             "n_segments": seg["n_segments"],
             "cache_size_tokens": seg["cache_size_tokens"],
             "prompt_tokens_total": seg["prompt_tokens_total"],
             "resend_ratio": seg["resend_ratio"],
             "content_breakdown": seg["content_breakdown"],
+            "content_examples": seg["content_examples"],
             "realized_vs_logical": seg["realized_vs_logical"],
-            "top_hits": sorted(
-                seg["segments"], key=lambda s: -s["realized_tokens"]
-            )[:8],
         }
     row["has_segments"] = bool(seg["n_calls"])
     row["has_prefix_dump"] = (cell / PREFIX_DUMP).is_file()
@@ -150,47 +137,64 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
     return row
 
 
+def _content_examples(examples: dict[str, list], tags: list[str]) -> list[str]:
+    """One collapsible block per content type, with real served text inside."""
+    L: list[str] = []
+    for tag in tags:
+        rows = examples.get(tag) or []
+        if not rows:
+            L.append(
+                f"<p><i>{html.escape(tag)}: nothing of this type was ever served "
+                "from cache.</i></p>"
+            )
+            continue
+        L.append(
+            f"<details><summary>{html.escape(tag)} — top {len(rows)} by tokens served"
+            "</summary>"
+        )
+        for rank, s in enumerate(rows, 1):
+            section = html.escape(s.get("section") or "?")
+            L.append(
+                f"<p><b>{rank}. {section} — served {_fmt(s['tag_tokens'])} "
+                f"{tag} tokens</b> · to {s['realized_hits']} call(s) · first sent "
+                f"by call {s['first_call']} · in {s['n_calls']} calls' prompts</p>"
+            )
+            L.append(f"<pre>{html.escape(s['hit_sample'])}</pre>")
+        L.append("</details>")
+    L.append("")
+    return L
+
+
 def _segment_section(r: dict[str, Any]) -> list[str]:
-    """What the never-evicting cache would hold, and what the real one served."""
+    """What the real cache served, split by what the text is."""
     seg = r["segments"]
     L: list[str] = []
     L.append("### Cache contents")
     L.append("")
     cb = seg["content_breakdown"]
-    L.append("| content | segments | cache space | real hits | hits ÷ space |")
+    tags = cb["tags"]
+    served = cb["n_served_segments"]
+    L.append("| content | tokens served | share of tokens | hit segments | share of segments |")
     L.append("| --- | ---: | ---: | ---: | ---: |")
-    for tag in CONTENT_TAGS:
+    # every type is listed, a zero included: "never served" is an answer
+    ranked = sorted(tags, key=lambda t: -cb["by_tag"][t]["realized_tokens"])
+    for tag in ranked:
         e = cb["by_tag"][tag]
-        if not e["n_segments"]:
-            continue
         L.append(
-            f"| {tag} | {e['n_segments']} | {_fmt(e['cache_size_tokens'])} "
-            f"({e['cache_share']:.1%}) | {_fmt(e['realized_tokens'])} "
-            f"({e['realized_share']:.1%}) | {e['leverage']} |"
+            f"| {tag} | {_fmt(e['realized_tokens'])} | {e['realized_share']:.1%} | "
+            f"{e['n_segments']} | {e['segment_share']:.1%} |"
         )
+    L.append(
+        f"| **all** | **{_fmt(cb['realized_tokens_total'])}** | **100.0%** | "
+        f"**{served}** | — |"
+    )
     L.append("")
-    if cb["unmatched_share"] > 0.95:
-        L.append(
-            "**Caution:** no content markers matched; the table above is meaningless "
-            "on this corpus."
-        )
-        L.append("")
-
-    hits = [s for s in seg["top_hits"] if s["realized_tokens"] > 0]
-    if hits:
-        L.append("**What the real cache served:**")
-        L.append("")
-        L.append("| seg | tokens | content | starts at | hits | tokens served | excerpt |")
-        L.append("| --- | ---: | --- | ---: | ---: | ---: | --- |")
-        for s in hits:
-            L.append(
-                f"| {s['segment']} | {_fmt(s['tokens'])} | {s['content_tag']} | "
-                f"{_fmt(s['start_offset'])} | {s['realized_hits']} | "
-                f"{_fmt(s['realized_tokens'])} | "
-                f"`{s['excerpt'][:150].replace('|', chr(92) + '|')}` |"
-            )
-        L.append("")
-
+    L.append(
+        f"Tokens split each hit across the sections it covers, so they add to 100%. "
+        f"Segments count a hit under every type it touched, so they do not."
+    )
+    L.append("")
+    L.extend(_content_examples(seg.get("content_examples") or {}, tags))
     return L
 
 
@@ -223,55 +227,17 @@ def build_report(
     L.append(f"_Generated {_dt.date.today().isoformat()} · {len(rows)} cell(s)._")
     L.append("")
 
-    def shared_cells(r: dict[str, Any]) -> str:
-        runtime = r.get("runtime") or {}
-        return (
-            f"| {r['cell']} | {', '.join(runtime.get('vendors') or ['unknown'])} | "
-            f"{', '.join(runtime.get('models') or ['unknown'])} | "
-            f"{r.get('n_calls', '?')} |"
-        )
-
     L.append("## Summary — tokens")
     L.append("")
-    L.append(
-        "| cell | vendor | model | calls | total_input | median_input | total_output "
-        "| cache_size | resend× | realized% | logical% | gap% | captured% |"
-    )
-    L.append("| --- | --- | --- |" + " ---: |" * 10)
-    for r in rows:
-        seg_row = r.get("segments") or {}
-        L.append(
-            shared_cells(r)
-            + f" {_fmt(r.get('total_input', 0))} |"
-            f" {_fmt(r.get('median_input', 0))} |"
-            f" {_fmt(r.get('total_output', 0))} |"
-            f" {_fmt(seg_row['cache_size_tokens']) if seg_row else 'n/a'} |"
-            f" {f'{seg_row['resend_ratio']}x' if seg_row.get('resend_ratio') else 'n/a'} |"
-            f" {_pct(r.get('realized_frac'))} | {_pct(r.get('logical_frac'))} |"
-            f" {_pct(r.get('gap_frac'))} |"
-            f" {_pct((seg_row.get('realized_vs_logical') or {}).get('capture_rate'))} |"
-        )
+    L.extend(token_table(rows))
     L.append("")
 
     L.append("## Summary — time")
     L.append("")
-    L.append("| cell | vendor | model | calls | Σinfer | span | median TTFT | median TPOT |")
-    L.append("| --- | --- | --- |" + " ---: |" * 5)
-    for r in rows:
-        latency = r.get("latency") or {}
-        overall = latency.get("overall") or {}
-        stream = latency.get("stream_timing") or {}
-        tpot = stream.get("median_tpot_s")
-        L.append(
-            shared_cells(r)
-            + f" {_dur(overall.get('total_duration_s'))} |"
-            f" {_dur(latency.get('wall_clock_span_s'))} |"
-            f" {_dur(stream.get('median_ttft_s'))} |"
-            + (f" {tpot * 1000:.1f}ms/token |" if isinstance(tpot, (int, float)) else " n/a |")
-        )
+    L.extend(time_table(rows))
     L.append("")
 
-    L.append("## Per cell")
+    L.append("## Per task")
     L.append("")
     for cell_index, r in enumerate(rows):
         if cell_index:
@@ -310,14 +276,13 @@ def build_report(
                 "the cache."
             )
             L.append("")
-            L.append("| age of newest possible source | calls | logical reusable tokens | realized cacheRead | token capture |")
-            L.append("| --- | ---: | ---: | ---: | ---: |")
+            L.append("| age of newest possible source | calls | logical reusable tokens | realized cacheRead |")
+            L.append("| --- | ---: | ---: | ---: |")
             for age_bin in temporal.get("age_bins", []):
                 L.append(
                     f"| {age_bin['age']} | {age_bin['n']} | "
                     f"{_fmt(age_bin['logical_reusable_tokens'])} | "
                     f"{_fmt(age_bin['realized_cache_read_tokens'])} | "
-                    f"{_pct(age_bin['token_capture_rate'])} |"
                 )
             L.append("")
             if r.get("has_prefix_dump"):
@@ -357,7 +322,6 @@ def build_report(
                 for alt, filename in [
                     ("TTFT and TPOT vs fresh input", TTFT_FRESH_INPUT_PNG),
                     ("latency breakdown", LATENCY_BREAKDOWN_PNG),
-                    ("TTFT vs prefix age", TTFT_PREFIX_AGE_PNG),
                 ]:
                     L.append(embedded_image(alt, r["cell"], filename))
                     L.append("")
@@ -377,13 +341,7 @@ def build_report(
         + html.escape(f"KV-Cache Report — {run_dir.name}")
         + """</title>
 <style>
-body { color: #202124; font: 16px/1.55 system-ui, sans-serif; margin: 2rem auto; max-width: 1200px; padding: 0 1.25rem; }
-table { border-collapse: collapse; display: block; overflow-x: auto; }
-th, td { border: 1px solid #c7c7c7; padding: 0.4rem 0.65rem; text-align: right; }
-th:first-child, td:first-child { text-align: left; }
-img { display: block; height: auto; margin: 1.25rem auto 2rem; max-width: 100%; }
-code { background: #f1f3f4; padding: 0.1rem 0.25rem; }
-</style>
+""" + PAGE_CSS + """</style>
 </head>
 <body>
 """
@@ -418,19 +376,15 @@ def main() -> int:
         print(f"  {cell.name}: realized={_pct(row.get('realized_frac'))} "
               f"logical={_pct(row.get('logical_frac'))} gap={_pct(row.get('gap_frac'))}")
 
+    # one report per task: a run holding three tasks is three experiments, and
+    # the results index is what puts them side by side
     for run_dir, rows in by_run.items():
-        out = build_report(run_dir, rows, results_dir)
-        print(f"report → {out}")
-        print(f"browser report → {out.with_suffix('.html')}")
         for row in rows:
-            cell_dir = run_dir / row["cell"]
-            cell_out = build_report(
-                cell_dir,
-                [row],
-                results_dir,
-                cells_root=run_dir,
+            out = build_report(
+                run_dir / row["cell"], [row], results_dir, cells_root=run_dir
             )
-            print(f"cell report → {cell_out}")
+            print(f"report → {out.with_suffix('.html')}")
+    write_results_index(results_dir)
     return 0
 
 

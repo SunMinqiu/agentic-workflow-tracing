@@ -17,12 +17,13 @@ The per-segment facts we care about:
   first_call    the call that created the segment (its text entered the cache here)
   n_calls       how many calls' prompts traverse it
   reuse_tokens  tokens * (n_calls - 1), i.e. tokens this segment served from cache
-  content_tag   what the text in the segment is: system prompt, history dialog,
-                code, or raw data
+  hit_by_tag    the tokens the real cache served out of it, split by what the
+                text is — see sections.py for how a prompt is cut into
+                instructions, code, raw data and history
 
-Every segment carries a content_tag, so the cache can be costed by what is in it
-rather than by which prompt produced it. The headline that falls out is the
-cache space each kind of content occupies against the hits it actually returns.
+Splitting per segment rather than labelling each segment once is what makes the
+headline answerable: of everything the cache actually served, how much of it was
+each kind of text.
 
     PYTHONPATH=src python3 -m agent_io_tracing.analysis.kvcache.segments <cell_dir>
 """
@@ -41,9 +42,12 @@ import tiktoken
 from agent_io_tracing.analysis.kvcache.logical import (
     _encoding_for, _serialize, load_joined_calls,
 )
+from agent_io_tracing.analysis.kvcache.sections import (
+    UNLABELED, describe, detect_grammar, overlap_by_tag, section_token_ranges,
+    widest_span,
+)
 
 SEGMENTS_CSV = "kvcache_segments.csv"
-SEGMENTS_MD = "kvcache_segments.md"
 SEGMENTS_JSON = "kvcache_segments.json"
 
 # --------------------------------------------------------------------------
@@ -116,76 +120,82 @@ def build_radix_trie(token_sequences: list[list[int]]) -> _Node:
 # what the text in a segment actually is
 # --------------------------------------------------------------------------
 
-# The four kinds of text a prompt is made of, ordered most-volatile first. A
-# segment takes the tag of the most volatile thing it contains, because that is
-# what decides whether it can ever be reused: one execution output landing in an
-# otherwise fixed block makes the whole block unrepeatable. So "raw data" means
-# "a block containing execution output", not "pure numbers", and "system prompt"
-# means the fixed preamble — system message, task guidelines, tool and
-# environment docs, response-format instructions — with nothing volatile in it.
+# Two numbers per content type, with two different denominators:
 #
-# The markers are GenoMAS prompt conventions. On a corpus that does not use them
-# everything lands in "boilerplate", which is why the summary also reports the
-# share that matched no marker at all — if that is ~100%, this cut says nothing.
-CONTENT_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("raw data", re.compile(r"\[Output\]:|Execution Output")),
-    ("code", re.compile(r"\[Code\]:|```python")),
-    ("history dialog", re.compile(r"STEP \d|Task History")),
-]
-DEFAULT_CONTENT_TAG = "system prompt"
-CONTENT_TAGS = [name for name, _ in CONTENT_PATTERNS] + [DEFAULT_CONTENT_TAG]
-
-# Literal measurement values: floats with real precision, GEO sample ids, Affy
-# probe ids. Deliberately narrow — a step number or a year must not count.
-RAW_DATA_TOKENS = re.compile(
-    r"-?\d+\.\d{3,}|GSM\d{5,}|'\d+_(?:at|s_at|x_at|a_at)'"
-)
-
-
-def classify_content(text: str) -> tuple[str, float]:
-    """Return the segment's most volatile content type and its raw-data share."""
-    tag = DEFAULT_CONTENT_TAG
-    for name, pattern in CONTENT_PATTERNS:
-        if pattern.search(text):
-            tag = name
-            break
-    matched = sum(len(m.group()) for m in RAW_DATA_TOKENS.finditer(text))
-    return tag, round(matched / len(text), 4) if text else 0.0
-
-
-def _content_breakdown(segments: list[dict[str, Any]]) -> dict[str, Any]:
-    """Resident cost against realized benefit, per content type."""
-    cache_total = sum(s["tokens"] for s in segments) or 1
-    realized_total = sum(s["realized_tokens"] for s in segments) or 1
+#   tokens served   an exact split of the hit tokens. A hit crossing from one
+#                   section into the next gives tokens to both, so these add
+#                   back up to the total.
+#   hit segments    how many hit segments contained any of this type. One
+#                   segment spanning code and output counts under both, so
+#                   these deliberately sum past the number of segments.
+def _content_breakdown(
+    segments: list[dict[str, Any]], tags: list[str]
+) -> dict[str, Any]:
+    """What the real cache served, per content type."""
+    realized_total = sum(s["realized_tokens"] for s in segments)
+    served = [s for s in segments if s["realized_tokens"] > 0]
     by_tag = {}
-    for tag in CONTENT_TAGS:
-        group = [s for s in segments if s["content_tag"] == tag]
-        occupied = sum(s["tokens"] for s in group)
-        realized = sum(s["realized_tokens"] for s in group)
+    for tag in tags:
+        tokens = sum(s["hit_by_tag"].get(tag, 0) for s in segments)
+        n = sum(1 for s in served if s["hit_by_tag"].get(tag, 0) > 0)
         by_tag[tag] = {
-            "n_segments": len(group),
-            "cache_size_tokens": occupied,
-            "cache_share": round(occupied / cache_total, 4),
-            "realized_tokens": realized,
-            "realized_share": round(realized / realized_total, 4),
-            # >1 means this content pays back more than the space it occupies
-            "leverage": (
-                round((realized / realized_total) / (occupied / cache_total), 2)
-                if occupied else None
+            "realized_tokens": tokens,
+            "realized_share": (
+                round(tokens / realized_total, 4) if realized_total else 0.0
             ),
+            "n_segments": n,
+            "segment_share": round(n / len(served), 4) if served else 0.0,
         }
     return {
         "by_tag": by_tag,
-        "unmatched_share": by_tag[DEFAULT_CONTENT_TAG]["cache_share"],
+        "tags": tags,
+        "realized_tokens_total": realized_total,
+        "n_served_segments": len(served),
+        "unlabeled_share": by_tag.get(UNLABELED, {}).get("realized_share", 0.0),
     }
 
 
-def _excerpt(enc: tiktoken.Encoding, tokens: list[int], head: int = 160, tail: int = 90) -> str:
-    text = enc.decode(tokens) if tokens else ""
-    text = text.replace("\n", "\\n")
+def examples_by_tag(
+    segments: list[dict[str, Any]], tags: list[str], per_tag: int = 3
+) -> dict[str, list[dict[str, Any]]]:
+    """A few served segments per content type, biggest contribution first.
+
+    A segment that served two types appears under both, showing each type's own
+    text, so every example matches the label above it.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    for tag in tags:
+        group = sorted(
+            (s for s in segments if s["hit_by_tag"].get(tag, 0) > 0),
+            key=lambda s: -s["hit_by_tag"][tag],
+        )[:per_tag]
+        out[tag] = [
+            {
+                "tokens": s["tokens"],
+                "first_call": s["first_call"],
+                "realized_hits": s["realized_hits"],
+                "tag_tokens": s["hit_by_tag"][tag],
+                "n_calls": s["n_calls"],
+                "section": s["hit_samples"][tag]["section"],
+                "hit_chars": s["hit_samples"][tag]["chars"],
+                "hit_sample": s["hit_samples"][tag]["sample"],
+            }
+            for s in group
+        ]
+    return out
+
+
+def _sample(text: str, head: int = 420, tail: int = 220) -> str:
+    """Head and tail of the text, elided in between when it is long."""
     if len(text) <= head + tail + 20:
         return text
-    return f"{text[:head]} … {text[-tail:]}"
+    return f"{text[:head]}\n  …\n{text[-tail:]}"
+
+
+def one_line(text: str, limit: int = 150) -> str:
+    """The same text squeezed onto one row of a table."""
+    flat = text.replace("\n", "\\n")
+    return flat[:limit]
 
 
 def collect_segments(
@@ -202,10 +212,8 @@ def collect_segments(
             call_indices = sorted(child.calls)
             tokens = len(child.edge)
             text = enc.decode(child.edge) if child.edge else ""
-            content_tag, raw_data_share = classify_content(text)
             rows.append({
-                "content_tag": content_tag,
-                "raw_data_share": raw_data_share,
+                "n_chars": len(text),
                 "path": f"{path}/{key}",
                 "content_sha": hashlib.sha1(
                     json.dumps(child.edge, separators=(",", ":")).encode("ascii")
@@ -219,7 +227,7 @@ def collect_segments(
                 "roles": sorted({roles[i] for i in call_indices}),
                 "call_indices": call_indices,
                 "is_prompt_end": bool(child.terminal_calls),
-                "excerpt": _excerpt(enc, child.edge),
+                "sample": _sample(text),
             })
             walk(child, depth + tokens, f"{path}/{key}")
 
@@ -263,13 +271,21 @@ def attach_realized(
         reusers = s["call_indices"][1:]
         # a realized prefix can stop in the middle of a segment, so count the
         # covered part rather than requiring the whole segment to fit
+        # whole tokens per call, not a rounded sum over calls: the per-content
+        # split below is computed call by call and has to add back up to this
         covered = {
-            i: max(0.0, min(cut[i] - start, float(s["tokens"])))
+            i: int(max(0.0, min(cut[i] - start, float(s["tokens"]))))
             for i in reusers
         }
-        s["realized_calls"] = [i for i, v in covered.items() if v > 0]
-        s["realized_hits"] = len(s["realized_calls"])
-        s["realized_tokens"] = round(sum(covered.values()))
+        covered = {i: v for i, v in covered.items() if v > 0}
+        s["covered_tokens"] = covered
+        s["realized_calls"] = sorted(covered)
+        s["realized_hits"] = len(covered)
+        s["realized_tokens"] = sum(covered.values())
+        # a hit always starts at the segment's first token and stops wherever
+        # the reported prefix ran out, so the served text is a prefix of the
+        # segment — this is the longest one any call actually got
+        s["hit_tokens"] = max(covered.values(), default=0)
         s["gap_tokens"] = max(s["reuse_tokens"] - s["realized_tokens"], 0)
 
     logical_reuse = sum(s["reuse_tokens"] for s in segments)
@@ -282,7 +298,6 @@ def attach_realized(
         "logical_reuse_tokens": logical_reuse,
         "realized_reuse_tokens": realized,
         "gap_tokens": max(logical_reuse - realized, 0),
-        "capture_rate": round(realized / logical_reuse, 4) if logical_reuse else None,
         # every call's realized prefix is partitioned by the segments on its
         # path, so the attribution must add back up to the reported hits
         "reported_hit_tokens_rescaled": round(sum(cut)),
@@ -293,22 +308,67 @@ def attach_realized(
     }
 
 
+def attach_content(
+    segments: list[dict[str, Any]],
+    token_sequences: list[list[int]],
+    ranges_per_call: list[list[tuple[int, int, str, str]]],
+    enc: tiktoken.Encoding,
+) -> None:
+    """Split each segment's served tokens across the content types it covers.
+
+    A hit is a prefix of the segment, and the segment sits at a fixed offset in
+    every call that traverses it, so the sections of the call that created it
+    describe the text for all of them. Each call's own hit length is intersected
+    with those sections separately, which is why the parts add back up to
+    ``realized_tokens`` exactly rather than approximately.
+    """
+    for s in segments:
+        start = s["start_offset"]
+        deep_end = start + s["hit_tokens"]
+        near = [
+            r for r in ranges_per_call[s["first_call"]]
+            if r[0] < deep_end and r[1] > start
+        ]
+        totals: dict[str, int] = {}
+        for covered in s["covered_tokens"].values():
+            for tag, width in overlap_by_tag(near, start, start + covered).items():
+                totals[tag] = totals.get(tag, 0) + width
+        s["hit_by_tag"] = totals
+        # one sample per type, cut from that type's own longest section inside
+        # the hit: a segment that served code and output shows the code under
+        # code and the output under raw data, not one of them under both
+        s["hit_samples"] = {}
+        for tag in totals:
+            lo, hi, name = widest_span(near, start, deep_end, tag)
+            served = enc.decode(token_sequences[s["first_call"]][lo:hi])
+            s["hit_samples"][tag] = {
+                "section": name,
+                "chars": len(served),
+                "sample": _sample(served),
+            }
+        s["hit_tag"] = max(totals, key=lambda t: (totals[t], t)) if totals else None
+
+
 def analyze_cell_segments(cell: Path) -> dict[str, Any]:
     calls = load_joined_calls(cell)
     if not calls:
         return {"cell": cell.name, "n_calls": 0, "segments": []}
 
     enc = _encoding_for(calls[0]["model"])
-    token_sequences = [
-        enc.encode(_serialize(c["messages"]), disallowed_special=())
-        for c in calls
-    ]
+    texts = [_serialize(c["messages"]) for c in calls]
+    token_sequences = [enc.encode(t, disallowed_special=()) for t in texts]
     roles = [c["role"] for c in calls]
 
     root = build_radix_trie(token_sequences)
     segments = collect_segments(root, enc, roles)
 
     realized = attach_realized(segments, calls, token_sequences)
+    grammar = detect_grammar([c["messages"] for c in calls])
+    ranges = [
+        section_token_ranges(c["messages"], token_sequences[i], enc, grammar, texts[i])
+        for i, c in enumerate(calls)
+    ]
+    attach_content(segments, token_sequences, ranges, enc)
     resident = sum(s["tokens"] for s in segments)
     written_total = sum(len(t) for t in token_sequences)
 
@@ -320,7 +380,9 @@ def analyze_cell_segments(cell: Path) -> dict[str, Any]:
         "cache_size_tokens": resident,
         "resend_ratio": round(written_total / resident, 3) if resident else None,
         "n_segments": len(segments),
-        "content_breakdown": _content_breakdown(segments),
+        "sections": describe(grammar, ranges),
+        "content_breakdown": _content_breakdown(segments, list(grammar.tags)),
+        "content_examples": examples_by_tag(segments, list(grammar.tags)),
         "realized_vs_logical": realized,
         "vendors": sorted({str(c["vendor"]) for c in calls}),
         "models": sorted({str(c["model"]) for c in calls}),
@@ -339,20 +401,22 @@ def write_tables(summary: dict[str, Any], cell: Path) -> None:
         writer.writerow([
             "segment", "tokens", "start_offset", "first_call", "last_call",
             "n_calls", "reuse_tokens", "roles",
-            "content_tag", "raw_data_share", "is_prompt_end",
+            "hit_tag", "hit_by_tag", "is_prompt_end",
             "realized_hits", "realized_tokens", "gap_tokens",
-            "call_indices", "content_sha", "excerpt",
+            "call_indices", "content_sha", "sample",
         ])
         for s in segments:
             writer.writerow([
                 s["segment"], s["tokens"], s["start_offset"], s["first_call"],
                 s["last_call"], s["n_calls"], s["reuse_tokens"],
                 "|".join(s["roles"]),
-                s["content_tag"], s["raw_data_share"], int(s["is_prompt_end"]),
+                s["hit_tag"] or "",
+                " ".join(f"{k}={v}" for k, v in sorted(s["hit_by_tag"].items())),
+                int(s["is_prompt_end"]),
                 s["realized_hits"], s["realized_tokens"], s["gap_tokens"],
                 " ".join(str(i) for i in s["call_indices"]),
                 s["content_sha"],
-                s["excerpt"],
+                one_line(s["sample"], 400),
             ])
 
     (cell / SEGMENTS_JSON).write_text(
@@ -360,66 +424,9 @@ def write_tables(summary: dict[str, Any], cell: Path) -> None:
     )
 
 
-def _md_escape(text: str) -> str:
-    return text.replace("|", "\\|")
-
-
-def write_markdown(summary: dict[str, Any], cell: Path, top: int = 60) -> None:
-    cb = summary["content_breakdown"]
-
-    L: list[str] = [f"# KV cache contents — `{summary['cell']}`", ""]
-    L.append("| content | segments | cache space | real hits | hits ÷ space |")
-    L.append("|---|---:|---:|---:|---:|")
-    for tag in CONTENT_TAGS:
-        e = cb["by_tag"][tag]
-        if not e["n_segments"]:
-            continue
-        L.append(
-            f"| {tag} | {e['n_segments']} | {e['cache_size_tokens']:,} "
-            f"({e['cache_share']:.1%}) | {e['realized_tokens']:,} "
-            f"({e['realized_share']:.1%}) | {e['leverage']} |"
-        )
-    L.append("")
-    if cb["unmatched_share"] > 0.95:
-        L.append("**Caution:** no content markers matched; the table above is meaningless here.")
-        L.append("")
-
-    losses = [
-        s for s in sorted(summary["segments"], key=lambda s: -s["gap_tokens"])[:10]
-        if s["gap_tokens"] > 0
-    ]
-    if losses:
-        L.append("**Losing the most to the real cache**")
-        L.append("")
-        L.append("| seg | tokens | content | traversals | real hits | tokens lost | excerpt |")
-        L.append("|---|---:|---|---:|---:|---:|---|")
-        for s in losses:
-            L.append(
-                f"| {s['segment']} | {s['tokens']:,} | {s['content_tag']} | "
-                f"{s['n_calls'] - 1} | {s['realized_hits']} | {s['gap_tokens']:,} | "
-                f"`{_md_escape(s['excerpt'])}` |"
-            )
-        L.append("")
-
-    segments = sorted(summary["segments"], key=lambda s: -s["tokens"])[:top]
-    L.append(f"**Largest {len(segments)} segments**")
-    L.append("")
-    L.append("| seg | tokens | content | first call | calls | reuse tokens | excerpt |")
-    L.append("|---|---:|---|---:|---:|---:|---|")
-    for s in segments:
-        L.append(
-            f"| {s['segment']} | {s['tokens']:,} | {s['content_tag']} | "
-            f"{s['first_call']} | {s['n_calls']} | {s['reuse_tokens']:,} | "
-            f"`{_md_escape(s['excerpt'])}` |"
-        )
-    L.append("")
-    (cell / SEGMENTS_MD).write_text("\n".join(L), encoding="utf-8")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cells", nargs="+", type=Path, help="cell directories")
-    parser.add_argument("--top", type=int, default=60, help="segments listed in markdown")
     args = parser.parse_args()
 
     for cell in args.cells:
@@ -428,7 +435,6 @@ def main() -> None:
             print(f"{cell}: no joined calls")
             continue
         write_tables(summary, cell)
-        write_markdown(summary, cell, top=args.top)
         print(
             f"{cell}: {summary['n_calls']} calls, "
             f"{summary['prompt_tokens_total']:,} prompt tokens → "

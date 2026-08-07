@@ -88,7 +88,7 @@ if [ "$CLASSIC_VCF_RECORD_LIMIT" -gt 0 ] && [ "$ROWS_PER_CHROMOSOME" -gt "$CLASS
     exit 1
 fi
 
-BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/classic_1000genome_$(date +%Y%m%d_%H%M%S)}"
+BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/$(run_dir_name 1000Genome $(selected_task_names))}"
 require_lustre_base_out "$BASE_OUT"
 BASE_OUT="$(cd "$BASE_OUT" && pwd)"
 

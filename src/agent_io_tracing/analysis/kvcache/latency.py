@@ -15,7 +15,6 @@ LATENCY_TIMELINE_PNG = "kvcache_inference_latency_timeline.png"
 OUTPUT_LATENCY_PNG = "kvcache_output_vs_latency.png"
 TTFT_FRESH_INPUT_PNG = "kvcache_ttft_vs_fresh_input.png"
 LATENCY_BREAKDOWN_PNG = "kvcache_latency_breakdown.png"
-TTFT_PREFIX_AGE_PNG = "kvcache_ttft_vs_prefix_age.png"
 
 _PALETTE = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9"]
 
@@ -310,25 +309,3 @@ def plot_latency_breakdown(summary: dict[str, Any], out_png: Path) -> None:
     plt.close(fig)
 
 
-def plot_ttft_vs_prefix_age(summary: dict[str, Any], out_png: Path) -> None:
-    calls = [
-        call for call in summary["per_call"]
-        if call.get("first_token_ms") is not None
-        and call.get("newest_possible_source_age_s") is not None
-    ]
-    fig, ax = plt.subplots(figsize=(9, 5.2))
-    scatter = ax.scatter(
-        [max(call["newest_possible_source_age_s"], 0.01) for call in calls],
-        [(call["first_token_ms"] - call["start_ms"]) / 1000.0 for call in calls],
-        c=[call.get("capture_rate") or 0 for call in calls],
-        cmap="viridis", vmin=0, vmax=1, s=55,
-    )
-    ax.set_xscale("log")
-    ax.set_xlabel("age of newest possible source (s)")
-    ax.set_ylabel("TTFT (s)")
-    ax.set_title("TTFT vs. prefix interval")
-    fig.colorbar(scatter, ax=ax, label="capture rate")
-    ax.grid(True, which="both", alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=150, bbox_inches="tight")
-    plt.close(fig)

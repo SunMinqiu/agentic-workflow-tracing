@@ -38,7 +38,7 @@ source "$CONFIG_FILE"
 [ -n "$CALLER_BASE_OUT" ] && BASE_OUT="$CALLER_BASE_OUT"
 
 # --- Verify paths and interpreters -----------------------------------------
-BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/fanout_$(date +%Y%m%d_%H%M%S)}"
+BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/$(run_dir_name GenoMAS $(selected_task_names))}"
 require_lustre_base_out "$BASE_OUT"
 mkdir -p "$WORK_DIR" "$VIEW_ROOT"
 BASE_OUT="$(cd "$BASE_OUT" && pwd)"

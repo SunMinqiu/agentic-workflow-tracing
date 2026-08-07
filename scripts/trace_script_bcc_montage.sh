@@ -68,7 +68,7 @@ if ! [[ "$BCC_PERF_PAGES" =~ ^[1-9][0-9]*$ ]] || [ $((BCC_PERF_PAGES & (BCC_PERF
     exit 1
 fi
 
-BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/classic_montage_$(date +%Y%m%d_%H%M%S)}"
+BASE_OUT="${BASE_OUT:-$(default_lustre_results_root)/$(run_dir_name Montage $(selected_task_names))}"
 require_lustre_base_out "$BASE_OUT"
 BASE_OUT="$(cd "$BASE_OUT" && pwd)"
 

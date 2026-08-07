@@ -350,19 +350,15 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
 
 ### 6. 每次运行
 
-下面以 GenoMAS、vLLM 和 `A_c2_w1` 为例。运行其他组合时修改前三行：
+结果目录由 trace 脚本命名，格式为 `<Workflow>_<task>_<时间戳>`，例如 `GenoMAS_A_c2_w1_20260806_101500`。多个 task 的运行写作 `<Workflow>_<N>tasks_<时间戳>`。命名逻辑在 `scripts/lib_results.sh` 的 `run_dir_name`。
+
+每次运行前建立日志目录：
 
 ```zsh
-WORKFLOW="genomas"
-BACKEND="vllm"
-WORKLOAD_TAG="A_c2_w1"
-RUN_NAME="${WORKFLOW}__${BACKEND}__${WORKLOAD_TAG}__$(date +%Y%m%d_%H%M%S)"
-REMOTE_RUN="$MOUNT_PATH/$SSH_USER/pi-ebpf-tracing-handoff/results/$RUN_NAME"
-REMOTE_LOG="logs/$RUN_NAME.log"
 ssh "$SSH_USER@$WORKFLOW_NODE" 'mkdir -p "$HOME/logs"'
 ```
 
-运行名只使用字母、数字、点、下划线和连字符。
+下面每一节先设置 `RUN_WORKLOADS` 和 `REMOTE_LOG`，再启动。结果目录在运行开始后从日志读取，见第 7 节。
 
 #### 6.1 GenoMAS
 
@@ -371,22 +367,24 @@ ssh "$SSH_USER@$WORKFLOW_NODE" 'mkdir -p "$HOME/logs"'
 ```text
 A_c1_w1,A_c2_w1,A_c2_w2,A_c3_w2,A_c4_w2,A_c4_w4,A_c8_w4
 B_t1_w2,B_t2_w2,B_t4_w2
+full_c1_w2
 ```
 
 在 Mac 设置并启动：
 
 ```zsh
 RUN_WORKLOADS="A_c2_w1"
+REMOTE_LOG="logs/genomas_${RUN_WORKLOADS}_$(date +%Y%m%d_%H%M%S).log"
 ssh "$SSH_USER@$WORKFLOW_NODE" \
   "cd pi-ebpf-tracing-handoff &&
    sudo -n true &&
-   nohup sudo -n -E env BASE_OUT='$REMOTE_RUN' RUN_WORKLOADS='$RUN_WORKLOADS' \
+   nohup sudo -n -E env RUN_WORKLOADS='$RUN_WORKLOADS' \
      bash scripts/trace_script_bcc_genomas.sh \
      >\"\$HOME/$REMOTE_LOG\" 2>&1 </dev/null &
-   echo PID=\$! LOG=\$HOME/$REMOTE_LOG RESULTS='$REMOTE_RUN'"
+   echo PID=\$! LOG=\$HOME/$REMOTE_LOG"
 ```
 
-空的 `RUN_WORKLOADS` 运行全部 10 个 cell。
+空的 `RUN_WORKLOADS` 运行全部 11 个 cell。
 
 #### 6.2 SciLink
 
@@ -403,13 +401,14 @@ planning_critical_materials
 
 ```zsh
 RUN_WORKLOADS="polycrystalline_grains_basic"
+REMOTE_LOG="logs/scilink_${RUN_WORKLOADS}_$(date +%Y%m%d_%H%M%S).log"
 ssh "$SSH_USER@$WORKFLOW_NODE" \
   "cd pi-ebpf-tracing-handoff &&
    sudo -n true &&
-   nohup sudo -n -E env BASE_OUT='$REMOTE_RUN' RUN_WORKLOADS='$RUN_WORKLOADS' \
+   nohup sudo -n -E env RUN_WORKLOADS='$RUN_WORKLOADS' \
      bash scripts/trace_script_bcc_scilink.sh \
      >\"\$HOME/$REMOTE_LOG\" 2>&1 </dev/null &
-   echo PID=\$! LOG=\$HOME/$REMOTE_LOG RESULTS='$REMOTE_RUN'"
+   echo PID=\$! LOG=\$HOME/$REMOTE_LOG"
 ```
 
 #### 6.3 1000 Genomes
@@ -418,11 +417,11 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
 
 ```zsh
 RUN_WORKLOADS="classic_chr1_r1"
+REMOTE_LOG="logs/1000genome_${RUN_WORKLOADS}_$(date +%Y%m%d_%H%M%S).log"
 ssh "$SSH_USER@$WORKFLOW_NODE" \
   "cd pi-ebpf-tracing-handoff &&
    sudo -n true &&
    nohup sudo -n -E env \
-     BASE_OUT='$REMOTE_RUN' \
      WORKFLOW_REPO='$MOUNT_PATH/$SSH_USER/1000genome-workflow' \
      DATASET_DIR='$MOUNT_PATH/$SSH_USER/1000genome-workflow/data/20130502' \
      POPULATION_DIR='$MOUNT_PATH/$SSH_USER/1000genome-workflow/data/populations' \
@@ -431,7 +430,7 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
      CLASSIC_OFFLINE=1 RUN_WORKLOADS='$RUN_WORKLOADS' \
      bash scripts/trace_script_bcc_1000genome.sh \
      >\"\$HOME/$REMOTE_LOG\" 2>&1 </dev/null &
-   echo PID=\$! LOG=\$HOME/$REMOTE_LOG RESULTS='$REMOTE_RUN'"
+   echo PID=\$! LOG=\$HOME/$REMOTE_LOG"
 ```
 
 默认矩阵包含 1、2、4 个 chromosome，各重复三次。正式运行前先确认所需 VCF 已准备。
@@ -458,11 +457,11 @@ REMOTE
 
 ```zsh
 RUN_WORKLOADS="montage_m17_0p10_r1"
+REMOTE_LOG="logs/montage_${RUN_WORKLOADS}_$(date +%Y%m%d_%H%M%S).log"
 ssh "$SSH_USER@$WORKFLOW_NODE" \
   "cd pi-ebpf-tracing-handoff &&
    sudo -n true &&
    nohup sudo -n -E env \
-     BASE_OUT='$REMOTE_RUN' \
      MONTAGE_ROOT='$MOUNT_PATH/$SSH_USER/montage' \
      MONTAGE_INPUT_ROOT='$MOUNT_PATH/$SSH_USER/montage/input' \
      MONTAGE_PYTHON='$MOUNT_PATH/$SSH_USER/montage/trace-venv/bin/python' \
@@ -471,12 +470,12 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
      MONTAGE_OFFLINE=1 RUN_WORKLOADS='$RUN_WORKLOADS' \
      bash scripts/trace_script_bcc_montage.sh \
      >\"\$HOME/$REMOTE_LOG\" 2>&1 </dev/null &
-   echo PID=\$! LOG=\$HOME/$REMOTE_LOG RESULTS='$REMOTE_RUN'"
+   echo PID=\$! LOG=\$HOME/$REMOTE_LOG"
 ```
 
 规模为 `0p10`、`0p25` 和 `0p50`。每个规模有 `r1`、`r2` 和 `r3`。
 
-启动成功后保留当前 terminal 中的 `RUN_NAME`、`REMOTE_RUN` 和 `REMOTE_LOG`，前往第 7 节。
+启动成功后保留当前 terminal 中的 `REMOTE_LOG`，前往第 7 节。
 
 ### 7. 查看进度
 
@@ -497,6 +496,15 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
 
 ```zsh
 ssh "$SSH_USER@$WORKFLOW_NODE" "tail -100 \"\$HOME/$REMOTE_LOG\""
+```
+
+结果目录由脚本命名，运行开始后从日志读取：
+
+```zsh
+REMOTE_RUN=$(ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "sed -n -E 's/^(Output dir: |Results: |Results in: |All done\\. Results in: )//p' \"\$HOME/$REMOTE_LOG\" | tail -1")
+RUN_NAME=$(basename "$REMOTE_RUN")
+printf 'RUN_NAME=%s\n' "$RUN_NAME"
 ```
 
 完成后前往第 8 节。
@@ -538,14 +546,7 @@ done
 (( failed == 0 )) && open "$LOCAL_RUN"/*/visualizations/index.html
 ```
 
-不要按目录时间猜测结果。若当前 terminal 已关闭，先从运行日志找回精确路径：
-
-```zsh
-REMOTE_LOG="logs/<run-name>.log"
-REMOTE_RUN=$(ssh "$SSH_USER@$WORKFLOW_NODE" \
-  "sed -n -E 's/^(Output dir: |Results: |Results in: |All done\\. Results in: )//p' \"\$HOME/$REMOTE_LOG\" | tail -1")
-RUN_NAME=$(basename "$REMOTE_RUN")
-```
+不要按目录时间猜测结果。若当前 terminal 已关闭，设置 `REMOTE_LOG="logs/<日志名>.log"` 后重新执行第 7 节末尾的读取命令。
 
 ---
 
@@ -599,7 +600,7 @@ results/
 results/<run_id>/<workload>/
 ```
 
-`<run_id>` 通常是时间戳或实验名称，`<workload>` 是被追踪的 cell 或用例。每个 cell 的完整结果必须保存在同一目录，包括 `ebpf_events.log`、`parsed.json`、`pi_events.jsonl`、`tool_calls.log`、`phase1_metrics.json`、`lineage/`、`visualizations/`，以及 `scilink_session/` 或 `work/` 等系统专用目录。
+`<run_id>` 由 `scripts/lib_results.sh` 的 `run_dir_name` 生成，格式为 `<Workflow>_<task>_<时间戳>`；`<workload>` 是被追踪的 cell 或用例。每个 cell 的完整结果必须保存在同一目录，包括 `ebpf_events.log`、`parsed.json`、`pi_events.jsonl`、`tool_calls.log`、`phase1_metrics.json`、`lineage/`、`visualizations/`，以及 `scilink_session/` 或 `work/` 等系统专用目录。
 
 `remote_results/` 只能作为从 CloudLab 或其他远端机器传输结果时的临时缓存。验证后的持久化结果必须移至 `results/`，随后删除临时副本。
 
@@ -609,7 +610,7 @@ results/<run_id>/<workload>/
 /mnt/lustrefs/<user>/pi-ebpf-tracing-handoff/results/
 ```
 
-CloudLab client 不得将新的追踪结果写入仓库 checkout、home 目录或根文件系统。新的追踪脚本应将 `BASE_OUT` 默认为 `/mnt/lustrefs/<user>/pi-ebpf-tracing-handoff/results/<run_id>`。拉回的本地副本必须保持 `results/<run_id>/<workload>/` 结构。
+CloudLab client 不得将新的追踪结果写入仓库 checkout、home 目录或根文件系统。新的追踪脚本应将 `BASE_OUT` 默认为 `$(default_lustre_results_root)/$(run_dir_name <Workflow> $(selected_task_names))`。拉回的本地副本必须保持 `results/<run_id>/<workload>/` 结构。
 
 ### 4. 目标系统与编排固定度
 

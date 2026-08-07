@@ -347,9 +347,9 @@ def _candidate_class(call: dict[str, Any]) -> str:
         return "no candidate"
     if count == 1:
         return "unique"
-    if count <= 3:
-        return "2–3 candidates"
-    return ">3 candidates"
+    if count == 2:
+        return "2 sources"
+    return "3+ sources"
 
 
 def _reuse_band(call: dict[str, Any]) -> str | None:
@@ -397,10 +397,6 @@ def _temporal_metrics(per_call: list[dict[str, Any]]) -> dict[str, Any]:
             "n": len(group),
             "logical_reusable_tokens": logical_tokens,
             "realized_cache_read_tokens": realized_tokens,
-            "token_capture_rate": (
-                round(realized_tokens / logical_tokens, 4)
-                if logical_tokens else None
-            ),
         })
     return {
         "longest_unique_source_age_s": (
@@ -423,12 +419,12 @@ def _temporal_metrics(per_call: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _candidate_count_table(per_call: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
-    for label in ["0", "1", "2", "3", "4+"]:
+    for label in ["0", "1", "2", "3+"]:
         group = [
             call for call in per_call
             if (
                 str(call["source_candidate_count"])
-                if call["source_candidate_count"] < 4 else "4+"
+                if call["source_candidate_count"] < 3 else "3+"
             ) == label
         ]
         rows.append({
@@ -536,10 +532,6 @@ def analyze_cell_logical(
             n,
             match_unit,
         )
-        capture_rate = (
-            c["cacheRead"] / logical_aligned if logical_aligned > 0 else None
-        )
-
         if dump_prefixes:
             role_call_counts[c["role"]] = role_call_counts.get(c["role"], 0) + 1
             new_head = enc.decode(tokens[g:g + 60]) if g < n else ""
@@ -569,7 +561,6 @@ def analyze_cell_logical(
             "output": c["output"],
             "logical": g, "role_logical": r,
             "logical_aligned": logical_aligned,
-            "capture_rate": round(capture_rate, 4) if capture_rate is not None else None,
             "start_ms": c["start_ms"],
             "end_ms": c["end_ms"],
             "elapsed_s": round((c["start_ms"] - first_start_ms) / 1000.0, 4),
@@ -634,7 +625,7 @@ def analyze_cell_logical(
         "source_class_counts": {
             source_class: sum(1 for c in per_call if c["source_class"] == source_class)
             for source_class in [
-                "unique", "2–3 candidates", ">3 candidates",
+                "unique", "2 sources", "3+ sources",
                 "no candidate", "exact repeat",
             ]
         },

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Pull one agentic run back from the client node, verify it, and open the
-# reports.  The KV report is always regenerated locally so its figures match
+# reports.  One KV report per task is always regenerated locally so its figures match
 # local code rather than whatever version the cluster had deployed.
 #
 # Usage, from the repo root with cloudlab_env.sh already sourced:
-#   bash scripts/pull_agentic_run.sh genomas_run.log
-#   bash scripts/pull_agentic_run.sh /mnt/lustrefs/.../results/phase4_20260729_124254
+#   bash scripts/pull_agentic_run.sh logs/genomas_A_c2_w1_20260806_101500.log
+#   bash scripts/pull_agentic_run.sh /mnt/lustrefs/.../results/GenoMAS_A_c2_w1_20260806_101500
 #
 # The first form reads "Output dir:" out of $HOME/<log> on the client node.
 # The second form takes the remote run directory directly, for runs that were
@@ -54,6 +54,10 @@ echo "Regenerating the KV report locally so figures match local code."
 PYTHONPATH=src python -m agent_io_tracing.analysis.kvcache.report \
     --results "$local_out" --runs . --dump-prefixes || exit 1
 
+echo "Rebuilding the results index over every local task."
+PYTHONPATH=src python -m agent_io_tracing.analysis.results_index \
+    --results results || exit 1
+
 failed=0
 cells=0
 for cell in "$local_out"/*; do
@@ -79,17 +83,16 @@ for cell in "$local_out"/*; do
     fi
 done
 
-for required in kvcache_report.md kvcache_report.html; do
-    if [ ! -s "$local_out/$required" ]; then
-        echo "ERROR: missing or empty: $local_out/$required" >&2
-        failed=1
-    fi
-done
+if [ ! -s "results/index.html" ]; then
+    echo "ERROR: missing or empty: results/index.html" >&2
+    failed=1
+fi
 
 [ "$cells" -gt 0 ] || failed=1
 if [ "$failed" -eq 0 ]; then
     open "$local_out"/*/visualizations/index.html
-    open "$local_out/kvcache_report.html"
+    open "$local_out"/*/kvcache_report.html
+    open results/index.html
 else
     echo "Result pull failed integrity checks; not opening incomplete output." >&2
     exit 1

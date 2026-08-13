@@ -9,6 +9,7 @@ from agent_io_tracing.adapters.llm_trace import (
     trace_cache_config,
 )
 from agent_io_tracing.adapters.scilink.logger import LiteLLMToolLogger
+from agent_io_tracing.adapters.scilink.logger import _normalize_usage_from_litellm
 
 
 def _jsonl(path):
@@ -86,6 +87,21 @@ def test_full_prompt_cache_key_is_stable_for_mapping_key_order():
     assert cache_key("openai", "model", first) != cache_key(
         "openai", "other-model", first
     )
+
+
+def test_explicit_zero_cached_tokens_is_measured():
+    response = SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens=100,
+            completion_tokens=10,
+            total_tokens=110,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+    )
+    usage = _normalize_usage_from_litellm(response)
+    assert usage["cacheRead"] == 0
+    assert usage["cacheReadAvailable"] is True
+    assert usage["cacheReadSource"] == "response"
 
 
 def test_serving_arm_manifest_is_stamped_without_losing_request_controls(

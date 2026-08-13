@@ -28,12 +28,15 @@ ROW = {
     "total_input": 74798,
     "median_input": 5406,
     "total_output": 29438,
+    "cached_tokens": 21692,
+    "cache_read_available": True,
     "realized_frac": 0.29,
     "logical_frac": 0.36,
     "gap_frac": 0.06,
     "latency": {"overall": {"total_duration_s": 431.0}, "wall_clock_span_s": 433.0,
                 "stream_timing": {"median_ttft_s": 0.7, "median_tpot_s": 0.0143}},
     "runtime": {"vendors": ["vLLM"], "models": ["Qwen3.6-27B"]},
+    "serving_config": {"kv_cache_size_tokens": "1325785"},
     "segments": {"cache_size_tokens": 45376},
 }
 
@@ -47,6 +50,10 @@ def test_index_and_report_show_the_same_numbers():
     report = _data_row(token_table([ROW]))
     index = _data_row(token_table([ROW], LEAD_HEADERS, _lead_cells))
     assert report.split(" | ")[1:] == index.split(" | ")[2:]
+    rendered = "\n".join(token_table([ROW]))
+    assert "cache size" not in rendered
+    assert "21,692" in rendered
+    assert "1,325,785 tokens" in rendered
 
 
 def test_both_tables_have_a_column_for_every_header():

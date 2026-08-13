@@ -414,6 +414,8 @@ def _per_arm_sections(sweep_dir: Path, arms: list[dict[str, Any]]) -> list[str]:
         lines.extend(["", "**Server config**", ""])
         lines.extend(["| key | value |", "| --- | --- |"])
         for key, value in sorted(arm["serving_config"].items()):
+            if key == "kv_cache_size_tokens":
+                continue
             lines.append(f"| `{key}` | `{value}` |")
         lines.extend(["", "**Artifacts**", ""])
         for index in range(arm["reps"]):
@@ -425,6 +427,22 @@ def _per_arm_sections(sweep_dir: Path, arms: list[dict[str, Any]]) -> list[str]:
                 f"[metrics after]({base}/metrics_after.prom)"
             )
         lines.extend(["", "---", ""])
+    return lines
+
+
+def _capacity_section(arms: list[dict[str, Any]]) -> list[str]:
+    """Show each distinct physical KV-cache capacity once per report."""
+    capacities = set()
+    for arm in arms:
+        raw = (arm.get("serving_config") or {}).get("kv_cache_size_tokens")
+        try:
+            capacities.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    if not capacities:
+        return []
+    lines = ["", "**KV-cache capacity used by these experiments**", ""]
+    lines.extend(f"- {capacity:,} tokens" for capacity in sorted(capacities))
     return lines
 
 
@@ -442,6 +460,7 @@ def write_report(sweep_dir: Path, results_dir: Path | None = None) -> Path:
         "",
     ]
     lines.extend(_token_summary(arms))
+    lines.extend(_capacity_section(arms))
     lines.extend(["", "## Summary — time and configuration", ""])
     lines.extend(render(arms))
     if comparison_plot is not None:
@@ -452,8 +471,6 @@ def write_report(sweep_dir: Path, results_dir: Path | None = None) -> Path:
         index = results_dir.resolve() / "index.html"
         lines.extend([f"[Back to experiments index]({os.path.relpath(index, sweep_dir.resolve())})", ""])
     text = "\n".join(lines) + "\n"
-    (sweep_dir / "sweep.md").write_text(text, encoding="utf-8")
-    (sweep_dir / "kvcache_report.md").write_text(text, encoding="utf-8")
     body = markdown.markdown(text, extensions=["tables"])
     html_text = (
         '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
@@ -464,7 +481,6 @@ def write_report(sweep_dir: Path, results_dir: Path | None = None) -> Path:
     )
     path = sweep_dir / "kvcache_report.html"
     path.write_text(html_text, encoding="utf-8")
-    (sweep_dir / "sweep.html").write_text(html_text, encoding="utf-8")
     return path
 
 

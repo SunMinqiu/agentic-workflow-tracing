@@ -14,7 +14,7 @@ GenoMAS target.  Two big differences from SRAgent and SciLink:
      iterates over EVERY (trait, condition) pair in it.  For a smoke /
      small-scale run we slice task_info.json down to only the traits whose
      data lives under `<data_root>/GEO/` (or `<data_root>/TCGA/`), and drop
-     all conditions so the matrix collapses to one task per trait.  The
+     all but the first condition so the matrix collapses to one task per trait. The
      original task_info.json is backed up to task_info.json.full and
      restored in `finally`.
 
@@ -25,6 +25,7 @@ Outputs in <log_dir>:
   - subagent_calls.log          empty placeholder (Phase 2 MVP)
   - genomas.stdout / .stderr    captured GenoMAS console output
   - sliced_traits.json          which traits we kept for this run
+  - selected_inputs.json        exact GEO cohorts selected for every trait
 
 Usage:
     python analyze_codebase_genomas.py <work_dir> <log_dir> \
@@ -113,6 +114,27 @@ def _detect_traits_from_data_root(data_root: Path) -> list[str]:
             if child.is_dir():
                 traits.add(child.name)
     return sorted(traits)
+
+
+def _selected_geo_inputs(
+    data_root: Path, traits: list[str], max_cohorts: int,
+) -> dict[str, list[str]]:
+    """Return the deterministic GSE-only cohort selection used by GenoMAS."""
+    selected: dict[str, list[str]] = {}
+    for trait in traits:
+        trait_dir = data_root / "GEO" / trait
+        available = sorted(
+            child.name for child in trait_dir.iterdir()
+            if child.is_dir() and child.name.startswith("GSE")
+        ) if trait_dir.is_dir() else []
+        chosen = available[:max_cohorts] if max_cohorts > 0 else available
+        if max_cohorts > 0 and len(chosen) < max_cohorts:
+            raise ValueError(
+                f"{trait}: requested {max_cohorts} GEO cohorts, "
+                f"but only {len(available)} are available under {trait_dir}"
+            )
+        selected[trait] = chosen
+    return selected
 
 
 def slice_task_info(
@@ -211,6 +233,27 @@ def main() -> int:
               f"names match keys in metadata/task_info.json.",
               file=sys.stderr)
         return 2
+
+    try:
+        selected_geo = _selected_geo_inputs(
+            data_root, list(sliced.keys()), args.max_cohorts,
+        )
+    except ValueError as error:
+        print(f"[analyze_codebase_genomas] ERROR: {error}", file=sys.stderr)
+        return 2
+    (log_dir / "selected_inputs.json").write_text(json.dumps({
+        "data_root": str(data_root),
+        "selection_rule": "GSE directories sorted lexicographically, then first N",
+        "max_geo_cohorts_per_trait": args.max_cohorts,
+        "traits": selected_geo,
+        "tcga_included": args.max_cohorts <= 0,
+    }, indent=2))
+    for trait, cohorts in selected_geo.items():
+        print(
+            f"[analyze_codebase_genomas] selected {trait}: "
+            f"{', '.join(cohorts) or 'no GEO cohorts'}",
+            file=sys.stderr,
+        )
 
     backup_path = task_info_path.with_suffix(".json.full")
     sliced_record = log_dir / "sliced_traits.json"

@@ -101,6 +101,8 @@ def load_calls(cell: Path) -> list[dict[str, Any]]:
                 "input": int(usage.get("input", 0) or 0),
                 "output": int(usage.get("output", 0) or 0),
                 "cacheRead": int(usage.get("cacheRead", 0) or 0),
+                "cacheReadAvailable": usage.get("cacheReadAvailable"),
+                "cacheReadSource": usage.get("cacheReadSource"),
                 "total": int(usage.get("totalTokens", 0) or 0),
                 "cache_key": o.get("cache_key"),
                 "cache_hit": bool(o.get("cache_hit")),
@@ -187,6 +189,18 @@ def analyze_cell(cell: Path) -> dict[str, Any] | None:
     total_input = sum(inputs)
     total_output = sum(outputs)
     total_cacheread = sum(cachereads)
+    explicit_cache_flags = [
+        c["cacheReadAvailable"] for c in token_calls
+        if c.get("cacheReadAvailable") is not None
+    ]
+    if explicit_cache_flags:
+        measured_calls = sum(bool(c.get("cacheReadAvailable")) for c in token_calls)
+        cache_read_available = measured_calls == len(token_calls)
+    else:
+        # Legacy traces did not record availability. Preserve their established
+        # interpretation when they contain at least one nonzero observation.
+        measured_calls = len(token_calls) if total_cacheread > 0 else 0
+        cache_read_available = total_cacheread > 0
 
     # Q1: per-call length, overall + per role + per phase.
     by_role: dict[str, list[int]] = {}
@@ -249,7 +263,10 @@ def analyze_cell(cell: Path) -> dict[str, Any] | None:
         "total_input_tokens": total_input,
         "total_output_tokens": total_output,
         "total_cacheread_tokens": total_cacheread,
-        "cacheread_fraction": round(cacheread_frac, 4),
+        "cacheread_fraction": round(cacheread_frac, 4) if cache_read_available else None,
+        "cache_read_available": cache_read_available,
+        "cache_read_measured_calls": measured_calls,
+        "cache_read_total_calls": len(token_calls),
         "verbatim_resubmissions": verbatim_resubmissions,
         "verbatim_resubmitted_tokens": verbatim_resubmitted_tokens,
         "verbatim_fraction": round(verbatim_frac, 4),

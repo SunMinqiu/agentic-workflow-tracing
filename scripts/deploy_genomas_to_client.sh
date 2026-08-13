@@ -17,15 +17,15 @@
 #     source ~/Desktop/Benchmarking_Agents/pi-ebpf-tracing-handoff/cloudlab_env.sh
 #     bash deploy_genomas_to_client.sh
 #
-# Re-runnable: clone uses pull-if-exists, uv venv is --clear, .env files
-# are overwritten.  Data dir is NOT touched (you populate it manually from
-# the GenoTEX Google Drive — see the bottom of this file).
+# Re-runnable: clone uses pull-if-exists, uv venv is --clear, and .env files
+# are overwritten. The canonical laptop dataset is mirrored to Lustre unless
+# SYNC_GENOMAS_DATASET=0 explicitly reuses an existing remote copy.
 #
 # Key differences from deploy_scilink_to_client.sh:
 #   - Python 3.10 (GenoMAS requirements.txt is pinned via README)
 #   - .env uses `_1` suffix for keys (GenoMAS load-balancing convention)
 #   - OpenAI requires BOTH OPENAI_API_KEY_1 AND OPENAI_ORGANIZATION_1
-#   - Data dir layout is `<root>/GEO/<cohort_dirs>` + `<root>/TCGA/<trait>/<files>`
+#   - Data layout is `<root>/GEO/<trait>/GSE*` + `<root>/TCGA/<trait>/<files>`
 #
 
 set -euo pipefail
@@ -39,6 +39,8 @@ MOUNT_PATH="${MOUNT_PATH:-/mnt/lustrefs}"
 
 # Local source dir for the tracing harness (rsync'd to remote).
 LOCAL_HARNESS="${LOCAL_HARNESS:-$HOME/Desktop/Benchmarking_Agents/pi-ebpf-tracing-handoff}"
+LOCAL_GENOMAS_DATASET="${LOCAL_GENOMAS_DATASET:-$HOME/Desktop/Benchmarking_Agents/GenoMAS_Datasets}"
+SYNC_GENOMAS_DATASET="${SYNC_GENOMAS_DATASET:-1}"
 
 # Remote layout — independent of ~/SRAgent and ~/SciLink so all three coexist.
 REMOTE_HARNESS_NAME="${REMOTE_HARNESS_NAME:-pi-ebpf-tracing-handoff}"
@@ -47,8 +49,7 @@ GENOMAS_GIT_URL="${GENOMAS_GIT_URL:-https://github.com/Liu-Hy/GenoMAS.git}"
 # Pin to main now; replace with a commit SHA once we verify a working revision.
 GENOMAS_GIT_REF="${GENOMAS_GIT_REF:-main}"
 
-# Lustre-side data dir.  You populate this manually from the GenoTEX Google
-# Drive — see the END_OF_DEPLOY_NOTES section at the bottom.
+# Lustre-side data dir populated from LOCAL_GENOMAS_DATASET in step 1a.
 REMOTE_DATA_DIR="${REMOTE_DATA_DIR_GENOMAS:-${MOUNT_PATH}/genomas_data}"
 
 # cloudlab_env.sh keeps SciLink/OpenAI and GenoMAS/FreeInference credentials
@@ -120,6 +121,33 @@ echo "  Lustre cache dir ready: $MOUNT_PATH/uv_cache_genomas"
 # where a prior 'sudo -E' run reverted ownership to root).
 touch "$REMOTE_DATA_DIR/.deploy_writetest" && rm "$REMOTE_DATA_DIR/.deploy_writetest"
 REMOTE_LUSTRE
+
+# ----------------------------------------------------------------
+# 1a) Mirror the laptop's canonical GenoMAS dataset onto Lustre.
+# ----------------------------------------------------------------
+case "$SYNC_GENOMAS_DATASET" in
+1|true|TRUE|yes|YES)
+    if [ ! -d "$LOCAL_GENOMAS_DATASET/GEO" ] || [ ! -d "$LOCAL_GENOMAS_DATASET/TCGA" ]; then
+        echo "Error: expected GEO/ and TCGA/ under LOCAL_GENOMAS_DATASET=$LOCAL_GENOMAS_DATASET" >&2
+        echo "       Set LOCAL_GENOMAS_DATASET or use SYNC_GENOMAS_DATASET=0 only when Lustre is already populated." >&2
+        exit 1
+    fi
+    echo "==> [1a] rsync GenoMAS dataset → $CLIENT_NODE:$REMOTE_DATA_DIR/"
+    rsync -az --delete --partial --progress \
+        --exclude '.DS_Store' \
+        "$LOCAL_GENOMAS_DATASET/" \
+        "$SSH_USER@$CLIENT_NODE:$REMOTE_DATA_DIR/"
+    ssh "$SSH_USER@$CLIENT_NODE" \
+        "find '$REMOTE_DATA_DIR' -name .DS_Store -type f -delete"
+    ;;
+0|false|FALSE|no|NO)
+    echo "==> [1a] dataset sync skipped by SYNC_GENOMAS_DATASET=$SYNC_GENOMAS_DATASET"
+    ;;
+*)
+    echo "Error: SYNC_GENOMAS_DATASET must be 0 or 1, got: $SYNC_GENOMAS_DATASET" >&2
+    exit 1
+    ;;
+esac
 
 # ----------------------------------------------------------------
 # 1b) rsync the tracing harness (so future Phase-2 logger + Phase-3 tracer
@@ -289,15 +317,40 @@ else:
 PYEOF
 fi
 
-# --- cohort-count knob for I/O experiments (GENOMAS_MAX_COHORTS) ---
+# --- deterministic cohort-count knob for I/O experiments ---
 # GenoMAS's environment.py lists ALL GEO cohorts per trait with no cap, so the
 # workload (and its I/O) can't be swept by cohort count.  Patch the enumeration
 # to honour GENOMAS_MAX_COHORTS (0/unset = all).  Idempotent.
 .venv/bin/python - << 'PYEOF'
 path = "environment.py"
 src = open(path).read()
-if "GENOMAS_MAX_COHORTS" in src:
-    print("  [max-cohorts] environment.py already patched; skip")
+marker = "GENOMAS_COHORT_SELECTION_V2"
+cohort_expr = (
+    "sorted(name for name in os.listdir(geo_trait_dir) "
+    "if name.startswith('GSE') and "
+    "os.path.isdir(os.path.join(geo_trait_dir, name)))"
+)
+if marker in src:
+    print("  [max-cohorts] deterministic environment.py patch already present; skip")
+elif "GENOMAS_MAX_COHORTS" in src:
+    old_capped = "sorted(os.listdir(geo_trait_dir))[:_mc]"
+    old_all = "os.listdir(geo_trait_dir) + ['TCGA']"
+    if old_capped not in src or old_all not in src:
+        print("  [max-cohorts] WARNING: existing patch has an unknown shape; skipped")
+    else:
+        src = src.replace(old_capped, f"{cohort_expr}[:_mc]")
+        src = src.replace(old_all, f"{cohort_expr} + ['TCGA']")
+        target = "_mc = int(os.environ.get('GENOMAS_MAX_COHORTS', '0') or '0')"
+        idx = src.find(target)
+        line_start = src.rfind("\n", 0, idx) + 1
+        indent = src[line_start:idx]
+        src = (
+            src[:line_start]
+            + f"{indent}# GENOMAS_COHORT_SELECTION_V2\n{indent}{target}"
+            + src[idx + len(target):]
+        )
+        open(path, "w").write(src)
+        print("  [max-cohorts] upgraded environment.py to deterministic GSE-only selection")
 else:
     needle = "cohorts = os.listdir(geo_trait_dir) + ['TCGA']"
     idx = src.find(needle)
@@ -307,11 +360,12 @@ else:
         line_start = src.rfind("\n", 0, idx) + 1
         indent = src[line_start:idx]
         block = (
+            f"{indent}# GENOMAS_COHORT_SELECTION_V2\n"
             f"{indent}_mc = int(os.environ.get('GENOMAS_MAX_COHORTS', '0') or '0')\n"
             f"{indent}if _mc > 0:\n"
-            f"{indent}    cohorts = sorted(os.listdir(geo_trait_dir))[:_mc]\n"
+            f"{indent}    cohorts = {cohort_expr}[:_mc]\n"
             f"{indent}else:\n"
-            f"{indent}    cohorts = os.listdir(geo_trait_dir) + ['TCGA']"
+            f"{indent}    cohorts = {cohort_expr} + ['TCGA']"
         )
         src = src[:line_start] + block + src[idx + len(needle):]
         open(path, "w").write(src)
@@ -408,11 +462,18 @@ REMOTE_TRACE_ENV
 echo "==> [4/5] Data dir status"
 ssh -T "$SSH_USER@$CLIENT_NODE" "bash -s" << REMOTE_DATA
 set -u
-GEO_COUNT=\$(ls -1 "${REMOTE_DATA_DIR}/GEO" 2>/dev/null | wc -l)
-TCGA_COUNT=\$(ls -1 "${REMOTE_DATA_DIR}/TCGA" 2>/dev/null | wc -l)
-echo "  GEO subdirs:  \$GEO_COUNT  (expected: 4-8 cohort folders for smoke)"
-echo "  TCGA subdirs: \$TCGA_COUNT (expected: ≥1 trait folder)"
-if [ "\$GEO_COUNT" -eq 0 ] && [ "\$TCGA_COUNT" -eq 0 ]; then
+GEO_TRAITS=\$(find "${REMOTE_DATA_DIR}/GEO" -mindepth 1 -maxdepth 1 -type d | wc -l)
+GEO_COHORTS=\$(find "${REMOTE_DATA_DIR}/GEO" -mindepth 2 -maxdepth 2 -type d -name 'GSE*' | wc -l)
+TCGA_TRAITS=\$(find "${REMOTE_DATA_DIR}/TCGA" -mindepth 1 -maxdepth 1 -type d | wc -l)
+echo "  GEO traits:   \$GEO_TRAITS"
+echo "  GEO cohorts:  \$GEO_COHORTS"
+echo "  TCGA traits:  \$TCGA_TRAITS"
+for trait_dir in "${REMOTE_DATA_DIR}"/GEO/*; do
+    [ -d "\$trait_dir" ] || continue
+    count=\$(find "\$trait_dir" -mindepth 1 -maxdepth 1 -type d -name 'GSE*' | wc -l)
+    echo "    \$(basename "\$trait_dir"): \$count cohorts"
+done
+if [ "\$GEO_TRAITS" -eq 0 ] && [ "\$TCGA_TRAITS" -eq 0 ]; then
     echo "  → Data dir is empty.  Smoke run will fail until you populate it."
 fi
 REMOTE_DATA
@@ -431,19 +492,19 @@ A. Confirm the venv works (no LLM call, no data needed):
   .venv/bin/python -c "import sys; print(sys.version)"
   .venv/bin/python main.py --help | head -30
 
-B. Populate the data dir from the GenoTEX Google Drive:
+B. Dataset placement:
 
-   1. Open https://drive.google.com/drive/folders/1kxHOyW5wNnY3Rk15xwLaM7ZZS01wGzRO
-      on your laptop.
-   2. Download 4–8 cohort folders from GEO/ and 1 trait folder from TCGA/.
-      Each cohort is typically a few hundred MB.  Don't bother with the full 42 GB.
-   3. scp them to the client:
-        scp -r ./GEO/<cohort_name> $SSH_USER@$CLIENT_NODE:${REMOTE_DATA_DIR}/GEO/
-        scp -r ./TCGA/<trait_name> $SSH_USER@$CLIENT_NODE:${REMOTE_DATA_DIR}/TCGA/
-   4. Validate (optional):
+   The deploy mirrored the canonical laptop dataset with this layout:
+     ${LOCAL_GENOMAS_DATASET}/GEO/<trait>/GSE* -> ${REMOTE_DATA_DIR}/GEO/<trait>/GSE*
+     ${LOCAL_GENOMAS_DATASET}/TCGA/<trait>/... -> ${REMOTE_DATA_DIR}/TCGA/<trait>/...
+
+   To reuse an existing remote copy, confirm its required layout, then run a
+   later deploy with SYNC_GENOMAS_DATASET=0:
         ssh $SSH_USER@$CLIENT_NODE
-        cd ~/$REMOTE_GENOMAS_DIR
-        .venv/bin/python download/validator.py --data-dir ${REMOTE_DATA_DIR} --validate
+        test -d "${REMOTE_DATA_DIR}/GEO" && test -d "${REMOTE_DATA_DIR}/TCGA"
+        test "\$(find "${REMOTE_DATA_DIR}" -type f | wc -l)" -gt 0
+        test "\$(find "${REMOTE_DATA_DIR}/GEO/Type_1_Diabetes" -mindepth 1 -maxdepth 1 -type d -name 'GSE*' | wc -l)" -ge 8
+        du -sh "${REMOTE_DATA_DIR}"
 
 C. Smoke run (no tracer, no logger, just GenoMAS):
    Note: this will iterate over EVERY pair in metadata/task_info.json.

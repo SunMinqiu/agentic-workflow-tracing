@@ -66,6 +66,8 @@ def task_row(cell: Path, results_dir: Path) -> dict[str, Any]:
         "median_input": (demand.get("input_tokens") or {}).get("median", 0),
         "total_output": demand.get("total_output_tokens", 0),
         "realized_frac": demand.get("cacheread_fraction"),
+        "cached_tokens": demand.get("total_cacheread_tokens"),
+        "cache_read_available": demand.get("cache_read_available", False),
         "logical_frac": logical.get("logical_frac"),
         "logical_aligned_frac": logical.get("logical_aligned_frac"),
         # Backends that leave cacheRead null record their realized reuse here
@@ -75,8 +77,8 @@ def task_row(cell: Path, results_dir: Path) -> dict[str, Any]:
         "gap_frac": logical.get("gap_frac"),
         "latency": logical.get("latency") or {},
         "runtime": logical.get("runtime") or {},
+        "serving_config": logical.get("serving_config") or {},
         "segments": {
-            "cache_size_tokens": seg.get("cache_size_tokens"),
             "realized_vs_logical": seg.get("realized_vs_logical") or {},
         } if seg else {},
     }

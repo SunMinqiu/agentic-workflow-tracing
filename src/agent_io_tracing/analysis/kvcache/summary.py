@@ -47,7 +47,7 @@ def dur(seconds: Any) -> str:
 
 TOKEN_HEADERS = [
     "vendor", "model", "calls", "total input", "median input", "total output",
-    "cache size", "realized reuse", "logical reuse", "reuse gap",
+    "cache queried", "cached tokens", "realized reuse", "logical reuse", "reuse gap",
 ]
 TIME_HEADERS = [
     "vendor", "model", "calls", "total inference", "wall", "median TTFT",
@@ -67,14 +67,12 @@ def _identity(r: dict[str, Any]) -> list[str]:
 def realized_cell(r: dict[str, Any]) -> str:
     """Realized reuse, from the vendor when it reports it, else the server.
 
-    vLLM leaves ``usage.prompt_tokens_details`` null, so ``cacheRead`` is 0 on
-    every call even while its prefix cache runs at 46%.  Printing that 0 in the
-    headline table while the body of the same report states the real figure is
-    worse than printing nothing.  The dagger marks the number as cell-level,
-    read from the engine's counters rather than summed from per-call usage.
+    Prefer complete per-request ``cached_tokens`` observations, including an
+    explicit zero. Some vLLM runs omit the field; the cell-level Prometheus
+    delta is the fallback. The dagger identifies that fallback.
     """
     realized = r.get("realized_frac")
-    if realized:
+    if r.get("cache_read_available") or r.get("realized_provenance") in {"response", "vendor"}:
         return pct(realized)
     server = r.get("server_prefix_cache") or {}
     rate = server.get("hit_rate")
@@ -96,7 +94,11 @@ def gap_cell(r: dict[str, Any]) -> str:
     instead -- the difference between 47% ideal and 46% achieved is the whole
     point of the column.
     """
-    if not r.get("realized_frac"):
+    measured_per_request = (
+        r.get("cache_read_available")
+        or r.get("realized_provenance") in {"response", "vendor"}
+    )
+    if not measured_per_request:
         rate = (r.get("server_prefix_cache") or {}).get("hit_rate")
         aligned = r.get("logical_aligned_frac")
         if rate is not None and aligned is not None:
@@ -109,16 +111,49 @@ def gap_cell(r: dict[str, Any]) -> str:
 
 
 def token_cells(r: dict[str, Any]) -> list[str]:
-    seg = r.get("segments") or {}
+    server = r.get("server_prefix_cache") or {}
+    measured_per_request = (
+        r.get("cache_read_available")
+        or r.get("realized_provenance") in {"response", "vendor"}
+    )
+    queried = server.get("queries")
+    queried_cell = fmt(queried) if queried is not None else "n/a"
+    if queried is not None and server.get("sole_client") is False:
+        queried_cell += "?"
+    cached = r.get("cached_tokens") if measured_per_request else server.get("hits")
     return _identity(r) + [
         fmt(r.get("total_input", 0)),
         fmt(r.get("median_input", 0)),
         fmt(r.get("total_output", 0)),
-        fmt(seg["cache_size_tokens"]) if seg else "n/a",
+        queried_cell,
+        fmt(cached) if cached is not None else "unmeasured",
         realized_cell(r),
         pct(r.get("logical_frac")),
         gap_cell(r),
     ]
+
+
+def _capacity_lines(rows: list[dict[str, Any]]) -> list[str]:
+    """Render each distinct physical vLLM capacity once as experiment config."""
+    capacities: dict[tuple[str, str, int], set[str]] = {}
+    for row in rows:
+        serving = row.get("serving_config") or {}
+        raw = serving.get("kv_cache_size_tokens")
+        try:
+            capacity = int(raw)
+        except (TypeError, ValueError):
+            continue
+        runtime = row.get("runtime") or {}
+        vendor = ", ".join(runtime.get("vendors") or ["unknown"])
+        model = ", ".join(runtime.get("models") or ["unknown"])
+        key = (vendor, model, capacity)
+        capacities.setdefault(key, set()).add(str(row.get("cell") or "?"))
+    if not capacities:
+        return []
+    lines = ["", "**KV-cache capacity used by these experiments**", ""]
+    for vendor, model, capacity in sorted(capacities):
+        lines.append(f"- {vendor} · {model}: {capacity:,} tokens")
+    return lines
 
 
 def time_cells(r: dict[str, Any]) -> list[str]:
@@ -177,13 +212,22 @@ def token_table(
 ) -> list[str]:
     L = _table(rows, TOKEN_HEADERS, token_cells,
                lead_headers or ["cell"], lead_cells)
-    # Explain the dagger where it is used, not in a distant legend.
+    # Explain the markers where they are used, not in a distant legend.
     if any(r.get("server_prefix_cache") for r in rows):
         L.append("")
         L.append(
-            "† cell-level, from the engine's own counters. `?` = another "
-            "client shared the server; not attributable."
+            "† cell-level cached-token result from the engine's counters. "
+            "`?` means the counter interval does not match this cell's input, "
+            "so shared or overlapping server traffic prevents attribution."
         )
+        L.append("")
+        L.append(
+            "`cache queried` is the number of prompt tokens submitted to vLLM's "
+            "prefix-cache lookup during the measurement window. It is the "
+            "denominator of the engine's prefix-cache hit rate, not the number of "
+            "tokens stored in cache."
+        )
+    L.extend(_capacity_lines(rows))
     return L
 
 

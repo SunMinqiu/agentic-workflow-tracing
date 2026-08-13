@@ -1,4 +1,4 @@
-# Agentic Scientific Workflow I/O：运行手册与研究概述
+# Agentic Scientific Workflow I/O：运行与研究设计
 
 ## 第一部分：运行手册
 
@@ -38,35 +38,33 @@
 | 用已有 vLLM 结果扫描服务器配置                           | 1 → 3 → 9                             |
 
 
-下表列出手册中的目录创建操作。第 2 节的部署步骤可能重建虚拟环境，只能在新节点上执行。其余目录由 `mkdir -p` 或脚本创建，重复执行不会覆盖结果。
-
-
-| 目录                                           | 位置  | 执行时机                            |
-| -------------------------------------------- | --- | ------------------------------- |
-| `$LUSTRE_USER_DIR` 与 `data/20130502/sifting` | 2.3 | 每个新 Workflow cluster 一次         |
-| Montage 的 `$ROOT` 子目录                        | 2.4 | 每个新 Workflow cluster 一次         |
-| `$HOME/logs`                                 | 6   | 每个新 Workflow cluster 一次         |
-| `results/$RUN_NAME`                          | 8.2 | 每次拉取 1000 Genomes 或 Montage 结果时 |
-| `results/<run_id>/<workload>/`               | 无   | trace 脚本自动创建                    |
-| `replay/bundles` 与 `replay/sweeps/<扫描名>`     | 无   | 第 9 节的命令自动创建                    |
-
-
 
 
 ### 1. 每个新 Mac terminal
+
+换节点时先编辑 `cloudlab_env.sh` 第 16 至 18 行的 `MGS_NODE`、`OST_NODE`、`CLIENT_NODE`，改完开一个新的 terminal 窗口。这三行写作 `${VAR:-默认值}`，变量已有值时 `source` 不覆盖，用过旧节点的窗口会一直用旧机器名。必须留在原窗口时先清空：
+
+```zsh
+unset MGS_NODE OST_NODE CLIENT_NODE WORKFLOW_NODE
+```
 
 在 Mac 的仓库根目录执行：
 
 ```zsh
 source cloudlab_env.sh
-export WORKFLOW_NODE="${WORKFLOW_NODE:-$CLIENT_NODE}"
-export CLIENT_NODE="$WORKFLOW_NODE"
-ssh "$SSH_USER@$WORKFLOW_NODE" true
-printf 'WORKFLOW=%s\nVLLM_NODE=%s\nVLLM_URL=%s\n' \
-  "$WORKFLOW_NODE" "${VLLM_NODE:-not-set}" "${VLLM_URL:-not-set}"
+export WORKFLOW_NODE="$CLIENT_NODE"
+printf 'MGS=%s\nOST=%s\nWORKFLOW=%s\nVLLM_NODE=%s\nVLLM_URL=%s\n' \
+  "$MGS_NODE" "$OST_NODE" "$WORKFLOW_NODE" "${VLLM_NODE:-not-set}" "${VLLM_URL:-not-set}"
+ssh "$SSH_USER@$WORKFLOW_NODE" hostname
 ```
 
-看到 `[cloudlab_env] keys OK`，且 SSH 没有报错，即可继续。
+看到 `[cloudlab_env] keys OK`，三个机器名与本次分配一致，且 SSH 返回远端 hostname，即可继续。
+
+CloudLab 复用旧机器名时 SSH 会报 host key 变更，删掉旧指纹后重连：
+
+```zsh
+ssh-keygen -R "$WORKFLOW_NODE"
+```
 
 使用 vLLM 时，`VLLM_URL` 必须指向 Workflow cluster 上的隧道端口。显示 `not-set` 时执行：
 
@@ -85,14 +83,22 @@ export VLLM_URL="http://127.0.0.1:18080"
 检查 Lustre：
 
 ```zsh
-ssh "$SSH_USER@$WORKFLOW_NODE" "mountpoint -q '$MOUNT_PATH'"
+ssh "$SSH_USER@$WORKFLOW_NODE" "mountpoint -q '$MOUNT_PATH' && echo mounted"
 ```
 
-失败时先执行：
+未打印 `mounted` 时建 Lustre。三台机器全部换新：
 
 ```zsh
 bash scripts/setup_lustre_simple.sh
 ```
+
+MGS 与 OST 沿用旧节点、只换 client 时改用下面这条，避免重新格式化 MDT：
+
+```zsh
+bash scripts/setup_lustre_ost_client_only.sh
+```
+
+完成后重新执行上面的 `mountpoint` 检查。
 
 安装 BCC：
 
@@ -100,11 +106,12 @@ bash scripts/setup_lustre_simple.sh
 ssh "$SSH_USER@$WORKFLOW_NODE" '
   sudo dnf install -y --setopt=install_weak_deps=False \
     bcc-tools python3-bcc "kernel-devel-$(uname -r)" git curl rsync &&
-  /usr/bin/python3 -c "from bcc import BPF"
+  /usr/bin/python3 -c "from bcc import BPF" &&
+  echo bcc-ready
 '
 ```
 
-
+通过标准：输出最后一行为 `bcc-ready`。
 
 #### 2.2 Agentic workflow
 
@@ -118,11 +125,81 @@ bash scripts/deploy_scilink_to_client.sh
 只执行需要的一行。两个都需要时依次执行。分别检查：
 
 ```zsh
-ssh "$SSH_USER@$WORKFLOW_NODE" 'test -x "$HOME/GenoMAS/.venv/bin/python"'
-ssh "$SSH_USER@$WORKFLOW_NODE" 'test -x "$HOME/SciLink/.venv/bin/python"'
+ssh "$SSH_USER@$WORKFLOW_NODE" 'test -x "$HOME/GenoMAS/.venv/bin/python" && echo genomas-ready'
+ssh "$SSH_USER@$WORKFLOW_NODE" 'test -x "$HOME/SciLink/.venv/bin/python" && echo scilink-ready'
 ```
 
-只检查已经部署的 workflow。
+只检查已经部署的 workflow。通过标准：输出对应的 `*-ready`。
+
+##### 2.2.1 将 GenoMAS 数据从 Mac 上传到 Lustre
+
+每个新的 Workflow cluster 都没有 GenoMAS 输入数据。Mac 上的标准数据源是 `/Users/minqiu/Desktop/Benchmarking_Agents/GenoMAS_Datasets`，远端固定写入 Lustre 的 `/mnt/lustrefs/genomas_data`。不要把数据写入远端 `$HOME` 或 `/root`。
+
+本地目录结构必须保持为：
+
+```text
+GenoMAS_Datasets/
+├── GEO/<trait>/GSE*/...
+└── TCGA/<trait>/...
+```
+
+新节点第一次部署 GenoMAS 时，部署脚本默认会同步数据：
+
+```zsh
+source cloudlab_env.sh
+export WORKFLOW_NODE="$CLIENT_NODE"
+LOCAL_GENOMAS_DATASET="/Users/minqiu/Desktop/Benchmarking_Agents/GenoMAS_Datasets" \
+SYNC_GENOMAS_DATASET=1 \
+bash scripts/deploy_genomas_to_client.sh
+```
+
+脚本使用 `rsync --delete`，将本地标准数据完整镜像到 `/mnt/lustrefs/genomas_data`。只有确认新节点的 Lustre 已经有完整数据时，才可以设置 `SYNC_GENOMAS_DATASET=0`。
+
+如果 GenoMAS 已经部署，只需单独上传数据：
+
+```zsh
+source cloudlab_env.sh
+export WORKFLOW_NODE="$CLIENT_NODE"
+LOCAL_GENOMAS_DATASET="/Users/minqiu/Desktop/Benchmarking_Agents/GenoMAS_Datasets"
+REMOTE_GENOMAS_DATASET="$MOUNT_PATH/genomas_data"
+
+ssh "$SSH_USER@$WORKFLOW_NODE" \
+  "sudo mkdir -p '$REMOTE_GENOMAS_DATASET/GEO' '$REMOTE_GENOMAS_DATASET/TCGA' &&
+   sudo chown -R '$SSH_USER' '$REMOTE_GENOMAS_DATASET'"
+
+rsync -az --partial --progress \
+  --exclude '.DS_Store' \
+  "$LOCAL_GENOMAS_DATASET/" \
+  "$SSH_USER@$WORKFLOW_NODE:$REMOTE_GENOMAS_DATASET/"
+```
+
+两个源目录末尾的 `/` 不能省略。上传后检查数据：
+
+```zsh
+ssh "$SSH_USER@$WORKFLOW_NODE" '
+  set -e
+  root=/mnt/lustrefs/genomas_data
+  test -d "$root/GEO" && test -d "$root/TCGA"
+  test "$(find "$root/GEO/Type_1_Diabetes" -mindepth 1 -maxdepth 1 -type d -name "GSE*" | wc -l)" -ge 8
+  file_count="$(find "$root" -type f | wc -l)"
+  test "$file_count" -gt 0
+  printf "files: %s\n" "$file_count"
+  du -sh "$root"
+  find "$root/GEO/Type_1_Diabetes" -mindepth 1 -maxdepth 1 -type d -name "GSE*" -printf "%f\n" | sort
+'
+```
+
+通过标准：命令退出码为 0，文件数不是 0，容量与本地约 1.5 GiB 接近，并列出至少 8 个 `GSE*` 目录。这些检查足以确认 workflow 所需的数据和目录结构已经就绪。
+
+当前 workload 的输入不是随机选择。定义保存在 `config/config_genomas.env`。每个 trait 下只选择名称以 `GSE` 开头的目录，按名称排序后取前 N 个。运行前可以预览这三个 workload 将使用的前 8 个 cohort：
+
+```zsh
+ssh "$SSH_USER@$WORKFLOW_NODE" '
+  find /mnt/lustrefs/genomas_data/GEO/Type_1_Diabetes \
+    -mindepth 1 -maxdepth 1 -type d -name "GSE*" -printf "%f\n" |
+    sort | head -8
+'
+```
 
 使用 OpenAI 或 FreeInference 时前往第 4 节。使用 vLLM 时前往第 3 节。
 
@@ -146,10 +223,19 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 "$HOME/.local/bin/uv" venv --python 3.10 .venv
 "$HOME/.local/bin/uv" pip install --python .venv/bin/python \
   numpy matplotlib pillow pandas plotly
+test -x .venv/bin/python
+test -d data/20130502/sifting
+echo 1000genome-ready
 exit
 ```
 
-运行前必须存在所选 chromosome 的主 VCF 和 annotation VCF。文件必须解压为 `.vcf`。
+通过标准：输出最后一行为 `1000genome-ready`。运行前用以下命令确认所选 chromosome 的主 VCF 和 annotation VCF 已解压为 `.vcf`：
+
+```bash
+find data/20130502 -type f -name '*.vcf' -print
+```
+
+目标 chromosome 的两个文件都出现在输出中才可运行。
 
 完成后前往第 5 节。
 
@@ -169,17 +255,18 @@ mkdir -p "$ROOT"/{tmp,logs,input,cache/pip,cache/python,cache/matplotlib,cache/x
 "$TRACE_VENV/bin/python" -m pip install \
   MontagePy astropy numpy matplotlib pillow pandas plotly importlib_resources
 "$TRACE_VENV/bin/python" -c 'import MontagePy, numpy, pandas, plotly'
+echo montage-ready
 REMOTE
 ```
 
-完成后前往第 5 节。
+通过标准：输出最后一行为 `montage-ready`。完成后前往第 5 节。
 
 ### 3. 第一次使用或更换 vLLM cluster
 
 本仓库不启动 vLLM server。保持 vLLM 的 `srun` terminal 运行，在新的 Mac terminal 设置计算节点：
 
 ```zsh
-export VLLM_NODE="nid001068"
+export VLLM_NODE="nid001232"
 ```
 
 建立 Perlmutter 到 Mac 的 tunnel。该 terminal 保持运行：
@@ -196,8 +283,7 @@ ssh -N \
 
 ```zsh
 source cloudlab_env.sh
-export WORKFLOW_NODE="${WORKFLOW_NODE:-$CLIENT_NODE}"
-export CLIENT_NODE="$WORKFLOW_NODE"
+export WORKFLOW_NODE="$CLIENT_NODE"
 
 ssh -N \
   -o ExitOnForwardFailure=yes \
@@ -217,6 +303,8 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
   "curl --connect-timeout 5 --max-time 10 -fsS \
   http://127.0.0.1:18080/v1/models | python3 -m json.tool"
 ```
+
+通过标准：输出包含非空的 `data[0].id`。
 
 将返回结果中的 `data[0].id` 设为模型：
 
@@ -330,42 +418,35 @@ EOF
 
 #### 4.4 每次运行前检查
 
-查看当前后端：
+选择本次 workflow 的环境文件：
 
 ```zsh
-ssh "$SSH_USER@$WORKFLOW_NODE" '
-  for file in .env.genomas .env.scilink; do
-    path="$HOME/pi-ebpf-tracing-handoff/$file"
-    [[ -f "$path" ]] || continue
-    set -a; source "$path"; set +a
-    printf "%s vendor=%s model=%s base=%s\n" \
-      "$file" "${GENOMAS_VENDOR:-${SCILINK_VENDOR:-}}" \
-      "${GENOMAS_MODEL:-${SCILINK_MODEL:-}}" "${OPENAI_BASE_URL:-default}"
-    unset GENOMAS_VENDOR SCILINK_VENDOR GENOMAS_MODEL SCILINK_MODEL OPENAI_BASE_URL
-  done
-'
+REMOTE_ENV=".env.genomas"  # SciLink 改为 .env.scilink
 ```
 
-OpenAI：
+验证配置和 endpoint：
 
 ```zsh
-ssh "$SSH_USER@$WORKFLOW_NODE" \
-  '! grep -q "^export OPENAI_BASE_URL=" pi-ebpf-tracing-handoff/.env.genomas &&
-   ! grep -q "^export OPENAI_BASE_URL=" pi-ebpf-tracing-handoff/.env.scilink'
+ssh "$SSH_USER@$WORKFLOW_NODE" "bash -s -- '$REMOTE_ENV'" <<'REMOTE'
+set -euo pipefail
+source "$HOME/pi-ebpf-tracing-handoff/$1"
+vendor="${GENOMAS_VENDOR:-${SCILINK_VENDOR:-}}"
+model="${GENOMAS_MODEL:-${SCILINK_MODEL:-}}"
+key="${OPENAI_API_KEY_1:-${OPENAI_API_KEY:-}}"
+base="${OPENAI_BASE_URL:-${OPENAI_API_BASE:-}}"
+test -n "$vendor" && test -n "$model" && test -n "$key"
+if [[ "$vendor" == "OpenAI" ]]; then
+  test -z "$base"
+else
+  test -n "$base"
+  curl -fsS "${base%/}/models" >/dev/null
+fi
+printf 'backend-ok vendor=%s model=%s base=%s\n' \
+  "$vendor" "$model" "${base:-default}"
+REMOTE
 ```
 
-FreeInference 或 vLLM：
-
-```zsh
-ssh "$SSH_USER@$WORKFLOW_NODE" '
-  set -a
-  source pi-ebpf-tracing-handoff/.env.genomas
-  set +a
-  curl -fsS "${OPENAI_BASE_URL%/}/models" >/dev/null
-'
-```
-
-后端检查通过后，代码未变化时前往第 6 节。代码变化时先执行第 5 节。
+通过标准：输出 `backend-ok` 及正确的 vendor、model 和 base。代码未变化时前往第 6 节，代码变化时先执行第 5 节。
 
 ### 5. 修改代码后同步整个仓库
 
@@ -382,16 +463,14 @@ rsync -az --delete \
 
 ```zsh
 ssh "$SSH_USER@$WORKFLOW_NODE" \
-  'cd pi-ebpf-tracing-handoff && bash -n scripts/trace_script_bcc_genomas.sh scripts/trace_script_bcc_scilink.sh'
+  'cd pi-ebpf-tracing-handoff && bash -n scripts/trace_script_bcc_genomas.sh scripts/trace_script_bcc_scilink.sh && echo sync-ok'
 ```
 
-成功后前往第 6 节。
+通过标准：输出 `sync-ok`。只运行其他 workflow 时，将对应 trace 脚本加入 `bash -n` 参数。通过后前往第 6 节。
 
 ### 6. 每次运行
 
 结果目录由 trace 脚本命名，格式为 `<Workflow>_<task>_<时间戳>`，例如 `GenoMAS_A_c2_w1_20260806_101500`。多个 task 的运行写作 `<Workflow>_<N>tasks_<时间戳>`。目录名和报告统一使用 `America/New_York`，不受 Workflow 节点或 Mac 的系统时区影响。命名逻辑在 `scripts/lib_results.sh` 的 `run_dir_name`。
-
-使用 vLLM 时，每个 agentic workflow cell 默认先调用 `/reset_prefix_cache`，因此同一批次中的 task 不会继承前一个 task 的前缀缓存。vLLM 必须以 `VLLM_SERVER_DEV_MODE=1` 启动。清理失败时 trace 脚本直接停止，不会生成来源不明的热缓存结果。只有明确研究热缓存时才设置 `VLLM_KEEP_PREFIX_CACHE=1`。
 
 远端日志目录。每个新 Workflow cluster 建一次即可，已经建过的节点可以跳过；重复执行无副作用：
 
@@ -406,7 +485,7 @@ ssh "$SSH_USER@$WORKFLOW_NODE" 'mkdir -p "$HOME/logs"'
 可选 workload：
 
 ```text
-A_c1_w1,A_c2_w1,A_c2_w2,A_c3_w2,A_c4_w2,A_c4_w4,A_c8_w4
+A_c1_w1,A_c2_w1,A_c3_w1,A_c4_w1,A_c8_w1,A_c2_w2,A_c3_w2,A_c4_w2,A_c4_w4,A_c8_w4
 B_t1_w2,B_t2_w2,B_t4_w2
 full_c1_w2
 ```
@@ -415,7 +494,7 @@ full_c1_w2
 
 ```zsh
 : "${VLLM_URL:?先 export VLLM_URL=http://127.0.0.1:18080；使用 OpenAI 或 FreeInference 时跳过此检查}"
-RUN_WORKLOADS="A_c2_w1"
+RUN_WORKLOADS="A_c3_w1,A_c4_w1,A_c8_w1"
 REMOTE_LOG="logs/genomas_${RUN_WORKLOADS}_$(date +%Y%m%d_%H%M%S).log"
 ssh "$SSH_USER@$WORKFLOW_NODE" \
   "cd pi-ebpf-tracing-handoff &&
@@ -428,8 +507,6 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
 
 空的 `RUN_WORKLOADS` 运行全部 11 个 cell。
 
-以上命令用于 vLLM。`VLLM_URL` 让 trace 脚本在每个 cell 前清空前缀缓存，并通过 Prometheus 计数器测量命中率。未传入该变量时，vLLM 的 `realized` 值表示未测量。使用 OpenAI 或 FreeInference 时，删除变量检查和远端命令中的 `VLLM_URL='$VLLM_URL'`。这两个后端通过响应中的 `cached_tokens` 上报缓存使用量。
-
 #### 6.2 SciLink
 
 可选 workload：
@@ -438,7 +515,7 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
 eels_plasmons_basic
 eels_identification_basic
 polycrystalline_grains_basic
-planning_critical_materials
+# planning_critical_materials
 ```
 
 以普通 SSH 用户启动 SciLink 的 trace 脚本。脚本会单独用 `sudo` 启动 BCC tracer。不要为整个脚本添加 `sudo`，否则模型缓存会写入 `/root`，脚本也会直接退出。命令中的 `sudo -n true` 只检查免密 sudo 是否可用。
@@ -469,8 +546,6 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
      >\"\$HOME/$REMOTE_LOG\" 2>&1 </dev/null &
    echo PID=\$! LOG=\$HOME/$REMOTE_LOG"
 ```
-
-`VLLM_URL` 用于在每个 cell 前清空前缀缓存并测量整个 cell 的命中率，结果写入 `vllm_cache_realized.json`。`SCILINK_FORCE_STREAM=1` 用于测量每次调用的 TTFT 和 TPOT。使用 OpenAI 时，只删除变量检查和远端命令中的 `VLLM_URL='$VLLM_URL'`。
 
 Launcher 会拦截重试循环。连续发送 20 次相同 prompt 时，进程以退出码 3 终止。`SCILINK_MAX_REPEAT_CALLS` 可以修改该阈值，设为 0 可关闭检查。`SCILINK_MAX_CALLS` 限制总调用数，默认值 0 表示不限制。
 
@@ -521,8 +596,12 @@ cd "$HOME/pi-ebpf-tracing-handoff"
 PYTHONPATH="$PWD/src" "$ROOT/trace-venv/bin/python" \
   -m agent_io_tracing.adapters.montage.prepare_input \
   --size-deg "$SIZE" --output "$ROOT/input/m17_${TAG}"
+test -n "$(find "$ROOT/input/m17_${TAG}" -type f -print -quit)"
+echo "input-ready: $ROOT/input/m17_${TAG}"
 REMOTE
 ```
+
+通过标准：输出 `input-ready:` 和对应目录。
 
 准备完成后启动：
 
@@ -547,6 +626,8 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
 规模为 `0p10`、`0p25` 和 `0p50`。每个规模有 `r1`、`r2` 和 `r3`。
 
 启动成功后保留当前 terminal 中的 `REMOTE_LOG`，前往第 7 节。
+
+四种启动命令的通过标准相同：立即输出非空的 `PID=` 和 `LOG=`。这只证明后台进程已创建，最终结果必须按第 7 节判断。
 
 ### 7. 查看进度
 
@@ -618,8 +699,16 @@ for cell in "$LOCAL_RUN"/*; do
   tail -1 "$cell/bcc.err" | grep -q 'lost_events=0' || failed=1
 done
 (( cells > 0 )) || failed=1
-(( failed == 0 )) && open "$LOCAL_RUN"/*/visualizations/index.html
+if (( failed == 0 )); then
+  echo "verified: $cells cells"
+  open "$LOCAL_RUN"/*/visualizations/index.html
+else
+  echo "verification failed" >&2
+  exit 1
+fi
 ```
+
+通过标准：输出 `verified: <数量> cells`，并打开每个 cell 的报告。任何必需文件为空或 `lost_events` 非零都会返回非零退出码。
 
 不要按目录时间猜测结果。若当前 terminal 已关闭，设置 `REMOTE_LOG="logs/<日志名>.log"` 后重新执行第 7 节末尾的读取命令。
 
@@ -635,9 +724,12 @@ PYTHONPATH=src python3 -m agent_io_tracing.analysis.kvcache.server_tokens \
 PYTHONPATH=src python3 -m agent_io_tracing.analysis.kvcache.report \
   --results results --runs "$RUN_NAME" --dump-prefixes
 PYTHONPATH=src python3 -m agent_io_tracing.analysis.results_index --results results
+test -s "results/$RUN_NAME/server_tokens.json" 2>/dev/null || \
+  find "results/$RUN_NAME" -mindepth 2 -maxdepth 2 -name server_tokens.json -size +0 -print -quit | grep -q .
+test -s results/index.html && echo kvcache-report-ready
 ```
 
-第一条为每个 cell 写入 `server_tokens.json`。第二条重算当前 run 的指标和图表。第三条刷新总索引。没有 `server_tokens.json` 的 cell 继续使用 tiktoken，因此不会改变 OpenAI 和 FreeInference 的既有结果。
+通过标准：输出最后一行为 `kvcache-report-ready`。第一条为每个 cell 写入 `server_tokens.json`，第二条重算当前 run，第三条刷新总索引。没有 `server_tokens.json` 的 cell 继续使用 tiktoken。
 
 ### 9. 固定输入测试
 
@@ -676,9 +768,12 @@ PYTHONPATH=src python3 -m agent_io_tracing.replay.bundle \
   --output "$BUNDLE" \
   --url "$MAC_VLLM_URL" \
   --model "$VLLM_SERVED_MODEL"
+python3 -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x' "$BUNDLE" && echo bundle-ready
 ```
 
 命令使用 vLLM 的 `/tokenize` 接口生成 prompt token ID。`--limit N` 只打包前 N 个请求，适合检查链路，不能用于正式结果。
+
+通过标准：输出最后一行为 `bundle-ready`。
 
 一个 sweep 的所有 arm 必须使用同一个 `BUNDLE`。文件名包含 `$RUN_NAME` 的时间戳，不需要另外创建 bundle ID。
 
@@ -693,6 +788,8 @@ PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep arm \
   --sweep-dir "$SWEEP_DIR" \
   --url "$MAC_VLLM_URL"
 ```
+
+通过标准：进度到达 `completed <总数>/<总数> requests`，命令退出码为 0，新增 arm 的 `rep0/summary.json` 非空。
 
 命令在前台运行，并实时显示 arm 名称、repetition 和已完成请求数：
 
@@ -734,10 +831,13 @@ replay: completed 11/11 requests
 ```zsh
 PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep report \
   --sweep-dir "$SWEEP_DIR"
+test -s "$SWEEP_DIR/kvcache_report.html"
+test -s results/index.html
+echo report-ready
 open results/index.html
 ```
 
-命令生成 `$SWEEP_DIR/kvcache_report.html`，并自动刷新 `results/index.html`。总索引的 `Fixed-input tests` 表按测试目录分组，显示每个 arm 的总输入、总输出、缓存命中率、TTFT、TPOT、请求延迟和墙钟时间，并链接到完整报告。完整报告还包含 server config、对比图和每个 repetition 的原始文件。`sweep.html` 作为旧链接的兼容入口保留。
+通过标准：输出 `report-ready` 并打开总索引。命令生成 `$SWEEP_DIR/kvcache_report.html`，刷新 `results/index.html`。总索引显示每个 arm 的输入、输出、缓存命中率、TTFT、TPOT、请求延迟和墙钟时间，并链接到完整报告。
 
 `median request latency` 是从发出请求到收完响应的请求耗时中位数。`wall` 是整组请求从开始到全部完成的墙钟时间。
 
@@ -749,252 +849,162 @@ TTFT 在 Mac 上测量，包含 Mac 到 Perlmutter 的隧道延迟。所有 arm 
 
 
 
-## 第二部分：研究概述
+## 第二部分：研究设计
 
 
 
-### 1. 研究动机
+### 1. 目标与范围
 
-传统科学工作流通常具有固定的 DAG、明确的任务依赖和稳定的生产者—消费者数据流。因此，已有研究主要通过任务结构、文件复用、访问类型、操作次数、数据流规模和带宽解释工作流的 I/O 行为。
+本项目回答一个问题：LLM agent 控制科学工作流时，探索、重试和动态工具选择会增加多少文件系统 I/O？
 
-Agentic scientific workflow 的执行路径还受 LLM agent 的运行时决策影响。Agent 可以选择工具、检查文件、重试失败步骤、调试错误，并配置下游科学任务。部分 agentic workflow 用于处理过去依赖人工判断的任务，本身没有可直接对照的传统工作流。
+研究对象是 agent 与科学任务产生的文件系统 I/O。模型加载、KV cache paging、模型 offloading 和 serving 内部存储不在范围内。固定输入重放只用于解释推理缓存，不纳入文件系统 I/O 对比。
 
-本项目研究真实部署的 agentic scientific workflow，区分其从传统科学工作流继承的 I/O 行为与 agent 执行引入或改变的 I/O 行为。研究不要求每个目标系统都存在传统工作流对照。
+### 2. 研究问题
 
-### 2. 核心研究问题
-
-当 LLM agent 执行科学工作流时会产生哪些 I/O 模式？这些模式与固定 DAG 的传统科学工作流有何不同？
-
-具体问题包括：
-
-- 正常科学任务产生多少 I/O？
-- 探索、调试、重试和重复读取等 agent 行为引入多少 I/O？
-- 可证明为次优的配置产生多少 I/O？这些配置可能来自 agent 生成的代码，也可能来自工作流的固定脚本。
-- 同一科学目标在重复运行中的 I/O footprint 有多稳定？其中多少变化可归因于 agent 行为？
+1. 每个 workflow 的读写字节、操作数、元数据操作和文件数是多少？
+2. 其中多少来自 agent 的探索、检查、失败和重试？
+3. 次优 I/O 配置来自 agent 生成代码还是固定脚本？
+4. 同一任务重复运行时，I/O 总量和归因结果是否稳定？
+5. 有传统脚本基线时，agentic 运行增加了哪些 I/O？
 
 
 
-### 3. 研究范围
-
-本项目分析 agent 行为和科学任务执行产生的文件系统 I/O。以下内容不在研究范围内：
-
-- LLM 模型加载
-- KV cache paging
-- 模型 offloading
-- LLM serving 系统内部的存储行为
-
-本项目将 LLM 视为工作流控制器，而非待刻画的存储负载。
-
-#### 3.1 结果存储规范
-
-仓库中的持久化本地结果统一存放在：
-
-```text
-results/
-```
-
-每次追踪使用以下目录结构：
-
-```text
-results/<run_id>/<workload>/
-```
-
-`<run_id>` 由 `scripts/lib_results.sh` 的 `run_dir_name` 生成，格式为 `<Workflow>_<task>_<时间戳>`；`<workload>` 是被追踪的 cell 或用例。每个 cell 的完整结果必须保存在同一目录，包括 `ebpf_events.log`、`parsed.json`、`pi_events.jsonl`、`tool_calls.log`、`phase1_metrics.json`、`lineage/`、`visualizations/`，以及 `scilink_session/` 或 `work/` 等系统专用目录。
-
-`remote_results/` 只能作为从 CloudLab 或其他远端机器传输结果时的临时缓存。验证后的持久化结果必须移至 `results/`，随后删除临时副本。
-
-远端机器在 Lustre 上使用相同的逻辑入口：
-
-```text
-/mnt/lustrefs/<user>/pi-ebpf-tracing-handoff/results/
-```
-
-CloudLab client 不得将新的追踪结果写入仓库 checkout、home 目录或根文件系统。新的追踪脚本应将 `BASE_OUT` 默认为 `$(default_lustre_results_root)/$(run_dir_name <Workflow> $(selected_task_names))`。拉回的本地副本必须保持 `results/<run_id>/<workload>/` 结构。
-
-### 4. 目标系统与编排固定度
-
-不同 agentic scientific workflow 的执行路径固定程度差异很大。本项目将编排固定度视为独立变量，不把所有 agentic workflow 当作同一类系统，也不强制为每个系统寻找传统工作流基线。
-
-对目标仓库的直接检查得到以下结论：
-
-- **GenoMAS**：用于基因表达分析、GEO/TCGA 预处理和回归。每个 agent 角色都按照 `prompts/action_units/base/*.json` 中的有序 Action Units 运行。Agent 决定每个固定阶段生成什么代码，但不决定阶段及其顺序。`environment.py` 中的 trait、condition、cohort、checkpoint 和目录管理均由确定性 Python 代码执行。
-- **SRAgent** 与 **ChemGraph**：分别用于 NCBI/SRA 元数据处理和 XANES 模拟。两者都使用 LangGraph ReAct 风格的 supervisor。Supervisor 根据消息历史在运行时选择下一个子 agent 或工具，没有固定阶段列表。工具调用数量和顺序也是运行时决策。
-- **SciLink**：用于显微和材料表征。其 autonomous 模式包含 `best_of_n_orchestrator`、`refinement_loop` 和 `multiskill_autoselect`。分析技能的选择和 refinement 次数均由 agent 在运行时决定。
-- **CMBAgent**：基于 AG2/AutoGen 的通用多 agent 科研系统。`planning_and_control` 模式先由 `planner` 与 `plan_reviewer` 在 `max_n_attempts` 范围内生成有序计划，再由 `control` 或 `controller` 逐步分派给 `engineer`、`researcher` 或领域 agent。计划结构由 LLM 动态生成，但执行阶段相对固定。`one_shot` 模式没有规划阶段，适合作为低成本的首次集成目标。
-
-GenoMAS 位于固定端，SRAgent、ChemGraph 和 autonomous SciLink 位于动态端，CMBAgent 的 `planning_and_control` 模式位于两者之间。实验报告必须标明每个系统的编排固定度。
-
-### 5. I/O 归因类别
-
-每个观测到的 I/O 单元只能归入以下三类之一。分类依据是该 I/O 的具体成因，不需要构造全局最优基线或“必要 I/O 下限”。
-
-#### 5.1 Agent-induced I/O
-
-这类 I/O 由本次运行中的 agent 行为产生。在任务和配置相同的条件下，行为不同的 agent 不一定会产生这些 I/O。
-
-典型实例包括：
-
-- 代码执行失败后的重复调试和重试
-- 同一任务内对同一文件的冗余读取
-- 读取错误日志
-- 多次检查中间结果
-- 被放弃的代码尝试留下的文件
-
-较高的 agent-induced I/O 表明 agent 尚不能用少量直接步骤完成任务，或现有文件系统和工具接口不适合 agent 的搜索、验证与错误恢复方式。这一现象本身就是研究结果。
-
-#### 5.2 Task-misconfigured I/O
-
-同一任务语义存在更优配置，且当前配置可证明产生了更高 I/O 成本时，相关 I/O 归入此类。检测标准只判断配置是否次优，不判断配置来源。
-
-确认实例后，再标记其来源：
-
-- **agent-caused**：次优选择来自本次运行中 agent 生成的代码。例如，使用逐文件 POSIX 读取而不使用已有的批处理接口，或反复解析大型原始文件而不缓存结果。
-- **script-caused**：次优选择来自工作流固定的编排代码或工具代码，因此每次运行都会出现。例如，GenoMAS 的 `environment.py` 在每次 cohort 循环中调用 `os.listdir()`，或 `tools/preprocess.py` 的 `validate_and_save_cohort_info` 在每个 cohort 完成后持有 `fcntl` 锁执行完整 JSON 的读取、修改和写回。
-
-比较 agent-caused 和 script-caused 的发生率，可以判断 agent 生成代码是否比人工编写的固定脚本引入更多配置问题。
-
-#### 5.3 Workflow task-induced I/O
-
-排除前两类后，剩余 I/O 归入此类。它包括读取必要输入数据和写入最终结果等行为。该类别由排除法定义，不代表已经计算出任务的绝对最小 I/O。
-
-### 6. 指标
+### 3. 目标系统
 
 
+| 系统                 | 编排方式                           | 实验标签 |
+| ------------------ | ------------------------------ | ---- |
+| GenoMAS            | 固定 Action Unit 顺序，agent 生成阶段代码 | 固定   |
+| CMBAgent           | LLM 生成计划，控制器按计划分派              | 半动态  |
+| SRAgent            | Supervisor 动态选择子 agent 和工具     | 动态   |
+| ChemGraph          | Supervisor 动态选择子 agent 和工具     | 动态   |
+| SciLink autonomous | 动态选择技能并决定 refinement 次数        | 动态   |
 
-#### 6.1 通用 I/O 指标
 
-以下指标覆盖所有 I/O，并按三类归因结果聚合：
+每份实验报告必须记录系统、版本、模型、任务、编排标签、worker 数、输入规模和重复编号。
 
-- 读写字节数
-- 读写操作数
+### 4. I/O 归因
+
+每个 I/O 单元只归入一类：
+
+
+| 类别                    | 判定标准                     | 例子                 |
+| --------------------- | ------------------------ | ------------------ |
+| Agent-induced         | 没有本次 agent 行为就不会发生       | 重试、读错误日志、重复检查、废弃输出 |
+| Task-misconfigured    | 保持任务语义不变时，存在已验证的低 I/O 配置 | 逐文件读取、重复解析、频繁重写元数据 |
+| Workflow task-induced | 不属于前两类                   | 读取输入、写最终结果         |
+
+
+Task-misconfigured 再标记来源：`agent-caused` 表示配置来自 agent 生成代码，`script-caused` 表示配置来自固定脚本。只有补丁前后实验或等价的局部反事实证明 I/O 降低后，才能标记为 Task-misconfigured。
+
+### 5. 指标
+
+所有运行报告以下指标：
+
+- 读写字节和操作数
 - 元数据操作数
-- 访问的唯一文件数
-- 小文件访问数和小 I/O 操作数
-- I/O 时间、有效带宽和 duty cycle
-- 读写比
+- 唯一文件数
+- 小文件数和小 I/O 操作数
+- I/O 时间、有效带宽、读写比和 duty cycle
+- 目录扫描、失败的 `open` 和 `stat`、重复读取、错误日志读取和输出检查次数
+- 三类归因的字节数、操作数和占比
 
-Duty cycle 定义为：
+Duty cycle 为读写系统调用时间区间并集除以对应 wall time。全局指标使用运行 wall time。Phase 和 role 指标使用各自时间区间。
 
-```text
-|union(read/write syscall intervals)| / group wall-clock time
+同一任务至少重复三次，并报告均值、标准差和变异系数。样本不足三次时只报告原始值，不做稳定性结论。
+
+### 6. 实验设计
+
+
+
+#### 6.1 采集验证
+
+先运行最小 workload。只有第 7 节的结构、trace 和指标检查全部通过，才扩大输入或增加 workflow。
+
+#### 6.2 归因
+
+用 `pi_events.jsonl` 和 `tool_calls.log` 中的时间区间连接 `parsed.json` 的 I/O 事件。无法从 provenance 证明成因的事件保留为 Workflow task-induced，并在报告中记录限制。
+
+#### 6.3 对比
+
+- 有相同科学目标的传统实现时，对比传统实现与 agentic 实现。
+- 没有传统实现时，只比较同一系统、任务和输入的重复运行。
+- 次优配置使用补丁前后对比。除待测配置外，输入、worker 数、模型和运行环境保持一致。
+
+
+
+#### 6.4 优化案例
+
+只选择证据完整且可复现的案例。每个案例必须给出原始配置、修改内容、语义等价检查和 I/O 差值。
+
+### 7. 输出与验收
+
+本地结果固定存放在 `results/<run_id>/<workload>/`。远端结果固定存放在 `/mnt/lustrefs/<user>/pi-ebpf-tracing-handoff/results/`。`remote_results/` 只作临时传输目录。
+
+每个 cell 必须包含以下输出：
+
+
+| 输出                          | 用途        | 通过标准                   |
+| --------------------------- | --------- | ---------------------- |
+| `manifest.json`             | 运行配置      | 文件非空且 JSON 可解析         |
+| `ebpf_events.log`           | 原始 trace  | 文件非空                   |
+| `parsed.json`               | 解析后的 I/O  | 文件非空且 JSON 可解析         |
+| `phase1_metrics.json`       | 聚合指标      | 文件非空且 JSON 可解析         |
+| `bcc.err`                   | tracer 状态 | 最后一行包含 `lost_events=0` |
+| `visualizations/index.html` | 单 cell 报告 | 文件非空                   |
+
+
+GenoMAS 和 SciLink 还必须包含 `pi_events.jsonl` 和 `tool_calls.log`。`pi_events.jsonl` 的每个非空行必须是合法 JSON。
+
+拉回结果后，在 Mac 执行：
+
+```zsh
+RUN_DIR="results/$RUN_NAME"
+PYTHONPATH=src python3 -m agent_io_tracing.analysis.results_index --results results
+
+RUN_DIR="$RUN_DIR" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+run = Path(os.environ["RUN_DIR"])
+required = [
+    "manifest.json",
+    "ebpf_events.log",
+    "parsed.json",
+    "phase1_metrics.json",
+    "bcc.err",
+    "visualizations/index.html",
+]
+cells = [p for p in run.iterdir() if (p / "manifest.json").is_file()]
+assert cells, f"no cells in {run}"
+for cell in cells:
+    for rel in required:
+        path = cell / rel
+        assert path.exists(), f"missing: {path}"
+        assert path.stat().st_size > 0, f"empty: {path}"
+    for rel in ("manifest.json", "parsed.json", "phase1_metrics.json"):
+        json.loads((cell / rel).read_text())
+    manifest = json.loads((cell / "manifest.json").read_text())
+    if manifest.get("workload") in {"GenoMAS", "SciLink"}:
+        for rel in ("pi_events.jsonl", "tool_calls.log"):
+            assert (cell / rel).exists(), f"missing: {cell / rel}"
+        for line in (cell / "pi_events.jsonl").read_text().splitlines():
+            if line.strip():
+                json.loads(line)
+    assert "lost_events=0" in (cell / "bcc.err").read_text().splitlines()[-1]
+print(f"verified {len(cells)} cells in {run}")
+PY
+
+test -s results/index.html && echo index-ready
 ```
 
-全局指标使用整个运行的 wall time。Phase 和 role 指标使用 tool-call 时间区间的并集。Inference-busy 和 inference-idle 指标分别使用 LLM 时间区间并集与剩余运行时间。
+通过标准：脚本输出 `verified <数量> cells` 和 `index-ready`，退出码为 0。检查失败的 run 不进入分析。
 
-#### 6.2 Agent-induced I/O 指标
+### 8. 交付结果
 
-- 目录扫描数
-- 失败的 `open` 和 `stat` 数
-- 同一文件和同一版本文件的重复读取数
-- 错误日志读取数
-- 输出检查数
-- 重试产生的 I/O 字节数和操作数
-- 临时文件数
-- 废弃 artifact 数
-- 冗余读取比例
-- 非生产性 I/O 比例
+项目最终交付三类结果：
 
-
-
-#### 6.3 Task-misconfigured I/O 指标
-
-目标系统运行在使用共享或并行文件系统的真实 HPC 集群上，包括 CloudLab、DARWIN 和 RCCS 上的 Lustre。以下指标默认适用于所有目标系统。每个系统需要确认 I/O 实际落在本地 scratch 还是 Lustre。
-
-- I/O 接口，包括 POSIX、批处理库调用和适用场景中的 parallel I/O
-- 输出文件数和平均文件大小
-- checkpoint 和元数据写入频率
-- scratch 与共享或并行文件系统之间的存储位置选择
-- 多 worker 或多 rank 任务的 I/O 规模与时间不均衡
-- agent-caused 与 script-caused 的比例
-
-多 worker 场景包括 GenoMAS 的 `--parallel-mode cohorts` 和 ChemGraph 的 ensemble 或 FDMNES 运行。
-
-#### 6.4 运行间方差指标
-
-这些指标用于衡量同一科学目标重复运行时的 I/O 可预测性，并判断方差来自 agent-induced、task-misconfigured 还是 workflow task-induced I/O：
-
-- 总 I/O 字节数和操作数方差
-- 元数据操作数方差
-- 唯一文件数方差
-- 三类归因结果各自的 I/O 方差
-- I/O 时间方差
-- 总运行时间方差
-
-
-
-### 7. 研究流程
-
-
-
-#### Phase 1：完整采集指标
-
-先在真实目标系统上验证第 6 节的指标。初始验证使用低成本的小规模实验，例如 GenoMAS 对 1 至 2 个 trait 或 cohort 的 quick test。只有确认现有 eBPF/BCC 基础设施能够提取所需指标后，才能扩大实验规模并接入更多系统。
-
-GenoMAS 完整运行需要 3 至 5 天，成本超过 300 美元，因此必须先完成低成本验证。
-
-#### Phase 2：基于 provenance 的归因
-
-将原始 I/O trace 与 tool call 或 Action Unit 的时间区间结合，把每个被标记的 I/O 结果归入 agent-induced、task-misconfigured 或 workflow task-induced。
-
-时间关联可以使用目标系统的执行日志，也可以使用仓库现有的时间窗口匹配逻辑。具体实现不改变三类归因框架。
-
-#### Phase 3：优化案例
-
-选择少量证据最充分的实例，展示修复方法和 I/O 改善。优先选择 script-caused 的 task-misconfigured I/O，因为这类路径是确定性的，一次修复可作用于后续所有运行，也便于进行清晰的前后对比。
-
-### 8. 关键对比
-
-
-
-#### 8.1 传统脚本工作流与 agentic workflow
-
-只有在同一科学目标确实存在传统脚本实现时，才进行直接对比。该对比用于识别 agentic 编排引入的额外 I/O。
-
-对于 GenoMAS 等没有直接传统对照的系统，比较两类执行特征：
-
-- 传统工作流：固定 DAG、稳定的生产者—消费者边和稳定的 I/O 模式
-- Agentic workflow：动态执行路径、更多文件探索、更高元数据量和更高运行间方差
-
-
-
-#### 8.2 同一目标的重复 agent 运行
-
-对同一 prompt 运行多次，衡量 I/O 的可预测性，并判断变化来自 agent 行为还是底层任务与配置。
-
-#### 8.3 次优配置的局部反事实对比
-
-Task-misconfigured I/O 不需要全局推荐配置作为基线。只需证明修复某个具体实例后，在保持任务语义不变的条件下降低了 I/O。
-
-Script-caused 实例使用补丁前后对比。Agent-caused 实例可以比较重复运行中采用和未采用次优配置的结果。
-
-### 9. 预期发现
-
-- 真实 agentic scientific workflow 中存在不可忽略的 agent-induced I/O。其占比反映 agent 可靠性及文件系统和工具接口是否适合 agent 的访问模式。
-- 在重复运行中，agent-induced I/O 的方差高于 task-misconfigured 和 workflow task-induced I/O。
-- Agent 生成代码与工作流固定脚本都可能产生 task-misconfigured I/O。比较两者的发生率，可以判断 agent 生成代码是否构成额外的配置错误来源。
-- 编排更动态的 SRAgent、ChemGraph 和 autonomous SciLink 可能比固定 Action Unit 序列的 GenoMAS 表现出更高的 I/O 运行间方差。
-
-
-
-### 10. 主要贡献
-
-本项目的主要贡献不是提出单个新指标，而是：
-
-1. 刻画 GenoMAS、SRAgent、ChemGraph、SciLink 和 CMBAgent 等真实 agentic scientific workflow 的 I/O 行为，并覆盖不同的编排固定度。
-2. 提出基于 provenance 的三类 I/O 归因框架，将 agent 行为、次优配置和工作流任务本身产生的 I/O 分开。次优配置进一步标记为 agent-caused 或 script-caused。
-3. 通过少量具体案例，量化修复次优配置后的 I/O 改善。
-
-
-
-### 11. 与既有工作的关系
-
-传统 HPC I/O characterization 研究分析大规模系统中的访问模式、文件复用、共享行为、读写特征、带宽、操作数和方差。Workflow-centric 研究进一步把这些行为与 DAG、阶段和生产者—消费者关系关联起来。
-
-本项目沿用这些分析方法，但研究对象具有新的执行特征：
-
-- 执行路径可能由 agent 动态生成，不同系统的动态程度不同。
-- 同一科学目标在重复运行中可能产生不同的 I/O footprint。
-- Agent 可能引入探索、调试、重试和冗余读取。
-- Agent 生成代码和人工编写的固定脚本都可能造成 I/O 次优配置。
-
-因此，本项目关注 agentic execution 条件下的 I/O 行为，而非只分析固定工作流。
+1. 不同编排固定度下的 I/O 测量结果。
+2. Agent-induced、Task-misconfigured 和 Workflow task-induced 的归因结果。
+3. 可复现的优化案例及补丁前后差值。

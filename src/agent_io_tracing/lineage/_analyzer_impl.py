@@ -1356,12 +1356,11 @@ def fig_io_volume_summary(summary: dict, out_path: Path):
 _CHROM_SAMPLE_RE = re.compile(r"^chr[0-9xym]+\.(hg|na)\d+")
 
 
-def io_kind(path: str, category: str | None = None) -> str:
+def io_kind(path: str) -> str:
     # Coarse, meaning-based buckets (not per-format).  raw_data lumps every bulk
     # scientific/binary format together (gz/tar/fits/vcf/npy/h5/...).  Anything
     # we cannot type by extension is "other" -- we deliberately do NOT fall back
     # to the storage-role category, so the label stays a pure file-type axis.
-    # `category` is accepted only for call-site compatibility and is unused.
     if not path:
         return "other"
     base = path.rsplit("/", 1)[-1].lower()
@@ -1443,8 +1442,7 @@ def fig_size_distribution(io_events: list[dict], per_artifact: dict, out_path: P
     read_kind = defaultdict(Counter)
     write_kind = defaultdict(Counter)
     for e in io_events:
-        cat = per_artifact.get(e["path"], {}).get("category")
-        k = io_kind(e["path"], cat)
+        k = io_kind(e["path"])
         idx = darshan_bin_index(e["size"])
         (read_kind if e["kind"] == "R" else write_kind)[idx][k] += 1
     for i in x:
@@ -1467,7 +1465,7 @@ def fig_size_distribution(io_events: list[dict], per_artifact: dict, out_path: P
             continue
         if size > 0:
             file_sizes.append(size)
-            file_kind[darshan_bin_index(size)][io_kind(path, rec.get("category"))] += 1
+            file_kind[darshan_bin_index(size)][io_kind(path)] += 1
     fh = darshan_hist(file_sizes)
     vals = [fh[l] for l in DARSHAN_SIZE_LABELS]
     if any(vals):

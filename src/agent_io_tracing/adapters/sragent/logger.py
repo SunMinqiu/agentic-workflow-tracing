@@ -173,17 +173,21 @@ def _normalize_usage(llm_output: dict | None) -> dict:
         or usage.get("output")
         or 0
     )
-    cache = (
-        usage.get("cache_read_input_tokens")
-        or usage.get("cache_read")
-        or usage.get("cacheRead")
-        or 0
-    )
+    cache = 0
+    cache_available = False
+    for name in ("cache_read_input_tokens", "cached_tokens", "cache_read", "cacheRead"):
+        value = usage.get(name)
+        if value is not None:
+            cache = int(value)
+            cache_available = True
+            break
     total = usage.get("total_tokens") or usage.get("totalTokens") or (int(inp) + int(out))
     return {
         "input": int(inp or 0),
         "output": int(out or 0),
         "cacheRead": int(cache or 0),
+        "cacheReadAvailable": cache_available,
+        "cacheReadSource": "response" if cache_available else None,
         "totalTokens": int(total or 0),
     }
 

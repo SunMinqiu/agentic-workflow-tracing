@@ -91,7 +91,7 @@ def _field(obj: Any, *names: str) -> Any:
     return None
 
 
-def _cached_tokens_from_raw(genomas_result: dict) -> int:
+def _cached_tokens_observation(genomas_result: dict) -> tuple[int, bool]:
     """Dig the provider's prompt-cache hit out of the raw response.
 
     GenoMAS's own ``usage`` dict is stripped to input/output/cost, but it also
@@ -102,17 +102,24 @@ def _cached_tokens_from_raw(genomas_result: dict) -> int:
     """
     raw = genomas_result.get("raw_response")
     if raw is None:
-        return 0
+        return 0, False
     usage = _field(raw, "usage")
     if usage is None:
-        return 0
+        return 0, False
     details = _field(usage, "prompt_tokens_details")
     src = details if details is not None else usage
     val = _field(src, "cached_tokens", "cache_read", "cacheRead")
+    if val is None:
+        return 0, False
     try:
-        return int(val or 0)
+        return int(val or 0), True
     except (TypeError, ValueError):
-        return 0
+        return 0, False
+
+
+def _cached_tokens_from_raw(genomas_result: dict) -> int:
+    """Return cached tokens while preserving the legacy integer helper."""
+    return _cached_tokens_observation(genomas_result)[0]
 
 
 def _to_pi_usage(genomas_result: Any) -> dict:
@@ -125,18 +132,23 @@ def _to_pi_usage(genomas_result: Any) -> dict:
     usage = genomas_result.get("usage") or {}
     inp = int(usage.get("input_tokens", 0) or 0)
     out = int(usage.get("output_tokens", 0) or 0)
-    cache = _cached_tokens_from_raw(genomas_result)
-    # vLLM reports no cached_tokens.  The streaming wrapper reads the server's
-    # prefix-cache counters either side of the request instead; use that only
-    # when its own check says the delta belongs to this call alone.
-    if not cache:
+    cache, cache_available = _cached_tokens_observation(genomas_result)
+    # When the response omits cached_tokens, use an attributable per-request
+    # Prometheus delta. An explicit cached_tokens=0 is a real observation and
+    # must not be replaced.
+    cache_source = "response" if cache_available else None
+    if not cache_available:
         measured = genomas_result.get("_trace_cache") or {}
         if measured.get("attributable"):
             cache = int(measured.get("cacheRead") or 0)
+            cache_available = True
+            cache_source = "prometheus_request_delta"
     return {
         "input": inp,
         "output": out,
         "cacheRead": cache,
+        "cacheReadAvailable": cache_available,
+        "cacheReadSource": cache_source,
         "totalTokens": inp + out,
     }
 

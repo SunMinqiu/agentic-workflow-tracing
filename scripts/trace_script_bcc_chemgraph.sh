@@ -215,27 +215,20 @@ for ws_out in "$BASE_OUT"/*/; do
     set +e
     failed_step=""
 
-    "$POST_PYTHON" -m agent_io_tracing.parsing.ebpf "$ws_out" \
-        > "$ws_out/parse.log" 2>&1
+    run_postprocess_module "$POST_PYTHON" "$ws_out" parse_ebpf parse.log \
+        agent_io_tracing.parsing.ebpf "$ws_out"
     PARSE_RC=$?
-    [ $PARSE_RC -ne 0 ] && failed_step="parse_ebpf"
     sed 's/^/    /' "$ws_out/parse.log" | tail -8 || true
 
     if [ -f "$ws_out/parsed.json" ] && [ -f "$ws_out/pi_events.jsonl" ]; then
-        "$POST_PYTHON" -m agent_io_tracing.analysis.summary "$ws_out" \
-            > "$ws_out/summarize.log" 2>&1
-        SUM_RC=$?
-        [ $SUM_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}summarize"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" summarize summarize.log \
+            agent_io_tracing.analysis.summary "$ws_out"
 
-        "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" \
-            > "$ws_out/parallelism.log" 2>&1
-        PAR_RC=$?
-        [ $PAR_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}parallelism"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" parallelism parallelism.log \
+            agent_io_tracing.analysis.parallelism "$ws_out"
 
-        "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" \
-            > "$ws_out/visualize.log" 2>&1
-        VIZ_RC=$?
-        [ $VIZ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}visualize"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" visualize visualize.log \
+            agent_io_tracing.viz.trace "$ws_out"
 
         [ -f "$ws_out/call_dag.html" ] && echo "    DAG HTML: $ws_out/call_dag.html"
         [ -f "$ws_out/parallelism_summary.json" ] && echo "    Metrics:  $ws_out/parallelism_summary.json"
@@ -261,11 +254,7 @@ if [ "$POST_FAIL_COUNT" -gt 0 ]; then
     done
 fi
 
-chmod -R a+rX "$BASE_OUT" || true
-if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
-    chown -R "$SUDO_UID:$SUDO_GID" "$BASE_OUT" 2>/dev/null || true
-    echo "Returned ownership of $BASE_OUT to ${SUDO_USER:-uid=$SUDO_UID}"
-fi
+return_results_ownership "$BASE_OUT"
 
 echo "All done. Results in: $BASE_OUT"
 echo "Look for: visualizations/index.html, call_dag.html, parallelism_summary.json"

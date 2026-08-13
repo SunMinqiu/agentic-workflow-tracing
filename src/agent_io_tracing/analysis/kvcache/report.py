@@ -86,6 +86,8 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
             "median_input": s["input_tokens"].get("median", 0),
             "max_context": s.get("max_context", 0),
             "realized_frac": s["cacheread_fraction"],
+            "cached_tokens": s["total_cacheread_tokens"],
+            "cache_read_available": s.get("cache_read_available", False),
             "out_in": round(s["total_output_tokens"] / max(s["total_input_tokens"], 1), 3),
         })
 
@@ -93,10 +95,11 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
     if lg is not None:
         latency = analyze_latency(lg)
         lg["latency"] = latency
-        # Backends that report cacheRead need nothing here; this fills in only
-        # where the vendor stays silent, and never replaces a reported number.
+        # Prefer complete per-request response data. Fall back to the cell-level
+        # Prometheus delta only when cached_tokens was absent from one or more
+        # responses. An explicit cached_tokens=0 remains a measured zero.
         server_cache = read_server_prefix_cache(cell, row.get("total_input"))
-        if server_cache is not None and not row.get("realized_frac"):
+        if server_cache is not None:
             lg["server_prefix_cache"] = server_cache
             row["server_prefix_cache"] = server_cache
         # Record whether realized was measured at all, so the tables can print
@@ -144,7 +147,6 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
         write_segments_tables(seg, cell)
         row["segments"] = {
             "n_segments": seg["n_segments"],
-            "cache_size_tokens": seg["cache_size_tokens"],
             "prompt_tokens_total": seg["prompt_tokens_total"],
             "content_breakdown": seg["content_breakdown"],
             "content_examples": seg["content_examples"],
@@ -285,7 +287,7 @@ def build_report(
                 + ", ".join(
                     f"`{k}`={serving[k]}"
                     for k in ("cache_dtype", "block_size", "prefix_match_unit",
-                              "enable_prefix_caching", "kv_cache_size_tokens",
+                              "enable_prefix_caching",
                               "num_gpu_blocks", "gpu_memory_utilization")
                     if k in serving
                 )

@@ -90,7 +90,7 @@ bcc_tracer.py ───────► ebpf_events.log
 ## Setup
 
 ```bash
-pip install -r requirements.txt   # matplotlib, numpy, pandas, plotly
+pip install -e '.[dev]'
 ```
 
 External dependencies (install per target, as needed):

@@ -246,23 +246,20 @@ for ws_out in "$BASE_OUT"/*/; do
     NAME="$(basename "$ws_out")"
     failed_step=""
     set +e
-    "$POST_PYTHON" -m agent_io_tracing.parsing.ebpf "$ws_out" >"$ws_out/parse.log" 2>&1
+    run_postprocess_module "$POST_PYTHON" "$ws_out" parse_ebpf parse.log \
+        agent_io_tracing.parsing.ebpf "$ws_out"
     PARSE_RC=$?
-    [ "$PARSE_RC" -ne 0 ] && failed_step="parse_ebpf"
     if [ "$PARSE_RC" -eq 0 ] && [ -f "$ws_out/parsed.json" ]; then
-        "$POST_PYTHON" -m agent_io_tracing.analysis.artifact_sizes "$ws_out" >"$ws_out/artifact_sizes.log" 2>&1
-        STEP_RC=$?
-        [ "$STEP_RC" -ne 0 ] && failed_step="${failed_step:+$failed_step,}artifact_sizes"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" artifact_sizes artifact_sizes.log \
+            agent_io_tracing.analysis.artifact_sizes "$ws_out"
         for module in lineage.analyzer analysis.parallelism analysis.phase1_metrics analysis.execution_units analysis.trace_quality viz.trace; do
             log_name="${module//./_}.log"
-            "$POST_PYTHON" -m "agent_io_tracing.$module" "$ws_out" >"$ws_out/$log_name" 2>&1
+            run_postprocess_module "$POST_PYTHON" "$ws_out" "$module" "$log_name" \
+                "agent_io_tracing.$module" "$ws_out"
             STEP_RC=$?
-            [ "$STEP_RC" -ne 0 ] && failed_step="${failed_step:+$failed_step,}$module"
             if [ "$module" = "lineage.analyzer" ] && [ "$STEP_RC" -eq 0 ]; then
-                "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char \
-                    --results "$ws_out" --runs . >"$ws_out/per_run_io_char.log" 2>&1
-                IO_RC=$?
-                [ "$IO_RC" -ne 0 ] && failed_step="${failed_step:+$failed_step,}per_run_io_char"
+                run_postprocess_module "$POST_PYTHON" "$ws_out" per_run_io_char per_run_io_char.log \
+                    agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs .
             fi
         done
     fi

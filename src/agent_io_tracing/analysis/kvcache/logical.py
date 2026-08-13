@@ -129,6 +129,8 @@ def load_joined_calls(cell: Path) -> list[dict[str, Any]]:
                 "input": int(u.get("input", 0) or 0),
                 "output": int(u.get("output", 0) or 0),
                 "cacheRead": int(u.get("cacheRead", 0) or 0),
+                "cacheReadAvailable": u.get("cacheReadAvailable"),
+                "cacheReadSource": u.get("cacheReadSource"),
                 "phase": o.get("phase") or "(unknown)",
                 "cache_key": o.get("cache_key"),
                 "provider_request_id": o.get("provider_request_id"),
@@ -178,6 +180,8 @@ def load_joined_calls(cell: Path) -> list[dict[str, Any]]:
             "input": int(u.get("input", 0) or 0),
             "output": int(u.get("output", 0) or 0),
             "cacheRead": int(u.get("cacheRead", 0) or 0),
+            "cacheReadAvailable": u.get("cacheReadAvailable"),
+            "cacheReadSource": u.get("cacheReadSource"),
             "cache_key": o.get("cache_key") or u.get("cache_key"),
             "provider_request_id": u.get("provider_request_id"),
         })
@@ -465,11 +469,10 @@ def _candidate_count_table(per_call: list[dict[str, Any]]) -> list[dict[str, Any
 def read_server_prefix_cache(cell: Path, total_input_tokens: int | None = None) -> dict[str, Any] | None:
     """Server-measured realized reuse, for backends that do not report it.
 
-    OpenAI and FreeInference return usage.prompt_tokens_details.cached_tokens,
-    so their realized figure comes from the response itself and this file does
-    not exist.  vLLM 0.26 leaves that field null while its prefix cache is
-    hitting, so the trace scripts snapshot the server's Prometheus counters
-    around each cell; the delta is that cell's realized reuse in tokens.
+    Prefer usage.prompt_tokens_details.cached_tokens whenever the response
+    includes it. Some vLLM runs omit that field, so the trace scripts also
+    snapshot the server's Prometheus counters around each cell. Their delta is
+    the cell-level realized reuse in tokens when the interval is attributable.
 
     This never overrides a vendor-reported number -- callers use it only when
     cacheRead is absent.  When ``total_input_tokens`` is given it is compared
@@ -530,7 +533,14 @@ def realized_provenance(
     "unmeasured" must not render as 0%: unknown reuse and zero reuse are
     different findings.
     """
-    if any((call.get("cacheRead") or 0) > 0 for call in per_call):
+    explicit = [
+        call.get("cacheReadAvailable") for call in per_call
+        if call.get("cacheReadAvailable") is not None
+    ]
+    if explicit and len(explicit) == len(per_call) and all(explicit):
+        return "response"
+    if not explicit and any((call.get("cacheRead") or 0) > 0 for call in per_call):
+        # Historical traces predate the availability marker.
         return "vendor"
     if server_cache and server_cache.get("hit_rate") is not None:
         return "server"
@@ -691,6 +701,8 @@ def analyze_cell_logical(
             "run_id": c["run_id"], "role": c["role"], "our_tokens": n,
             "phase": c["phase"],
             "input": c["input"], "cacheRead": c["cacheRead"],
+            "cacheReadAvailable": c.get("cacheReadAvailable"),
+            "cacheReadSource": c.get("cacheReadSource"),
             "output": c["output"],
             "logical": g, "role_logical": r,
             "logical_aligned": logical_aligned,

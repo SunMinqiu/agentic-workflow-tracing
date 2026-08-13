@@ -185,11 +185,10 @@ prepare_vllm_cache_for_cell() {
     echo "  Prefix cache: reset before cell" >&2
 }
 
-# vLLM 0.26 serves an OpenAI-compatible /v1 but leaves usage.prompt_tokens_
-# details null, so every call's cacheRead reads 0 even while the server's
-# prefix cache is hitting.  Its Prometheus counters are the only place the
-# realized reuse is visible.  Snapshot them around a cell and the delta is
-# that cell's realized reuse.  The counters are in tokens: across three
+# Some vLLM responses omit usage.prompt_tokens_details.cached_tokens even when
+# --enable-prompt-tokens-details is set. Prometheus counters provide the
+# fallback. Snapshot them around a cell and the delta is that cell's realized
+# reuse when no other traffic overlaps. The counters are in tokens: across three
 # runs the queries delta equalled the cell's total input tokens exactly,
 # which both fixes the unit and proves no other client shared the server.
 #
@@ -289,6 +288,23 @@ run_kvcache_report() {
     echo "Generating run-level KV-cache report..."
     "$python" -m agent_io_tracing.analysis.kvcache.report \
         --results "$run_root" --runs . --dump-prefixes >"$log_path" 2>&1
+}
+
+# Run one Python post-processing module, capture its log, and add its label to
+# the caller's failure list. Callers keep control of ordering and arguments.
+run_postprocess_module() {
+    local python="$1" run_dir="$2" step="$3" log_name="$4" module="$5"
+    shift 5
+    local rc
+    if "$python" -m "$module" "$@" >"$run_dir/$log_name" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        failed_step="${failed_step:+$failed_step,}$step"
+    fi
+    return "$rc"
 }
 
 return_results_ownership() {

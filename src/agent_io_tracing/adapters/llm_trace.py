@@ -372,12 +372,10 @@ def infer_phase(messages: Any) -> str:
 
 # ----- per-call prefix-cache measurement ------------------------------------
 #
-# vLLM leaves usage.prompt_tokens_details null, so a response never says how
-# much of its prompt was served from cache.  Its Prometheus counters do, and
-# reading them either side of one request attributes the delta to that request
-# -- verified directly: a single request moved queries by exactly its prompt
-# token count.  The attribution only holds while nothing else is in flight, so
-# every reading carries the check that proves it.
+# Prefer usage.prompt_tokens_details.cached_tokens when vLLM returns it. Some
+# versions or response paths omit that field. Prometheus counters provide the
+# per-request fallback, and reading them either side of one request attributes
+# the delta only when nothing else is in flight.
 
 PREFIX_CACHE_QUERIES = "vllm:prefix_cache_queries_total"
 PREFIX_CACHE_HITS = "vllm:prefix_cache_hits_total"

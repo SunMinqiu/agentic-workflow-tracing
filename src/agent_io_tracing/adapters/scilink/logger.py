@@ -112,25 +112,35 @@ def _normalize_usage_from_litellm(response: Any) -> dict:
 
     # Anthropic / OpenAI prompt-caching: details nested one level down.
     cache = 0
+    cache_available = False
     details = (
         getattr(usage, "prompt_tokens_details", None)
         or (usage.get("prompt_tokens_details") if isinstance(usage, dict) else None)
     )
-    if details is not None:
-        cache = _get(details, "cached_tokens", "cache_read", "cacheRead")
-    if not cache:
-        cache = _get(
-            usage,
-            "cache_read_input_tokens",
-            "cached_tokens",
-            "cache_read",
-            "cacheRead",
-        )
+    for source, names in (
+        (details, ("cached_tokens", "cache_read", "cacheRead")),
+        (usage, ("cache_read_input_tokens", "cached_tokens", "cache_read", "cacheRead")),
+    ):
+        if source is None:
+            continue
+        for name in names:
+            value = source.get(name) if isinstance(source, dict) else getattr(source, name, None)
+            if value is not None:
+                try:
+                    cache = int(value)
+                    cache_available = True
+                    break
+                except (TypeError, ValueError):
+                    continue
+        if cache_available:
+            break
 
     return {
         "input": inp,
         "output": out,
         "cacheRead": cache,
+        "cacheReadAvailable": cache_available,
+        "cacheReadSource": "response" if cache_available else None,
         "totalTokens": total,
     }
 
@@ -481,10 +491,12 @@ class LiteLLMToolLogger(TraceFileWriter):
             messages, nocache_tag = strip_nocache_tag(kwargs.get("messages") or [])
             self._capture_system_prompt_once(messages)
             usage = _normalize_usage_from_litellm(completion_response)
-            if not usage.get("cacheRead"):
+            if not usage.get("cacheReadAvailable"):
                 measured = observed_cache.get() or {}
                 if measured.get("attributable"):
                     usage["cacheRead"] = int(measured.get("cacheRead") or 0)
+                    usage["cacheReadAvailable"] = True
+                    usage["cacheReadSource"] = "prometheus_request_delta"
             if nocache_tag and usage.get("cacheRead"):
                 print(
                     "[litellm_tool_logger] WARNING: no-cache arm got cacheRead="

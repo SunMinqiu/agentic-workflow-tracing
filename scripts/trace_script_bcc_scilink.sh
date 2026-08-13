@@ -331,21 +331,17 @@ for ws_out in "$BASE_OUT"/*/; do
     failed_step=""
 
     echo "  Parsing eBPF logs..."
-    "$POST_PYTHON" -m agent_io_tracing.parsing.ebpf \
-        "$ws_out" \
-        > "$ws_out/parse.log" 2>&1
+    run_postprocess_module "$POST_PYTHON" "$ws_out" parse_ebpf parse.log \
+        agent_io_tracing.parsing.ebpf "$ws_out"
     PARSE_RC=$?
     sed 's/^/    /' "$ws_out/parse.log" || true
-    [ $PARSE_RC -ne 0 ] && failed_step="parse_ebpf"
 
     if [ -f "$ws_out/parsed.json" ]; then
         if [ -f "$ws_out/pi_events.jsonl" ] && [ -f "$ws_out/tool_calls.log" ]; then
             echo "  Summarizing pi-compat events..."
-            "$POST_PYTHON" -m agent_io_tracing.analysis.summary "$ws_out" \
-                > "$ws_out/summarize.log" 2>&1
-            SUM_RC=$?
+            run_postprocess_module "$POST_PYTHON" "$ws_out" summarize summarize.log \
+                agent_io_tracing.analysis.summary "$ws_out"
             sed 's/^/    /' "$ws_out/summarize.log" || true
-            [ $SUM_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}summarize"
 
         else
             echo "  Skipping pi summary (pi_events.jsonl or tool_calls.log missing)"
@@ -362,11 +358,10 @@ for ws_out in "$BASE_OUT"/*/; do
 
         if [ -f "$ws_out/pi_events.jsonl" ] && [ -f "$ws_out/tool_calls.log" ]; then
             echo "  Computing DAG + parallelism metrics..."
-            "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" \
-                > "$ws_out/parallelism.log" 2>&1
+            run_postprocess_module "$POST_PYTHON" "$ws_out" parallelism parallelism.log \
+                agent_io_tracing.analysis.parallelism "$ws_out"
             PAR_RC=$?
             sed 's/^/    /' "$ws_out/parallelism.log" || true
-            [ $PAR_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}parallelism"
             if [ $PAR_RC -eq 0 ]; then
                 [ -f "$ws_out/call_dag.html" ] && echo "    DAG HTML: $ws_out/call_dag.html"
                 [ -f "$ws_out/parallelism_summary.json" ] && echo "    Metrics:  $ws_out/parallelism_summary.json"
@@ -374,35 +369,26 @@ for ws_out in "$BASE_OUT"/*/; do
         fi
 
         echo "  Computing phase-1 I/O metrics..."
-        "$POST_PYTHON" -m agent_io_tracing.analysis.phase1_metrics "$ws_out" \
-            > "$ws_out/phase1_metrics.log" 2>&1
-        P1_RC=$?
+        run_postprocess_module "$POST_PYTHON" "$ws_out" phase1_metrics phase1_metrics.log \
+            agent_io_tracing.analysis.phase1_metrics "$ws_out"
         sed 's/^/    /' "$ws_out/phase1_metrics.log" || true
-        [ $P1_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}phase1_metrics"
 
-        "$POST_PYTHON" -m agent_io_tracing.analysis.execution_units "$ws_out" \
-            > "$ws_out/execution_units.log" 2>&1
-        EU_RC=$?
-        [ $EU_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}execution_units"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" execution_units execution_units.log \
+            agent_io_tracing.analysis.execution_units "$ws_out"
 
-        "$POST_PYTHON" -m agent_io_tracing.analysis.trace_quality "$ws_out" \
-            > "$ws_out/trace_quality.log" 2>&1
-        TQ_RC=$?
-        [ $TQ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}trace_quality"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" trace_quality trace_quality.log \
+            agent_io_tracing.analysis.trace_quality "$ws_out"
 
         echo "  Generating per-run I/O characterization figures..."
-        "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs . \
-            > "$ws_out/per_run_io_char.log" 2>&1
-        PRC_RC=$?
+        run_postprocess_module "$POST_PYTHON" "$ws_out" per_run_io_char per_run_io_char.log \
+            agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs .
         sed 's/^/    /' "$ws_out/per_run_io_char.log" || true
-        [ $PRC_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}per_run_io_char"
 
         echo "  Generating visualizations..."
-        "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" \
-            > "$ws_out/visualize.log" 2>&1
+        run_postprocess_module "$POST_PYTHON" "$ws_out" visualize visualize.log \
+            agent_io_tracing.viz.trace "$ws_out"
         VIZ_RC=$?
         sed 's/^/    /' "$ws_out/visualize.log" || true
-        [ $VIZ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}visualize"
         if [ $VIZ_RC -eq 0 ]; then
             [ -f "$ws_out/visualizations/index.html" ] && echo "    Viz index: $ws_out/visualizations/index.html"
             [ -f "$ws_out/visualizations/agent_timeline.html" ] && echo "    Agent timeline: $ws_out/visualizations/agent_timeline.html"

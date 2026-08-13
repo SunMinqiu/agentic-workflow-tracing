@@ -256,31 +256,25 @@ for ws_out in "$BASE_OUT"/*/; do
     failed_step=""
 
     echo "  Parsing eBPF logs..."
-    "$POST_PYTHON" -m agent_io_tracing.parsing.ebpf \
-        "$ws_out" \
-        > "$ws_out/parse.log" 2>&1
+    run_postprocess_module "$POST_PYTHON" "$ws_out" parse_ebpf parse.log \
+        agent_io_tracing.parsing.ebpf "$ws_out"
     PARSE_RC=$?
     sed 's/^/    /' "$ws_out/parse.log" || true
-    [ $PARSE_RC -ne 0 ] && failed_step="parse_ebpf"
 
     if [ -f "$ws_out/parsed.json" ]; then
         if [ -f "$ws_out/pi_events.jsonl" ] && [ -f "$ws_out/tool_calls.log" ]; then
             echo "  Summarizing pi-compat events..."
-            "$POST_PYTHON" -m agent_io_tracing.analysis.summary "$ws_out" \
-                > "$ws_out/summarize.log" 2>&1
-            SUM_RC=$?
+            run_postprocess_module "$POST_PYTHON" "$ws_out" summarize summarize.log \
+                agent_io_tracing.analysis.summary "$ws_out"
             sed 's/^/    /' "$ws_out/summarize.log" || true
-            [ $SUM_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}summarize"
         else
             echo "  Skipping pi summary (pi_events.jsonl or tool_calls.log missing)"
         fi
 
         echo "  Generating visualizations..."
-        "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" \
-            > "$ws_out/visualize.log" 2>&1
-        VIZ_RC=$?
+        run_postprocess_module "$POST_PYTHON" "$ws_out" visualize visualize.log \
+            agent_io_tracing.viz.trace "$ws_out"
         sed 's/^/    /' "$ws_out/visualize.log" || true
-        [ $VIZ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}visualize"
     else
         echo "  Skipping visualization (parsed.json not found)"
         failed_step="${failed_step:+$failed_step,}no_parsed_json"
@@ -303,14 +297,6 @@ if [ "$POST_FAIL_COUNT" -gt 0 ]; then
     echo "(See <workload>/{parse,summarize,visualize}.log for details)"
 fi
 
-chmod -R a+rX "$BASE_OUT" || true
-
-# When invoked via `sudo -E`, root owns every trace artefact, which makes it
-# annoying to re-parse, re-visualize, scp, or even rm without sudo.  Hand
-# ownership back to the invoking user.  No-op if not running under sudo.
-if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
-    chown -R "$SUDO_UID:$SUDO_GID" "$BASE_OUT" 2>/dev/null || true
-    echo "Returned ownership of $BASE_OUT to ${SUDO_USER:-uid=$SUDO_UID}"
-fi
+return_results_ownership "$BASE_OUT"
 
 echo "All done. Results in: $BASE_OUT"

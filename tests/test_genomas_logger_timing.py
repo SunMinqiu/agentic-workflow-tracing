@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from agent_io_tracing.adapters.genomas.logger import (
     GenoMASToolLogger,
     _install_openai_stream_timing,
+    _to_pi_usage,
 )
 
 
@@ -103,6 +104,19 @@ def test_genomas_logger_does_not_fabricate_first_token(tmp_path, monkeypatch):
     events = _read_events(tmp_path / "pi_events.jsonl")
     assert "message_first_token" not in [event["type"] for event in events]
     assert events[-1]["stream_timing_available"] is False
+
+
+def test_genomas_explicit_zero_cached_tokens_is_measured():
+    usage = _to_pi_usage({
+        "usage": {"input_tokens": 100, "output_tokens": 10},
+        "raw_response": {
+            "usage": {"prompt_tokens_details": {"cached_tokens": 0}}
+        },
+        "_trace_cache": {"attributable": True, "cacheRead": 64},
+    })
+    assert usage["cacheRead"] == 0
+    assert usage["cacheReadAvailable"] is True
+    assert usage["cacheReadSource"] == "response"
 
 
 def test_genomas_openai_compatible_stream_produces_real_timing(monkeypatch):

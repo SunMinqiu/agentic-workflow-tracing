@@ -335,7 +335,7 @@ done
 
 if [ "$CELL_IDX" -eq 0 ]; then
     echo "Error: RUN_WORKLOADS selected zero GenoMAS cells: ${RUN_WORKLOADS:-<empty>}" >&2
-    echo "Available cells: A_c1_w1,A_c2_w1,A_c2_w2,A_c3_w2,A_c4_w2,A_c4_w4,A_c8_w4,B_t1_w2,B_t2_w2,B_t4_w2" >&2
+    echo "Available cells: A_c1_w1,A_c2_w1,A_c2_w2,A_c3_w1,A_c3_w2,A_c4_w1,A_c4_w2,A_c4_w4,A_c8_w1,A_c8_w4,B_t1_w2,B_t2_w2,B_t4_w2,full_c1_w2" >&2
     exit 2
 fi
 
@@ -356,52 +356,36 @@ for ws_out in "$BASE_OUT"/*/; do
     set +e
     failed_step=""
 
-    "$POST_PYTHON" -m agent_io_tracing.parsing.ebpf "$ws_out" \
-        > "$ws_out/parse.log" 2>&1
+    run_postprocess_module "$POST_PYTHON" "$ws_out" parse_ebpf parse.log \
+        agent_io_tracing.parsing.ebpf "$ws_out"
     PARSE_RC=$?
-    [ $PARSE_RC -ne 0 ] && failed_step="parse_ebpf"
     sed 's/^/    /' "$ws_out/parse.log" | tail -5 || true
 
     if [ -f "$ws_out/parsed.json" ] && [ -f "$ws_out/pi_events.jsonl" ]; then
-        "$POST_PYTHON" -m agent_io_tracing.analysis.summary "$ws_out" \
-            > "$ws_out/summarize.log" 2>&1
-        SUM_RC=$?
-        [ $SUM_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}summarize"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" summarize summarize.log \
+            agent_io_tracing.analysis.summary "$ws_out"
 
-        "$POST_PYTHON" -m agent_io_tracing.lineage.analyzer "$ws_out" \
-            > "$ws_out/lineage.log" 2>&1
-        LIN_RC=$?
-        [ $LIN_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}lineage"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" lineage lineage.log \
+            agent_io_tracing.lineage.analyzer "$ws_out"
 
-        "$POST_PYTHON" -m agent_io_tracing.analysis.parallelism "$ws_out" \
-            > "$ws_out/parallelism.log" 2>&1
+        run_postprocess_module "$POST_PYTHON" "$ws_out" parallelism parallelism.log \
+            agent_io_tracing.analysis.parallelism "$ws_out"
         PAR_RC=$?
-        [ $PAR_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}parallelism"
 
-        "$POST_PYTHON" -m agent_io_tracing.analysis.phase1_metrics "$ws_out" \
-            > "$ws_out/phase1_metrics.log" 2>&1
-        P1_RC=$?
-        [ $P1_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}phase1_metrics"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" phase1_metrics phase1_metrics.log \
+            agent_io_tracing.analysis.phase1_metrics "$ws_out"
 
-        "$POST_PYTHON" -m agent_io_tracing.analysis.execution_units "$ws_out" \
-            > "$ws_out/execution_units.log" 2>&1
-        EU_RC=$?
-        [ $EU_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}execution_units"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" execution_units execution_units.log \
+            agent_io_tracing.analysis.execution_units "$ws_out"
 
-        "$POST_PYTHON" -m agent_io_tracing.analysis.trace_quality "$ws_out" \
-            > "$ws_out/trace_quality.log" 2>&1
-        TQ_RC=$?
-        [ $TQ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}trace_quality"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" trace_quality trace_quality.log \
+            agent_io_tracing.analysis.trace_quality "$ws_out"
 
-        "$POST_PYTHON" -m agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs . \
-            > "$ws_out/per_run_io_char.log" 2>&1
-        PRC_RC=$?
-        [ $PRC_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}per_run_io_char"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" per_run_io_char per_run_io_char.log \
+            agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs .
 
-        "$POST_PYTHON" -m agent_io_tracing.viz.trace "$ws_out" \
-            > "$ws_out/visualize.log" 2>&1
-        VIZ_RC=$?
-        [ $VIZ_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}visualize"
+        run_postprocess_module "$POST_PYTHON" "$ws_out" visualize visualize.log \
+            agent_io_tracing.viz.trace "$ws_out"
 
         if [ $PAR_RC -eq 0 ] && [ -f "$ws_out/parallelism_summary.json" ]; then
             WCS=$("$POST_PYTHON" -c "import json; print(json.load(open('$ws_out/parallelism_summary.json'))['wall_clock_s'])" 2>/dev/null || echo "?")

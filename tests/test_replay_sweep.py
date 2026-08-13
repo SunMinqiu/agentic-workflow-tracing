@@ -184,7 +184,9 @@ def test_sweep_report_has_normal_kv_sections_and_artifacts(tmp_path) -> None:
     assert "Fixed-input Test" in page
     assert "Per arm" in page
     assert "metrics before" in page
-    assert (tmp_path / "sweep.html").is_file()
+    assert not (tmp_path / "sweep.html").exists()
+    assert not (tmp_path / "sweep.md").exists()
+    assert not (tmp_path / "kvcache_report.md").exists()
     assert (tmp_path / "visualizations" / "sweep_comparison.png").is_file()
 
 

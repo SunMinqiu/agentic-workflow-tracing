@@ -29,7 +29,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from agent_io_tracing.parsing.phases import load_phases
 from agent_io_tracing.analysis.execution_units import (
     annotate_parsed_execution_units,
     load_execution_units,
@@ -52,10 +51,6 @@ from agent_io_tracing.viz.format_utils import datetime_from_ms, esc, fmt_bytes, 
 #   SUBAGENT_COLORS     — LangGraph subagents (mid-tone purples/pinks)
 #   SYSCALL_CATEGORY_COLORS — FS / syscall categories (cool, desaturated)
 #
-# The legacy `category_colors` dict (previously identical to TOOL_COLORS hex
-# codes, causing the matplotlib timeline to silently mis-label scatter dots)
-# is replaced by SYSCALL_CATEGORY_COLORS below.
-
 # Tool type colors (warm/saturated, consistent across all visualizations).
 # Known pi tools get fixed colors so their identity is stable across traces.
 TOOL_COLORS = {
@@ -147,11 +142,6 @@ RESOURCE_COLORS = {
 # accent that is distinct from tool warm + subagent purple + syscall cool.
 LLM_COLOR = "#2ECC71"  # Green — readable on white, no overlap with above.
 LLM_SUBAGENT_COLOR = "#A8E6A3"
-
-# Backwards-compat alias for old call sites that reference `category_colors`
-# inline.  Existing code uses a local dict identical to this; consolidating
-# here removes the duplicate-definition bug that allowed silent drift.
-category_colors = SYSCALL_CATEGORY_COLORS
 
 # Syscall category classification
 SYSCALL_CATEGORIES = {
@@ -1491,29 +1481,6 @@ def _load_agent_timeline_data_uncached(trace_dir: Path) -> dict | None:
                       - t0).total_seconds())
     total_span = max(spans) if spans else 0.0
 
-    # Subagent parent-child structure: compute from TIME CONTAINMENT between
-    # subagent intervals, NOT from pi_events.jsonl's parent_subagent_run_id
-    # field. The pi_events field is set at trace time by the run_id tree walk,
-    # which breaks for SRAgent (it invokes sub-agents without forwarding
-    # RunnableConfig).  After reclassify_subagents.py has moved entries into
-    # subagent_calls.log, the run_id-tree-based parent info is incomplete or
-    # absent. Time containment is robust against this: if A's interval contains
-    # B's interval, A is B's parent (subject to picking the *nearest* enclosing
-    # subagent, not just any ancestor).
-    parent_of_subagent: dict[str, str | None] = {}
-    for s_a, e_a, _name_a, id_a in subagent_intervals:
-        best_parent: tuple[float, str] | None = None  # (parent_span, parent_id)
-        for s_b, e_b, _name_b, id_b in subagent_intervals:
-            if id_b == id_a:
-                continue
-            # b strictly contains a?
-            if s_b <= s_a and e_b >= e_a and (e_b - s_b) > (e_a - s_a):
-                span = e_b - s_b
-                # We want the smallest enclosing subagent (nearest ancestor).
-                if best_parent is None or span < best_parent[0]:
-                    best_parent = (span, id_b)
-        parent_of_subagent[id_a] = best_parent[1] if best_parent else None
-
     return {
         "t0": t0,
         "total_span_s": total_span,
@@ -1522,7 +1489,6 @@ def _load_agent_timeline_data_uncached(trace_dir: Path) -> dict | None:
         "tool_parent_by_id": tool_parent_by_id,
         "tool_display_by_id": tool_display_by_id,
         "subagent_intervals": subagent_intervals,
-        "parent_of_subagent": parent_of_subagent,
         "strace_data": strace_data,
     }
 
@@ -1545,7 +1511,6 @@ def _compute_residue_warning(bundle: dict) -> tuple[float, float]:
 
 def _aggregate_subagent_rows(
     subagent_intervals: list[tuple[float, float, str, str]],
-    parent_of_subagent: dict[str, str | None],   # kept for signature compat, unused
 ) -> list[dict]:
     """
     Aggregate subagent invocations by NAME — one row per unique name, with
@@ -1814,7 +1779,7 @@ def create_agent_timeline_plotly(trace_dir: Path, output_path: Path) -> None:
     # --- Build row labels for each lane ------------------------------------
     # Semantic lane: one LLM row per parent context, not one anonymous bucket.
     sub_rows = _aggregate_subagent_rows(
-        bundle["subagent_intervals"], bundle["parent_of_subagent"])
+        bundle["subagent_intervals"])
 
     llm_rows = _aggregate_llm_rows(
         bundle["llm_segments"], bundle["tool_display_by_id"])
@@ -2058,7 +2023,7 @@ def create_agent_timeline_matplotlib(trace_dir: Path, output_path: Path) -> None
         )
 
     sub_rows = _aggregate_subagent_rows(
-        bundle["subagent_intervals"], bundle["parent_of_subagent"])
+        bundle["subagent_intervals"])
     tool_rows_agg = _aggregate_tool_tree_rows(
         bundle["tool_intervals"],
         bundle["llm_segments"],
@@ -2970,16 +2935,6 @@ def create_index_html(output_dir: Path) -> None:
 # Main Visualization Runner
 # =============================================================================
 
-# Visualizations that use StraceData (from parsed.json). The old detail-only
-# strace views were retired from the cleaned dashboard.
-STRACE_VISUALIZATIONS = {}
-
-# Visualizations that use PhaseAnalysis (from tool_calls.log) — empty now,
-# kept for backwards compat and as an extension point.  Time Accounting
-# (phase_breakdown) was moved to AGENT_VISUALIZATIONS so it can also load
-# LLM + subagent data.
-PHASE_VISUALIZATIONS: dict = {}
-
 # Visualizations that operate directly on the trace directory (load whatever
 # combination of pi_events.jsonl, tool_calls.log, subagent_calls.log, parsed.json
 # they need on their own). These take (trace_dir, output_path) signatures.
@@ -2999,7 +2954,7 @@ AGENT_VISUALIZATIONS = {
 }
 
 # Combined for CLI help and validation
-VISUALIZATIONS = {**STRACE_VISUALIZATIONS, **PHASE_VISUALIZATIONS, **AGENT_VISUALIZATIONS}
+VISUALIZATIONS = AGENT_VISUALIZATIONS
 
 RETIRED_VISUALIZATION_STEMS = {
     "timeline",
@@ -3057,96 +3012,16 @@ def generate_visualizations(
     # Determine which visualizations to generate
     viz_names = only if only else list(VISUALIZATIONS.keys())
     
-    # Separate strace, phase, and agent visualizations
-    strace_viz_to_gen = [v for v in viz_names if v in STRACE_VISUALIZATIONS]
-    phase_viz_to_gen = [v for v in viz_names if v in PHASE_VISUALIZATIONS]
-    agent_viz_to_gen = [v for v in viz_names if v in AGENT_VISUALIZATIONS]
+    visualizations_to_generate = [v for v in viz_names if v in VISUALIZATIONS]
 
     # Check for unknown visualizations
     unknown = [v for v in viz_names if v not in VISUALIZATIONS]
     for v in unknown:
         print(f"Warning: Unknown visualization '{v}', skipping", file=sys.stderr)
     
-    # Load strace data if needed
-    strace_data = None
-    if strace_viz_to_gen:
-        parsed_json = trace_dir / "parsed.json"
-        if parsed_json.exists():
-            print(f"Loading strace data from {parsed_json}...", file=sys.stderr)
-            strace_data = load_parsed_json(parsed_json)
-            print(f"  Loaded {len(strace_data.tool_calls_df)} tool calls, "
-                  f"{len(strace_data.fs_entries_df)} fs entries", file=sys.stderr)
-            print(f"  Duration: {strace_data.duration_seconds:.2f} seconds", file=sys.stderr)
-        else:
-            print(f"Warning: {parsed_json} not found, skipping strace visualizations", 
-                  file=sys.stderr)
-            strace_viz_to_gen = []
-    
-    # Load phase data if needed
-    phase_data = None
-    if phase_viz_to_gen:
-        tool_log = trace_dir / "tool_calls.log"
-        if tool_log.exists():
-            print(f"Loading phase data from {tool_log}...", file=sys.stderr)
-            phase_data = load_phases(trace_dir)
-            print(f"  Found {len(phase_data.phases)} phases, {len(phase_data.batches)} batches", 
-                  file=sys.stderr)
-            print(f"  Tool execution: {phase_data.tool_execution_pct:.1f}%, "
-                  f"Model completion: {phase_data.model_completion_pct:.1f}%", file=sys.stderr)
-        else:
-            print(f"Warning: {tool_log} not found, skipping phase visualizations", 
-                  file=sys.stderr)
-            phase_viz_to_gen = []
-    
-    # Generate strace visualizations
-    for viz_name in strace_viz_to_gen:
-        plotly_fn, matplotlib_fn = STRACE_VISUALIZATIONS[viz_name]
-        
-        if not png_only and plotly_fn:
-            html_path = output_dir / f"{viz_name}.html"
-            print(f"Generating {html_path.name}...", file=sys.stderr)
-            try:
-                plotly_fn(strace_data, html_path)
-                generated.append(viz_name)
-            except Exception as e:
-                print(f"  Error: {e}", file=sys.stderr)
-        
-        if not html_only and matplotlib_fn:
-            png_path = output_dir / f"{viz_name}.png"
-            print(f"Generating {png_path.name}...", file=sys.stderr)
-            try:
-                matplotlib_fn(strace_data, png_path)
-                if viz_name not in generated:
-                    generated.append(viz_name)
-            except Exception as e:
-                print(f"  Error: {e}", file=sys.stderr)
-    
-    # Generate phase visualizations
-    for viz_name in phase_viz_to_gen:
-        plotly_fn, matplotlib_fn = PHASE_VISUALIZATIONS[viz_name]
-
-        if not png_only and plotly_fn:
-            html_path = output_dir / f"{viz_name}.html"
-            print(f"Generating {html_path.name}...", file=sys.stderr)
-            try:
-                plotly_fn(phase_data, html_path)
-                generated.append(viz_name)
-            except Exception as e:
-                print(f"  Error: {e}", file=sys.stderr)
-
-        if not html_only and matplotlib_fn:
-            png_path = output_dir / f"{viz_name}.png"
-            print(f"Generating {png_path.name}...", file=sys.stderr)
-            try:
-                matplotlib_fn(phase_data, png_path)
-                if viz_name not in generated:
-                    generated.append(viz_name)
-            except Exception as e:
-                print(f"  Error: {e}", file=sys.stderr)
-
-    # Generate agent visualizations (these load their own data from trace_dir).
-    for viz_name in agent_viz_to_gen:
-        plotly_fn, matplotlib_fn = AGENT_VISUALIZATIONS[viz_name]
+    # Each visualization loads its own data from the trace directory.
+    for viz_name in visualizations_to_generate:
+        plotly_fn, matplotlib_fn = VISUALIZATIONS[viz_name]
 
         if not png_only and plotly_fn:
             html_path = output_dir / f"{viz_name}.html"

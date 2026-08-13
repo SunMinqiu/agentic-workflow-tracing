@@ -31,8 +31,10 @@ from agent_io_tracing.analysis.kvcache.demand import (
 )
 from agent_io_tracing.analysis.kvcache.logical import (
     analyze_cell_logical, plot_cache_warming, plot_prefix_lineage,
+    realized_provenance,
+    read_server_prefix_cache,
     CELL_JSON as LOGICAL_JSON, CACHE_WARMING_PNG,
-    PREFIX_LINEAGE_PNG, PREFIX_DUMP,
+PREFIX_LINEAGE_PNG, PREFIX_DUMP,
 )
 from agent_io_tracing.analysis.kvcache.summary import (
     PAGE_CSS, token_table, time_table,
@@ -52,6 +54,9 @@ from agent_io_tracing.analysis.kvcache.latency import (
 import json
 
 
+LINEAGE_NOTES = "kvcache_lineage_notes.md"
+
+
 def _fmt(n: Any) -> str:
     try:
         return f"{int(n):,}"
@@ -60,7 +65,7 @@ def _fmt(n: Any) -> str:
 
 
 def _pct(x: Any) -> str:
-    return f"{x:.0%}" if isinstance(x, (int, float)) else "n/a"
+    return f"{x:.2%}" if isinstance(x, (int, float)) else "n/a"
 
 
 def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
@@ -88,6 +93,18 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
     if lg is not None:
         latency = analyze_latency(lg)
         lg["latency"] = latency
+        # Backends that report cacheRead need nothing here; this fills in only
+        # where the vendor stays silent, and never replaces a reported number.
+        server_cache = read_server_prefix_cache(cell, row.get("total_input"))
+        if server_cache is not None and not row.get("realized_frac"):
+            lg["server_prefix_cache"] = server_cache
+            row["server_prefix_cache"] = server_cache
+        # Record whether realized was measured at all, so the tables can print
+        # "n/a" instead of a 0 that reads as a finding.
+        lg["realized_provenance"] = realized_provenance(
+            cell, lg.get("per_call") or [], lg.get("server_prefix_cache"),
+        )
+        row["realized_provenance"] = lg["realized_provenance"]
         (cell / LOGICAL_JSON).write_text(json.dumps(lg, indent=1), encoding="utf-8")
         viz = cell / "visualizations"
         viz.mkdir(parents=True, exist_ok=True)
@@ -110,6 +127,9 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
             "latency": latency,
             "has_stream_timing": has_stream_timing(lg),
             "runtime": lg.get("runtime") or {},
+            "tokenizer": lg.get("tokenizer"),
+            "token_source": lg.get("token_source") or {},
+            "serving_config": lg.get("serving_config") or {},
         })
     if d is not None and d["summary"]["tokens_available"]:
         viz = cell / "visualizations"
@@ -126,7 +146,6 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
             "n_segments": seg["n_segments"],
             "cache_size_tokens": seg["cache_size_tokens"],
             "prompt_tokens_total": seg["prompt_tokens_total"],
-            "resend_ratio": seg["resend_ratio"],
             "content_breakdown": seg["content_breakdown"],
             "content_examples": seg["content_examples"],
             "realized_vs_logical": seg["realized_vs_logical"],
@@ -181,11 +200,11 @@ def _segment_section(r: dict[str, Any]) -> list[str]:
     for tag in ranked:
         e = cb["by_tag"][tag]
         L.append(
-            f"| {tag} | {_fmt(e['realized_tokens'])} | {e['realized_share']:.1%} | "
-            f"{e['n_segments']} | {e['segment_share']:.1%} |"
+            f"| {tag} | {_fmt(e['realized_tokens'])} | {e['realized_share']:.2%} | "
+            f"{e['n_segments']} | {e['segment_share']:.2%} |"
         )
     L.append(
-        f"| **all** | **{_fmt(cb['realized_tokens_total'])}** | **100.0%** | "
+        f"| **all** | **{_fmt(cb['realized_tokens_total'])}** | **100.00%** | "
         f"**{served}** | — |"
     )
     L.append("")
@@ -255,8 +274,62 @@ def build_report(
             )
             if configured_cache else "provider-managed/default; no request-level cache controls recorded"
         )
-        L.append(f"- **KV-cache request settings**: {cache_text}")
+        # Only worth a line when the request actually carried cache controls;
+        # "none recorded" is the default and says nothing.
+        if configured_cache:
+            L.append(f"- **KV-cache request settings**: {cache_text}")
+        serving = r.get("serving_config") or {}
+        if serving:
+            L.append(
+                "- **Server config**: "
+                + ", ".join(
+                    f"`{k}`={serving[k]}"
+                    for k in ("cache_dtype", "block_size", "prefix_match_unit",
+                              "enable_prefix_caching", "kv_cache_size_tokens",
+                              "num_gpu_blocks", "gpu_memory_utilization")
+                    if k in serving
+                )
+            )
         L.append("")
+        # Which tokenizer produced logical.  Without this a reader cannot tell
+        # a cell corrected against the engine's own tokenizer from one still
+        # counted with tiktoken, and the two differ by orders of magnitude on
+        # tool- or image-bearing workloads.
+        source = r.get("token_source") or {}
+        n_server = source.get("server_tokenized_calls") or 0
+        if n_server:
+            n_exact = source.get("n_exact")
+            n_tokenized = source.get("n_tokenized")
+            residual = source.get("residual_pct")
+            detail = (
+                f" ({n_exact}/{n_tokenized} exact against the server's recorded "
+                f"`input`"
+                if n_exact is not None and n_tokenized else ""
+            )
+            shortfall = (
+                f", {residual}% short where the trace lost `tool_calls`)"
+                if residual else ")" if detail else ""
+            )
+            L.append(f"- **Token counts**: from the engine's own `/tokenize`{detail}{shortfall}.")
+        elif r.get("tokenizer"):
+            L.append(
+                f"- **Token counts**: re-tokenized locally with "
+                f"`{r['tokenizer']}`; absolute totals differ from the provider's."
+            )
+        L.append("")
+        server = r.get("server_prefix_cache")
+        if server:
+            # The summary table already prints the rate with its † marker.
+            # Only the failure case needs saying.
+            if not server.get("sole_client"):
+                L.append(
+                    f"- **Realized reuse**: {server['hit_rate']:.2%} read from "
+                    f"the engine's counters, but **not attributable** — "
+                    f"{_fmt(server['queries'])} queried tokens against this "
+                    f"cell's {_fmt(r.get('total_input', 0))} input tokens means "
+                    f"another client shared the server."
+                )
+            L.append("")
         if r.get("has_logical"):
             L.append("**Possible sources per call**")
             L.append("")
@@ -314,6 +387,10 @@ def build_report(
             L.append("")
             L.append(embedded_image("prefix cache lineage", r["cell"], PREFIX_LINEAGE_PNG))
             L.append("")
+            lineage_notes = artifact_root / r["cell"] / LINEAGE_NOTES
+            if lineage_notes.is_file():
+                L.append(lineage_notes.read_text(encoding="utf-8").strip())
+                L.append("")
             L.append(embedded_image("inference latency timeline", r["cell"], LATENCY_TIMELINE_PNG))
             L.append("")
             L.append(embedded_image("output length vs latency", r["cell"], OUTPUT_LATENCY_PNG))

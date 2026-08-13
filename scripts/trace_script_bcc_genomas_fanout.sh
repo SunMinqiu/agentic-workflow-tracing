@@ -134,6 +134,7 @@ for entry in "${CELLS[@]}"; do
     rm -rf "$GENOMAS_REPO/output/$NAME" 2>/dev/null || true
 
     # 2) Launch GenoMAS (STOPped) against the staged view.
+    prepare_vllm_cache_for_cell
     set +e
     "$AGENT_PYTHON" -m agent_io_tracing.adapters.genomas.launcher \
         "$WORK" "$OUT" \

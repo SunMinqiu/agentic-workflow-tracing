@@ -9,6 +9,8 @@ from __future__ import annotations
 import pathlib
 import re
 import subprocess
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -68,6 +70,21 @@ def test_a_study_can_name_itself():
 
 def test_no_workloads_at_all_still_names_the_workflow():
     assert _bash("WORKLOADS=(); run_dir_name SciLink") == "SciLink_20260806_101500"
+
+
+def test_default_stamp_uses_new_york_even_when_the_host_does_not():
+    before = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d_%H%M")
+    script = (
+        f"source {SCRIPTS}/lib_results.sh\n"
+        "TZ=UTC run_dir_name GenoMAS task"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, cwd=ROOT
+    )
+    after = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d_%H%M")
+    assert result.returncode == 0, result.stderr
+    stamp = result.stdout.strip().rsplit("_", 2)
+    assert "_".join(stamp[-2:])[:13] in {before, after}
 
 
 def test_no_script_pastes_its_own_run_prefix():

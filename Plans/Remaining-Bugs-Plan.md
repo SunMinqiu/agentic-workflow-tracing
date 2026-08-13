@@ -119,7 +119,7 @@ rsync -az --delete \
   ./ "$SSH_USER@$CLIENT_NODE:pi-ebpf-tracing-handoff/"
 
 ssh -t "$SSH_USER@$CLIENT_NODE" \
-  "cd pi-ebpf-tracing-handoff && sudo -E RUN_WORKLOADS='eels_plasmons_basic,eels_identification_basic,planning_critical_materials' bash scripts/trace_script_bcc_scilink.sh"
+  "cd pi-ebpf-tracing-handoff && sudo -n true && RUN_WORKLOADS='eels_plasmons_basic,eels_identification_basic,planning_critical_materials' bash scripts/trace_script_bcc_scilink.sh"
 
 RUN=$(ssh "$SSH_USER@$CLIENT_NODE" \
   "ls -1dt /mnt/lustrefs/$SSH_USER/pi-ebpf-tracing-handoff/results/*/ | head -1")

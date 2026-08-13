@@ -46,8 +46,17 @@ fi
 
 local_out="results/$(basename "$remote_run")"
 mkdir -p "$local_out"
+
+# Two passes.  parsed.json is the parser's expansion of ebpf_events.log and can
+# reach tens of GB on a long run; it is regenerable from the raw log, so the
+# second pass drops it past PARSED_MAX_SIZE.  Everything else, the raw log
+# included, comes back whole.
+PARSED_MAX_SIZE=100m
 rsync -az --progress --checksum --partial \
-    --exclude 'work/' --exclude 'bcc.out' \
+    --exclude 'work/' --exclude 'bcc.out' --exclude 'parsed.json' \
+    "$SSH_USER@$CLIENT_NODE:$remote_run/" "$local_out/"
+rsync -az --progress --checksum --partial --max-size="$PARSED_MAX_SIZE" \
+    --include '*/' --include 'parsed.json' --exclude '*' \
     "$SSH_USER@$CLIENT_NODE:$remote_run/" "$local_out/"
 
 echo "Regenerating the KV report locally so figures match local code."
@@ -63,8 +72,22 @@ cells=0
 for cell in "$local_out"/*; do
     [ -f "$cell/manifest.json" ] || continue
     cells=$((cells + 1))
+
+    # Report why the cell is degraded before listing what it is missing.  A
+    # cell whose LLM calls were rejected produces a clean I/O trace and an
+    # empty tool_calls.log, so the file-level errors below read as a plotting
+    # bug unless the cause is stated first.
+    PYTHONPATH=src python -m agent_io_tracing.analysis.trace_quality_report "$cell" || failed=1
+
+    # parsed.json is exempt from the required list: the size cap above skips the
+    # big ones on purpose.  Say so, rather than letting it read as a lost file.
+    if [ ! -s "$cell/parsed.json" ]; then
+        echo "NOTE: $cell/parsed.json skipped, over $PARSED_MAX_SIZE on the client." \
+             "Regenerate it from ebpf_events.log, or rsync that one file by hand."
+    fi
+
     for required in \
-        ebpf_events.log parsed.json manifest.json pi_events.jsonl tool_calls.log \
+        ebpf_events.log manifest.json pi_events.jsonl tool_calls.log \
         messages.jsonl kvcache_demand.json kvcache_logical.json \
         kvcache_report.md kvcache_report.html \
         phase1_metrics.json parallelism_summary.json trace_quality.json \

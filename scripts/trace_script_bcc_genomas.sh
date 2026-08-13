@@ -219,6 +219,7 @@ for entry in "${WORKLOADS[@]}"; do
         TRAITS_FLAG=("--smoke-traits" "$GENOMAS_SMOKE_TRAITS")
     fi
 
+    prepare_vllm_cache_for_cell
     set +e
     # Detect "fullpipeline" sentinel in EXTRA: if present, drop --quick-test
     # so GenoMAS actually runs the statistician/regression phase.  Otherwise
@@ -247,6 +248,8 @@ for entry in "${WORKLOADS[@]}"; do
         > "$OUT/genomas.log" 2>&1 &
     AGENT_PID=$!
     kill -STOP "$AGENT_PID" >/dev/null 2>&1 || true
+
+    vllm_cache_snapshot "$OUT/vllm_cache_before.json"
 
     INSTRUMENTATION_LEVEL="ebpf"
     if [ "${COLLECT_LUSTRE_COUNTERS:-0}" = "1" ] || [ "${COLLECT_LUSTRE_COUNTERS:-0}" = "true" ]; then
@@ -300,6 +303,10 @@ for entry in "${WORKLOADS[@]}"; do
 
     wait "$AGENT_PID"
     EXIT_CODE=$?
+
+    vllm_cache_snapshot "$OUT/vllm_cache_after.json"
+    vllm_cache_delta "$OUT/vllm_cache_before.json" "$OUT/vllm_cache_after.json" \
+        "$OUT/vllm_cache_realized.json"
 
     # GenoMAS writes its detailed application log outside the trace result.
     # Copy it into the cell so API/tool failures are included in pull checks.

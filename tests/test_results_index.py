@@ -15,7 +15,7 @@ from agent_io_tracing.analysis.kvcache.summary import (
 )
 from agent_io_tracing.analysis.results_index import (
     IO_REPORT, KV_REPORT, LEAD_HEADERS, _lead_cells,
-    discover_tasks, group_rows, task_row, write_results_index,
+    discover_sweep_arms, discover_tasks, group_rows, task_row, write_results_index,
 )
 
 ROW = {
@@ -34,7 +34,7 @@ ROW = {
     "latency": {"overall": {"total_duration_s": 431.0}, "wall_clock_span_s": 433.0,
                 "stream_timing": {"median_ttft_s": 0.7, "median_tpot_s": 0.0143}},
     "runtime": {"vendors": ["vLLM"], "models": ["Qwen3.6-27B"]},
-    "segments": {"cache_size_tokens": 45376, "resend_ratio": 1.552},
+    "segments": {"cache_size_tokens": 45376},
 }
 
 
@@ -61,6 +61,12 @@ def test_every_task_links_to_both_of_its_reports():
     assert "A_c2_w1" in task and "08-05" in task
     assert f"{ROW['rel']}/{IO_REPORT}" in links
     assert f"{ROW['rel']}/{KV_REPORT}" in links
+
+
+def test_task_time_matches_the_run_directory_name():
+    row = dict(ROW, recorded_at=1786461590.0)
+    task, _ = _lead_cells(row)
+    assert task.endswith("08-05 15:21")
 
 
 def test_newest_run_comes_first_inside_a_workflow():
@@ -114,3 +120,52 @@ def test_no_run_level_report_is_written(tmp_path):
     for run in Path("results").iterdir():
         if run.is_dir():
             assert not (run / "kvcache_report.html").exists(), run
+
+
+def test_sweep_arms_are_included_in_the_results_index(tmp_path):
+    results = tmp_path / "results"
+    results.mkdir()
+    sweep = tmp_path / "replay" / "sweeps" / "blocksize"
+    rep = sweep / "block784" / "rep0"
+    rep.mkdir(parents=True)
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text(json.dumps({
+        "source_cell": str(
+            results / "GenoMAS_A_c2_w1_20260811_111925" / "A_c2_w1"
+        ),
+    }), encoding="utf-8")
+    (sweep / "kvcache_report.html").write_text("report", encoding="utf-8")
+    (rep / "summary.json").write_text(json.dumps({
+        "bundle": str(bundle),
+        "mode": "packed",
+        "cache_state": "cold_by_reset",
+        "requests": 14,
+        "prompt_tokens": 122460,
+        "output_tokens": 448,
+        "prefix_cache": {"hit_rate": 0.3073},
+        "median_ttft_ms": 1118.3,
+        "median_tpot_ms": 14.4,
+        "median_total_ms": 1118.5,
+        "wall_s": 14.1,
+        "started_at_epoch_s": 1,
+    }), encoding="utf-8")
+
+    rows = discover_sweep_arms(results)
+    assert len(rows) == 1
+    assert rows[0]["sweep"] == "sweeps/blocksize"
+    assert rows[0]["arm"] == "block784"
+    assert rows[0]["case"] == "A_c2_w1 · 08-11 11:19"
+
+    page = write_results_index(results).read_text(encoding="utf-8")
+    assert "Fixed-input tests" in page
+    assert "block784" in page
+    assert "A_c2_w1 · 08-11 11:19" in page
+    assert "sweeps/blocksize" in page
+    assert "30.73%" in page
+    assert "1.12s" in page
+    assert "14.40ms/token" in page
+    assert "14.10s" in page
+    assert ">mode</th>" not in page
+    assert ">cache</th>" not in page
+    assert "1118.3ms" not in page
+    assert "../replay/sweeps/blocksize/kvcache_report.html" in page

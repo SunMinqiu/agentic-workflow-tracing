@@ -5,10 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from agent_io_tracing.adapters.llm_trace import (
+    PREFIX_CACHE_HITS,
+    PREFIX_CACHE_QUERIES,
+)
+
+CACHE_CONFIG_METRIC = "vllm:cache_config_info{"
 
 
 def _base_url(value: str) -> str:
@@ -119,6 +127,52 @@ class VLLMEndpoint:
         ):
             raise RuntimeError("/tokenize did not return integer token IDs")
         return tokens
+
+
+def parse_prefix_cache(text: str) -> dict[str, int]:
+    """Prefix-cache counters out of one /metrics scrape, in tokens."""
+    counters: dict[str, int] = {}
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        for key, metric in (
+            ("queries", PREFIX_CACHE_QUERIES),
+            ("hits", PREFIX_CACHE_HITS),
+        ):
+            if line.startswith(metric):
+                counters[key] = int(float(line.rsplit(" ", 1)[-1]))
+    return counters
+
+
+def parse_cache_config(text: str) -> dict[str, str]:
+    """The engine's own cache_config_info labels: block_size, cache_dtype, ...
+
+    A sweep arm is defined by what the server is actually serving, not by what
+    the launch command asked for, so every replay records this.
+    """
+    for line in text.splitlines():
+        if line.startswith(CACHE_CONFIG_METRIC):
+            inner = line[line.index("{") + 1:line.rindex("}")]
+            return dict(re.findall(r'([A-Za-z0-9_]+)="([^"]*)"', inner))
+    return {}
+
+
+def prefix_cache_delta(before: str, after: str) -> dict[str, Any] | None:
+    """Realized reuse over one replay, from two /metrics scrapes."""
+    start = parse_prefix_cache(before)
+    end = parse_prefix_cache(after)
+    if "queries" not in start or "queries" not in end:
+        return None
+    queries = end["queries"] - start["queries"]
+    hits = end.get("hits", 0) - start.get("hits", 0)
+    if queries <= 0 or hits < 0:
+        return None
+    return {
+        "unit": "tokens",
+        "queries": queries,
+        "hits": hits,
+        "hit_rate": round(hits / queries, 4),
+    }
 
 
 def _metric_names(text: str) -> list[str]:

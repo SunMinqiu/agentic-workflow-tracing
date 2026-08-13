@@ -141,7 +141,6 @@ def build_bundle(
             "prompt_token_ids": token_ids,
             "prompt_tokens": len(token_ids),
             "sampling_params": request_params,
-            "max_tokens": max(int(recorded_usage.get("output", 0) or 0), 1),
             "recorded_usage": recorded_usage,
             "recorded_response": response_capture,
             "recorded_response_text": response_text,

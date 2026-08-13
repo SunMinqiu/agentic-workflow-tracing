@@ -165,6 +165,7 @@ for entry in "${WORKLOADS[@]}"; do
     echo "  Work (local):$WORK"
     echo "  Data (Lustre):$DATA"
 
+    prepare_vllm_cache_for_cell
     set +e
     # Re-tokenize SRARGS so quoted multi-word inputs stay single argv elements
     # AND \$DATA / $DATA expand to the per-workload Lustre dir.

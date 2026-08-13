@@ -49,6 +49,8 @@ from typing import Any, Awaitable, Callable
 from agent_io_tracing.adapters.trace_writer import TraceFileWriter
 from agent_io_tracing.adapters.llm_trace import (
     apply_nocache_tag as _apply_nocache_tag,
+    attribute_cache_hit,
+    prefix_cache_counters,
     cache_request_config as _cache_request_config,
     capture_messages as _capture_messages,
     capture_request_params as _capture_request_params,
@@ -124,6 +126,13 @@ def _to_pi_usage(genomas_result: Any) -> dict:
     inp = int(usage.get("input_tokens", 0) or 0)
     out = int(usage.get("output_tokens", 0) or 0)
     cache = _cached_tokens_from_raw(genomas_result)
+    # vLLM reports no cached_tokens.  The streaming wrapper reads the server's
+    # prefix-cache counters either side of the request instead; use that only
+    # when its own check says the delta belongs to this call alone.
+    if not cache:
+        measured = genomas_result.get("_trace_cache") or {}
+        if measured.get("attributable"):
+            cache = int(measured.get("cacheRead") or 0)
     return {
         "input": inp,
         "output": out,
@@ -654,6 +663,7 @@ def _install_openai_stream_timing(llm_mod: Any) -> bool:
             params = dict(self.config.extra_message_params or {})
             params.pop("stream", None)
             params.pop("stream_options", None)
+            cache_before = prefix_cache_counters()
             stream = await self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
@@ -722,6 +732,11 @@ def _install_openai_stream_timing(llm_mod: Any) -> bool:
                 "first_token_ms": first_token_ms,
                 "last_token_ms": last_token_ms,
             }
+            result["_trace_cache"] = attribute_cache_hit(
+                cache_before,
+                prefix_cache_counters(),
+                int(_field(usage, "prompt_tokens", "input_tokens") or 0),
+            )
             return result
         except Exception as exc:
             return self.handle_exception(exc)

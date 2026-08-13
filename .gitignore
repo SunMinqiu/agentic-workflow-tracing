@@ -37,3 +37,5 @@ venv/
 .claude/
 .idea/
 .vscode/
+replay/bundles/
+replay/sweeps/

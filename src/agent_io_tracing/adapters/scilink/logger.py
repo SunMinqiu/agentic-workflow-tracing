@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import traceback
 import threading
 import time
@@ -134,6 +135,31 @@ def _normalize_usage_from_litellm(response: Any) -> dict:
     }
 
 
+def is_stream_chunk(response: Any) -> bool:
+    """True for a per-chunk callback, false for a finished response.
+
+    litellm fires the success callback once per streamed chunk; recording each
+    as a completed call inflated one request into 143 trace entries.  A chunk
+    carries ``choices[0].delta``, a finished response ``choices[0].message``;
+    anything with neither is recorded rather than dropped.
+    """
+    choices = getattr(response, "choices", None)
+    if choices is None and isinstance(response, dict):
+        choices = response.get("choices")
+    for choice in choices or []:
+        message = getattr(choice, "message", None)
+        if message is None and isinstance(choice, dict):
+            message = choice.get("message")
+        if message is not None:
+            return False
+        delta = getattr(choice, "delta", None)
+        if delta is None and isinstance(choice, dict):
+            delta = choice.get("delta")
+        if delta is not None:
+            return True
+    return False
+
+
 def _to_epoch_ms(t: Any) -> float:
     """litellm passes datetime; fall back to wall-clock if something else."""
     if hasattr(t, "timestamp"):
@@ -184,8 +210,126 @@ def _litellm_provider(kwargs: dict[str, Any], model: Any) -> str:
     return str(model).split("/", 1)[0] if "/" in str(model) else "litellm"
 
 
+def _snapshot_kwargs(kwargs: Any) -> dict[str, Any]:
+    """Copy litellm's kwargs before the callback reads them.
+
+    On a streamed call litellm keeps writing into the same kwargs dict while
+    the callback runs, so iterating it directly raises "dictionary changed
+    size during iteration" and aborts the callback -- which once left every
+    recorded response empty.  Retry the copy a few times because the same race
+    can hit the copy itself, then fall back to whatever keys we can read.
+    """
+    if not isinstance(kwargs, dict):
+        return {}
+    for _ in range(3):
+        try:
+            return dict(kwargs)
+        except RuntimeError:
+            time.sleep(0.001)
+    snapshot: dict[str, Any] = {}
+    for key in list(kwargs.keys()):
+        try:
+            snapshot[key] = kwargs[key]
+        except (KeyError, RuntimeError):
+            continue
+    return snapshot
+
+
+def _describe_exception(
+    original_exception: BaseException | None, kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Structured failure reason.
+
+    litellm does not always pass the exception positionally -- on several
+    failure paths `original_exception` arrives as None and the real error is
+    only in kwargs.  Recording repr(None) loses the reason entirely, which is
+    how a run with 39% failed calls once looked clean in the JSONL.  Try every
+    place litellm puts it, and keep the type and HTTP status separately so
+    downstream checks can group failures without parsing prose.
+    """
+    exc: Any = original_exception
+    if exc is None:
+        for key in ("exception", "original_exception", "traceback_exception"):
+            candidate = kwargs.get(key)
+            if candidate is not None and str(candidate) not in ("", "None"):
+                exc = candidate
+                break
+    if exc is None:
+        logged = kwargs.get("standard_logging_object")
+        if isinstance(logged, dict):
+            exc = logged.get("error_str") or (logged.get("error_information") or {}).get("error_message")
+
+    message = "" if exc is None else str(exc).strip()
+    if message in ("", "None"):
+        message = "unknown (litellm reported no exception object)"
+    error_type = type(exc).__name__ if isinstance(exc, BaseException) else None
+    if error_type is None:
+        for key in ("error_class", "exception_type"):
+            if kwargs.get(key):
+                error_type = str(kwargs[key])
+                break
+
+    status: int | None = None
+    for attr in ("status_code", "code", "http_status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            status = value
+            break
+        if isinstance(value, str) and value.isdigit():
+            status = int(value)
+            break
+    if status is None:
+        match = re.search(r"\b(4\d{2}|5\d{2})\b", message)
+        if match:
+            status = int(match.group(1))
+
+    return {
+        "message": message[:600],
+        "type": error_type,
+        "status_code": status,
+    }
+
+
+# Set by the launcher's forced-streaming wrapper, which consumes the chunk
+# stream itself and therefore observes the first token directly.  litellm does
+# not always populate completion_start_time when the caller drains the stream,
+# so this is the authoritative source when present.
+observed_first_token_ms: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "scilink_observed_first_token_ms", default=None
+)
+
+# The instant the last generated token arrived.  Falling back to the callback's
+# end_ms overstates it: that fires after the trailing usage-only chunk has made
+# a further round trip, which inflates TPOT on short answers.
+observed_last_token_ms: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "scilink_observed_last_token_ms", default=None
+)
+
+# This call's prefix-cache attribution, measured by the launcher from the
+# server's counters.  vLLM reports no cached_tokens of its own.
+observed_cache: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "scilink_observed_cache", default=None
+)
+
+
+def _last_token_ms(start_ms: float, end_ms: float) -> float:
+    """Observed last-token instant when the stream gave one, else end_ms."""
+    observed = observed_last_token_ms.get()
+    if observed is not None and start_ms <= observed <= end_ms:
+        return observed
+    return end_ms
+
+
 def _first_token_ms(kwargs: dict[str, Any], start_ms: float, end_ms: float) -> float | None:
-    """Read LiteLLM's measured completion-start timestamp when available."""
+    """Wall-clock instant the first token arrived, or None if not streamed.
+
+    A non-streamed response cannot carry this: the client only sees the
+    request leaving and the whole body coming back, so TTFT does not exist
+    rather than being un-measured.
+    """
+    observed = observed_first_token_ms.get()
+    if observed is not None and start_ms <= observed <= end_ms:
+        return observed
     if kwargs.get("stream") is not True:
         return None
     for name in ("completion_start_time", "first_token_time"):
@@ -327,6 +471,9 @@ class LiteLLMToolLogger(TraceFileWriter):
         start_time: Any, end_time: Any,
     ) -> None:
         """litellm success_callback signature."""
+        if is_stream_chunk(completion_response):
+            return
+        kwargs = _snapshot_kwargs(kwargs)
         try:
             # The launcher may have tagged the prompt for the no-cache arm.
             # Strip it here so every recorded field matches the cached arm byte
@@ -334,6 +481,10 @@ class LiteLLMToolLogger(TraceFileWriter):
             messages, nocache_tag = strip_nocache_tag(kwargs.get("messages") or [])
             self._capture_system_prompt_once(messages)
             usage = _normalize_usage_from_litellm(completion_response)
+            if not usage.get("cacheRead"):
+                measured = observed_cache.get() or {}
+                if measured.get("attributable"):
+                    usage["cacheRead"] = int(measured.get("cacheRead") or 0)
             if nocache_tag and usage.get("cacheRead"):
                 print(
                     "[litellm_tool_logger] WARNING: no-cache arm got cacheRead="
@@ -411,14 +562,15 @@ class LiteLLMToolLogger(TraceFileWriter):
                         "timestamp": first_token_ms,
                     },
                 })
+                last_ms = _last_token_ms(start_ms, end_ms)
                 self._append_event({
                     **common,
                     "type": "message_last_token",
                     "run_id": run_id,
-                    "wall_time_ms": end_ms,
+                    "wall_time_ms": last_ms,
                     "message": {
                         "role": "assistant",
-                        "timestamp": end_ms,
+                        "timestamp": last_ms,
                     },
                 })
             self._append_event(end_event)
@@ -446,9 +598,11 @@ class LiteLLMToolLogger(TraceFileWriter):
         start_time: Any, end_time: Any,
     ) -> None:
         """litellm failure_callback signature."""
+        kwargs = _snapshot_kwargs(kwargs)
         try:
             messages, nocache_tag = strip_nocache_tag(kwargs.get("messages") or [])
             self._capture_system_prompt_once(messages)
+            failure = _describe_exception(original_exception, kwargs)
             run_id = uuid.uuid4().hex
             parent = _current_parent.get()
             model = kwargs.get("model") or "?"
@@ -481,7 +635,9 @@ class LiteLLMToolLogger(TraceFileWriter):
                 **common,
                 "type": "message_end",
                 "run_id": run_id,
-                "error": repr(original_exception),
+                "error": failure["message"],
+                "error_type": failure["type"],
+                "error_status_code": failure["status_code"],
                 "message": {
                     "role": "assistant",
                     "timestamp": _to_epoch_ms(end_time),
@@ -504,7 +660,9 @@ class LiteLLMToolLogger(TraceFileWriter):
                 },
                 "request_params": captured_params,
                 "nocache_tag": nocache_tag,
-                "error": repr(original_exception),
+                "error": failure["message"],
+                "error_type": failure["type"],
+                "error_status_code": failure["status_code"],
             })
         except Exception as e:
             print(f"[litellm_tool_logger] on_llm_failure error: {e!r}",

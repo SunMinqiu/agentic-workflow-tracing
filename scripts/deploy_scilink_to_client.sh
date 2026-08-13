@@ -450,8 +450,10 @@ B. Full eBPF-traced run (everything end-to-end, prompt fed via stdin):
   cat .env.scilink                  # confirm AGENT_PYTHON / OPENAI_API_KEY
   \${EDITOR:-vi} config/config_scilink.env # tweak WORKLOADS / RUN_WORKLOADS
 
-  # sudo required for BCC; -E preserves OPENAI_API_KEY via .env.scilink.
-  sudo -E bash scripts/trace_script_bcc_scilink.sh
+  # The script elevates only the BCC tracer. Do not run the whole script with
+  # sudo because SciLink would put its multi-gigabyte model cache in /root.
+  sudo -n true
+  bash scripts/trace_script_bcc_scilink.sh
 
   # Outputs land in:
   #   /mnt/lustrefs/$SSH_USER/pi-ebpf-tracing-handoff/results/<timestamp>/<workload>/

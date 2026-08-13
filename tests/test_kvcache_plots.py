@@ -85,11 +85,21 @@ def test_cache_block_identity_includes_the_parent_prefix() -> None:
 
 
 def test_lineage_uses_logical_prefix_candidates_without_cache_read() -> None:
-    call = {"cacheRead": 0, "logical_source_candidates": [1, 3]}
+    # A vendor that never reports cacheRead must still get a lineage.
+    call = {"cacheRead": 0, "logical_aligned": 4352, "logical_source_candidates": [1, 3]}
     assert _lineage_parent_index(call) == 3
 
     call["logical_source_candidates"] = []
     assert _lineage_parent_index(call) is None
+
+
+def test_lineage_skips_reuse_that_does_not_survive_block_alignment() -> None:
+    """Sharing a few leading tokens is not reuse a cache could ever serve."""
+    call = {"cacheRead": 0, "logical_aligned": 0, "logical_source_candidates": [1, 3]}
+    assert _lineage_parent_index(call) is None
+
+    call["logical_aligned"] = 128
+    assert _lineage_parent_index(call) == 3
 
 
 def test_lineage_size_uses_logical_reuse_percentage() -> None:
@@ -247,7 +257,10 @@ def test_report_embeds_kvcache_figures(
     assert "## Summary — time" in report
     assert "FreeInference" in report
     assert "qwen3.6-35b" in report
-    assert "provider-managed/default" in report
+    # A cell with no request-level cache controls says nothing about them:
+    # "none recorded" is the default and only adds noise to the page.
+    assert "provider-managed/default" not in report
+    assert "KV-cache request settings" not in report
     assert "\n---\n\n### cell-b" in report
     assert "ctx_grow/call" not in report
     assert "x-agent%" not in report
@@ -392,7 +405,69 @@ def test_logical_analysis_reads_cache_geometry_from_serving_manifest(
     assert summary["cache_geometry"] == {
         "block_size": 4,
         "prefix_match_unit": 2,
+        "source": "trace/legacy",
     }
     assert summary["logical_aligned_frac"] > 0
     assert summary["block_demand"]["cumulative_unique_blocks"] > 0
     assert summary["block_demand"]["reuse_distance_blocks"]
+
+
+def test_serving_config_supplies_cache_geometry(tmp_path):
+    """The captured server config decides the geometry when the trace lacks it.
+
+    Without it the match unit falls back to LEGACY_MATCH_UNIT=128 while the
+    server actually matches on 16, so logical_aligned floors away real reuse.
+    """
+    import json as _json
+    from agent_io_tracing.analysis.kvcache.logical import analyze_cell_logical
+
+    run_ids = ["r0", "r1"]
+    messages = [
+        {"run_id": rid, "model": "Qwen3.6-27B", "provider": "vllm",
+         "agent_role": "A",
+         "messages": [{"role": "user", "content": "shared prefix " * 40 + str(i)}]}
+        for i, rid in enumerate(run_ids)
+    ]
+    events = []
+    for i, rid in enumerate(run_ids):
+        events.append({"run_id": rid, "type": "message_start",
+                       "message": {"timestamp": 1000.0 + i}})
+        events.append({"run_id": rid, "type": "message_end", "provider": "vllm",
+                       "model": "Qwen3.6-27B",
+                       "message": {"timestamp": 2000.0 + i,
+                                   "usage": {"input": 200, "output": 5, "cacheRead": 0}}})
+    (tmp_path / "messages.jsonl").write_text(
+        "\n".join(_json.dumps(m) for m in messages), encoding="utf-8")
+    (tmp_path / "pi_events.jsonl").write_text(
+        "\n".join(_json.dumps(e) for e in events), encoding="utf-8")
+    (tmp_path / "vllm_cache_before_serving_config.json").write_text(
+        _json.dumps({"block_size": "1568", "prefix_match_unit": "16",
+                     "cache_dtype": "fp8"}), encoding="utf-8")
+
+    summary = analyze_cell_logical(tmp_path)
+
+    assert summary["cache_geometry"] == {
+        "block_size": 1568,
+        "prefix_match_unit": 16,
+        "source": "server",
+    }
+    assert summary["serving_config"]["cache_dtype"] == "fp8"
+
+
+def test_per_call_cache_attribution_requires_an_exclusive_server():
+    """A counter delta belongs to this call only if it queried exactly its prompt."""
+    from agent_io_tracing.adapters.llm_trace import attribute_cache_hit
+
+    clean = attribute_cache_hit((1000, 400), (1500, 700), prompt_tokens=500)
+    assert clean["attributable"] is True
+    assert clean["cacheRead"] == 300
+
+    overlapped = attribute_cache_hit((1000, 400), (1900, 700), prompt_tokens=500)
+    assert overlapped["attributable"] is False
+    assert overlapped["cacheRead"] == 0
+    assert "overlapped" in overlapped["reason"]
+
+    restarted = attribute_cache_hit((1000, 400), (10, 4), prompt_tokens=500)
+    assert restarted["attributable"] is False
+
+    assert attribute_cache_hit(None, (1, 1), 5)["attributable"] is False

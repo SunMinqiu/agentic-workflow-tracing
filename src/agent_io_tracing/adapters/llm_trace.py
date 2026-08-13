@@ -12,7 +12,6 @@ from datetime import datetime
 from typing import Any
 
 
-EMPTY_USAGE = {"input": 0, "output": 0, "cacheRead": 0, "totalTokens": 0}
 _CACHE_REQUEST_KEYS = (
     "prompt_cache_key",
     "prompt_cache_retention",
@@ -68,14 +67,27 @@ def stable_json(value: Any) -> str:
         return str(value)
 
 
+# Fields a chat template renders but that live outside `content`.  Dropping
+# them cost real tokens: replaying a 19-call SciLink trace through vLLM's own
+# /tokenize came in 0.65-2.8% under the server's recorded input on exactly the
+# calls that carried tool_calls, and the deficit grew with every tool round.
+# Kept optional so a message without them serializes as it always did.
+MESSAGE_EXTRA_FIELDS = ("tool_calls", "tool_call_id", "name", "function_call")
+
+
 def normalize_messages(messages: Any) -> list[dict[str, Any]]:
     """Preserve the outgoing role and content values used for prefix analysis."""
     output: list[dict[str, Any]] = []
     for message in messages or []:
-        output.append({
+        entry: dict[str, Any] = {
             "role": field(message, "role"),
             "content": field(message, "content"),
-        })
+        }
+        for name in MESSAGE_EXTRA_FIELDS:
+            value = field(message, name)
+            if value is not None:
+                entry[name] = jsonable(value)
+        output.append(entry)
     return output
 
 
@@ -166,6 +178,11 @@ def capture_response(response: Any) -> dict[str, Any]:
 # prompt can still be rebuilt exactly (tag + original), which must score
 # logical == realized == 0.
 
+
+
+EMPTY_USAGE = {"input": 0, "output": 0, "cacheRead": 0, "totalTokens": 0}
+
+
 NOCACHE_TAG_PATTERN = re.compile(r"^\[nocache:[0-9a-f]{32}\]\n")
 
 
@@ -185,6 +202,8 @@ def apply_nocache_tag(messages: Any, tag: str) -> Any:
     # Multimodal or unexpected shape: prepend a separate leading message so the
     # tag is still the very first token of the prefill.
     return [{"role": "system", "content": tag}, *messages]
+
+
 
 
 def strip_nocache_tag(messages: Any) -> tuple[Any, str | None]:
@@ -349,3 +368,70 @@ def infer_phase(messages: Any) -> str:
     if any(word in text for word in ("memory snippet", "validated code snippet", "snippet store")):
         return "memory_write"
     return "reasoning"
+
+
+# ----- per-call prefix-cache measurement ------------------------------------
+#
+# vLLM leaves usage.prompt_tokens_details null, so a response never says how
+# much of its prompt was served from cache.  Its Prometheus counters do, and
+# reading them either side of one request attributes the delta to that request
+# -- verified directly: a single request moved queries by exactly its prompt
+# token count.  The attribution only holds while nothing else is in flight, so
+# every reading carries the check that proves it.
+
+PREFIX_CACHE_QUERIES = "vllm:prefix_cache_queries_total"
+PREFIX_CACHE_HITS = "vllm:prefix_cache_hits_total"
+
+
+def prefix_cache_counters(url: str | None = None, timeout: float = 2.0):
+    """(queries, hits) in tokens, or None when no endpoint answers."""
+    import urllib.request
+
+    base = (url or os.environ.get("VLLM_URL") or "").strip()
+    if not base:
+        return None
+    base = base.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    try:
+        with urllib.request.urlopen(f"{base}/metrics", timeout=timeout) as response:
+            text = response.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    queries = hits = None
+    for line in text.splitlines():
+        if line.startswith(PREFIX_CACHE_QUERIES):
+            queries = float(line.rsplit(" ", 1)[-1])
+        elif line.startswith(PREFIX_CACHE_HITS):
+            hits = float(line.rsplit(" ", 1)[-1])
+        if queries is not None and hits is not None:
+            break
+    if queries is None or hits is None:
+        return None
+    return int(queries), int(hits)
+
+
+def attribute_cache_hit(before, after, prompt_tokens: int) -> dict[str, Any]:
+    """Turn a counter pair into this call's cached tokens, with its own proof.
+
+    ``attributable`` is the whole point: the queries delta must equal this
+    request's prompt tokens.  Anything else means another request overlapped
+    and the hits delta is not ours, so the caller must not record it.
+    """
+    if not before or not after:
+        return {"attributable": False, "reason": "counters unavailable"}
+    queries = after[0] - before[0]
+    hits = after[1] - before[1]
+    if queries < 0 or hits < 0:
+        return {"attributable": False, "reason": "counters reset mid-call"}
+    ok = bool(prompt_tokens) and queries == int(prompt_tokens)
+    return {
+        "attributable": ok,
+        "queries_delta": queries,
+        "hits_delta": hits,
+        "cacheRead": hits if ok else 0,
+        "reason": None if ok else (
+            f"queries delta {queries} != prompt tokens {prompt_tokens}; "
+            "another request overlapped"
+        ),
+    }

@@ -244,7 +244,6 @@ def test_analyze_cell_segments_end_to_end(tmp_path):
         + sum(s["reuse_tokens"] for s in summary["segments"])
         == summary["prompt_tokens_total"]
     )
-    assert summary["resend_ratio"] > 1.0
 
     # the whole point of splitting by section: the parts add back up
     for s in summary["segments"]:

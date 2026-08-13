@@ -10,6 +10,7 @@ from typing import Any
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 LATENCY_TIMELINE_PNG = "kvcache_inference_latency_timeline.png"
 OUTPUT_LATENCY_PNG = "kvcache_output_vs_latency.png"
@@ -300,6 +301,7 @@ def plot_latency_breakdown(summary: dict[str, Any], out_png: Path) -> None:
         color="#999999", label="client finalization",
     )
     ax.set_xlabel("stream-timed inference index")
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.set_ylabel("seconds")
     ax.set_title("Inference latency breakdown")
     ax.legend(fontsize=8)

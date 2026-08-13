@@ -48,6 +48,8 @@ from typing import Any
 
 import tiktoken
 
+from agent_io_tracing.analysis.kvcache import server_tokens as _server_tokens
+
 LEGACY_MATCH_UNIT = 128
 CELL_JSON = "kvcache_logical.json"
 CACHE_WARMING_PNG = "kvcache_cache_warming.png"
@@ -204,11 +206,12 @@ def _insert_and_match(root: dict, tokens: list[int]) -> int:
     return matched
 
 
-def _preview(enc: tiktoken.Encoding, token_ids: list[int], head: int = 600, tail: int = 280) -> str:
-    text = enc.decode(token_ids) if token_ids else ""
+def _preview(render, lo: int, hi: int, head: int = 600, tail: int = 280) -> str:
+    """Show the token range [lo, hi) as text, eliding the middle when long."""
+    text = render(lo, hi) if hi > lo else ""
     if len(text) <= head + tail + 40:
         return text
-    return f"{text[:head]}\n  …[{len(token_ids)} tokens reused total]…\n{text[-tail:]}"
+    return f"{text[:head]}\n  …[{hi - lo} tokens reused total]…\n{text[-tail:]}"
 
 
 def _lcp_len(left: list[int], right: list[int]) -> int:
@@ -240,10 +243,29 @@ def _positive_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+SERVING_CONFIG = "vllm_cache_before_serving_config.json"
+
+
+def read_serving_config(cell: Path) -> dict[str, Any]:
+    """The server's own cache_config_info, captured beside the counters.
+
+    Without it the geometry falls back to LEGACY_MATCH_UNIT, and a knob sweep
+    cannot say which configuration produced which number.
+    """
+    path = cell / SERVING_CONFIG
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def _cache_geometry(
     calls: list[dict[str, Any]],
     block_size: int | None,
     prefix_match_unit: int | None,
+    server_config: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     """Resolve physical storage and prefix-match units from the arm manifest."""
     observed: set[tuple[int | None, int | None]] = set()
@@ -268,14 +290,19 @@ def _cache_geometry(
             f"{sorted(observed, key=repr)}"
         )
     observed_block, observed_match = next(iter(observed), (None, None))
+    # `serving` above is rebound inside the loop; the captured server config
+    # arrives under its own name so the two cannot collide.
+    server_config = server_config or {}
     physical = (
         _positive_int(block_size)
         or observed_block
+        or _positive_int(server_config.get("block_size"))
         or LEGACY_MATCH_UNIT
     )
     matching = (
         _positive_int(prefix_match_unit)
         or observed_match
+        or _positive_int(server_config.get("prefix_match_unit"))
         or physical
     )
     return physical, matching
@@ -435,6 +462,83 @@ def _candidate_count_table(per_call: list[dict[str, Any]]) -> list[dict[str, Any
     return rows
 
 
+def read_server_prefix_cache(cell: Path, total_input_tokens: int | None = None) -> dict[str, Any] | None:
+    """Server-measured realized reuse, for backends that do not report it.
+
+    OpenAI and FreeInference return usage.prompt_tokens_details.cached_tokens,
+    so their realized figure comes from the response itself and this file does
+    not exist.  vLLM 0.26 leaves that field null while its prefix cache is
+    hitting, so the trace scripts snapshot the server's Prometheus counters
+    around each cell; the delta is that cell's realized reuse in tokens.
+
+    This never overrides a vendor-reported number -- callers use it only when
+    cacheRead is absent.  When ``total_input_tokens`` is given it is compared
+    against the queries delta: the two match exactly when this run was the
+    server's only client, and a mismatch marks the reading unattributable.
+    """
+    path = cell / "vllm_cache_realized.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not data.get("queries"):
+        return None
+    queries = int(data["queries"])
+    result = {
+        "source": data.get("source", "vllm_prometheus_prefix_cache"),
+        # Snapshots taken before the unit was verified are labelled "blocks".
+        # They are not: the queries delta equals the cell's input tokens
+        # exactly, which is only possible if the counter counts tokens.  Trust
+        # the measurement over the stale label rather than propagating it.
+        "unit": "tokens",
+        "recorded_unit_label": data.get("unit"),
+        "queries": queries,
+        "hits": int(data.get("hits") or 0),
+        "hit_rate": data.get("hit_rate"),
+        "sole_client": None,
+    }
+    if total_input_tokens:
+        result["sole_client"] = queries == int(total_input_tokens)
+        result["queries_vs_input_ratio"] = round(queries / int(total_input_tokens), 4)
+    return result
+
+
+def _is_nocache_arm(cell: Path) -> bool:
+    """True when this cell deliberately defeated the prefix cache."""
+    path = cell / "messages.jsonl"
+    if not path.is_file():
+        return False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            if json.loads(line).get("nocache_tag"):
+                return True
+        except json.JSONDecodeError:
+            continue
+    return False
+
+
+def realized_provenance(
+    cell: Path, per_call: list[dict[str, Any]], server_cache: dict | None,
+) -> str:
+    """vendor | server | nocache_arm | unmeasured.
+
+    "unmeasured" must not render as 0%: unknown reuse and zero reuse are
+    different findings.
+    """
+    if any((call.get("cacheRead") or 0) > 0 for call in per_call):
+        return "vendor"
+    if server_cache and server_cache.get("hit_rate") is not None:
+        return "server"
+    if _is_nocache_arm(cell):
+        return "nocache_arm"
+    return "unmeasured"
+
+
 def analyze_cell_logical(
     cell: Path,
     dump_prefixes: bool = False,
@@ -445,12 +549,21 @@ def analyze_cell_logical(
     if not calls:
         return None
 
+    serving = read_serving_config(cell)
     physical_block_size, match_unit = _cache_geometry(
         calls,
         block_size,
         prefix_match_unit,
+        serving,
     )
     enc = _encoding_for(calls[0]["model"])
+    # When the serving engine tokenized these prompts for us, its counts are
+    # the truth: they include the tools schema and price images as images.
+    # Missing entries fall back to tiktoken per call, so a partially built
+    # cache degrades one call at a time instead of failing the cell.
+    server_tokens = _server_tokens.load(cell)
+    server_token_strs = _server_tokens.load_token_strs(cell)
+    n_from_server = 0
     prefix_lines: list[str] = []
     role_totals: dict[str, int] = {}
     role_global_calls: dict[str, list[int]] = {}
@@ -473,8 +586,28 @@ def analyze_cell_logical(
     first_start_ms = calls[0]["start_ms"]
 
     for call_index, c in enumerate(calls):
-        tokens = enc.encode(_serialize(c["messages"]), disallowed_special=())
+        tokens = server_tokens.get(c["run_id"])
+        from_server = tokens is not None
+        if from_server:
+            n_from_server += 1
+        else:
+            tokens = enc.encode(_serialize(c["messages"]), disallowed_special=())
         n = len(tokens)
+
+        # Render a token range as the text that produced it.  Server ids belong
+        # to the engine's vocabulary, so tiktoken cannot decode them; the cache
+        # carries their surface forms instead, which also keeps the prefix dump
+        # working when the report is regenerated with no tunnel up.
+        strs = server_token_strs.get(c["run_id"]) if from_server else None
+        if strs is not None and len(strs) == n:
+            def render(lo: int, hi: int, _s=strs) -> str:
+                return _server_tokens.decode_token_strs(_s[lo:hi])
+        elif from_server:
+            def render(lo: int, hi: int) -> str:
+                return f"<{hi - lo} tokens; rebuild server_tokens.json to see the text>"
+        else:
+            def render(lo: int, hi: int, _t=tokens) -> str:
+                return enc.decode(_t[lo:hi])
 
         trie_match = _insert_and_match(global_trie, tokens)
         rt = role_tries.setdefault(c["role"], {})
@@ -534,7 +667,7 @@ def analyze_cell_logical(
         )
         if dump_prefixes:
             role_call_counts[c["role"]] = role_call_counts.get(c["role"], 0) + 1
-            new_head = enc.decode(tokens[g:g + 60]) if g < n else ""
+            new_head = render(g, min(g + 60, n)) if g < n else ""
             prefix_lines.append(
                 f"===== global_call={len(per_call)}  role={c['role']}  "
                 f"role_call={role_call_counts[c['role']]}/{role_totals[c['role']]}  "
@@ -544,7 +677,7 @@ def analyze_cell_logical(
                 f"exact_hash_sources={exact_hash_sources}  "
                 f"latest_source_age_s={latest_start_age}  "
                 f"newest_possible_source_age_s={latest_completion_gap} =====\n"
-                f"--- REUSED PREFIX (served from cache) ---\n{_preview(enc, tokens[:g])}\n"
+                f"--- REUSED PREFIX (served from cache) ---\n{_preview(render, 0, g)}\n"
                 f"--- DIVERGES HERE → NEW TAIL BEGINS ---\n{new_head!r}\n"
             )
 
@@ -601,7 +734,20 @@ def analyze_cell_logical(
 
     summary = {
         "cell": cell.name,
-        "tokenizer": enc.name,
+        "tokenizer": (
+            f"{_server_tokens.SOURCE}+{enc.name}"
+            if 0 < n_from_server < len(calls)
+            else _server_tokens.SOURCE if n_from_server
+            else enc.name
+        ),
+        # Which numbers came from the engine's own tokenizer.  A reader must be
+        # able to tell a corrected cell from an uncorrected one without
+        # guessing from the workflow name.
+        "token_source": {
+            "server_tokenized_calls": n_from_server,
+            "tiktoken_calls": len(calls) - n_from_server,
+            **_server_tokens.load_meta(cell),
+        },
         "n_calls": len(calls),
         "our_input_tokens": sum_our_tokens,
         "openai_input_tokens": sum_input,
@@ -620,7 +766,11 @@ def analyze_cell_logical(
         "cache_geometry": {
             "block_size": physical_block_size,
             "prefix_match_unit": match_unit,
+            "source": "server" if serving else "trace/legacy",
         },
+        # The server's own cache_config_info at cell start: which knobs this
+        # cell actually ran under.
+        "serving_config": serving,
         "block_demand": _reuse_distance_summary(block_references),
         "source_class_counts": {
             source_class: sum(1 for c in per_call if c["source_class"] == source_class)
@@ -675,7 +825,19 @@ def _role_colors(roles: list[str]) -> dict[str, str]:
 
 
 def _lineage_parent_index(call: dict[str, Any]) -> int | None:
-    """Return the latest source sharing the call's longest logical prefix."""
+    """Return the latest source sharing the call's longest logical prefix.
+
+    Only calls whose shared prefix survives block alignment get an edge.  A
+    prompt can share two or twenty leading tokens with an earlier one -- the
+    opening words of a system prompt -- and that is a textual coincidence, not
+    reuse: a KV cache matches whole blocks, so anything under one block yields
+    nothing.  Drawing those edges filled the graph with links that no cache
+    could ever serve.  ``logical_aligned`` is exactly the post-alignment
+    figure, so requiring it to be positive keeps the lineage to reuse that is
+    physically realizable.
+    """
+    if int(call.get("logical_aligned", 0) or 0) <= 0:
+        return None
     candidates = call.get("logical_source_candidates") or []
     return max(candidates) if candidates else None
 
@@ -699,6 +861,7 @@ def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
     from matplotlib.lines import Line2D
 
     pc = summary["per_call"]
@@ -806,7 +969,7 @@ def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
         ax.add_artist(role_artist)
     size_legend = [
         Line2D(
-            [0], [0], marker="o", color="none", label=f"{fraction:.0%}",
+            [0], [0], marker="o", color="none", label=f"{fraction:.2%}",
             markerfacecolor="#A7A7A7", markeredgecolor="#555555",
             markersize=_lineage_marker_size(fraction) ** 0.5,
         )
@@ -823,6 +986,8 @@ def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
     ax.set_xlim(-1, max(len(pc), 1))
     ax.set_yticks([])
     ax.set_xlabel("global LLM call index")
+    # a call index is a count, so fractional ticks are meaningless
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.set_ylabel("logical prefix branches")
     ax.set_title("Logical KV-cache lineage")
     ax.grid(True, axis="x", alpha=0.18)
@@ -851,6 +1016,7 @@ def plot_cache_warming(summary: dict, out_png: Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
 
     x, realized, logical = _per_call_reuse(summary)
     fig, ax = plt.subplots(figsize=(11, 4.5))
@@ -880,7 +1046,21 @@ def plot_cache_warming(summary: dict, out_png: Path) -> None:
         markersize=2.8,
         label="logical aligned / input",
     )
+    server = summary.get("server_prefix_cache")
+    if server and server.get("hit_rate") is not None:
+        # The server exposes one counter for the whole cell, not per call, so
+        # this is a level rather than a curve.  Same unit and denominator as
+        # the orange line -- tokens served over tokens submitted -- so the two
+        # are directly comparable; it is dashed because it cannot be resolved
+        # per call.
+        label = f"server-measured realized ({server['hit_rate']:.2%}, cell-level)"
+        if server.get("sole_client") is False:
+            label += " — server had other clients"
+        ax.axhline(
+            server["hit_rate"], color="#D55E00", lw=1.6, ls="--", label=label,
+        )
     ax.set_xlabel("LLM call index (chronological)")
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.set_ylabel("per-call reuse fraction")
     ax.set_ylim(0, 1)
     ax.set_title("Per-call prefix reuse")

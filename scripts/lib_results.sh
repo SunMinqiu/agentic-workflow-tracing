@@ -22,7 +22,7 @@ default_lustre_results_root() {
 # RUN_LABEL is for a study whose name says more than its task list does.
 run_dir_name() {
     local workflow="$1"; shift
-    local stamp="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
+    local stamp="${RUN_STAMP:-$(env TZ=America/New_York date +%Y%m%d_%H%M%S)}"
     if [ -n "${RUN_LABEL:-}" ]; then
         printf '%s_%s_%s' "$workflow" "$RUN_LABEL" "$stamp"
     elif [ "$#" -eq 1 ]; then
@@ -152,6 +152,131 @@ wait_for_trace_file() {
     return 1
 }
 
+# Start every vLLM-backed cell with an independent prefix cache. Without this,
+# a task can reuse prefixes loaded by the task before it and the comparison no
+# longer measures that task alone. Provider-managed APIs have no reset endpoint
+# and leave VLLM_URL unset, so this is a no-op for them.
+prepare_vllm_cache_for_cell() {
+    local base="${VLLM_URL:-}"
+    if [ -z "$base" ]; then
+        CACHE_STATE="provider_managed"
+        export CACHE_STATE
+        return 0
+    fi
+    base="${base%/}"
+    base="${base%/v1}"
+    case "${VLLM_KEEP_PREFIX_CACHE:-0}" in
+        1|true|TRUE|yes|YES)
+            CACHE_STATE="warm_inherited"
+            export CACHE_STATE
+            echo "  Prefix cache: keeping existing vLLM state" >&2
+            return 0
+            ;;
+    esac
+    if ! curl -fsS --connect-timeout 3 --max-time 30 \
+        -X POST "$base/reset_prefix_cache" >/dev/null; then
+        echo "Error: could not reset $base/reset_prefix_cache." >&2
+        echo "Start vLLM with VLLM_SERVER_DEV_MODE=1, or set" \
+             "VLLM_KEEP_PREFIX_CACHE=1 for an intentional warm run." >&2
+        return 1
+    fi
+    CACHE_STATE="cold_by_reset"
+    export CACHE_STATE
+    echo "  Prefix cache: reset before cell" >&2
+}
+
+# vLLM 0.26 serves an OpenAI-compatible /v1 but leaves usage.prompt_tokens_
+# details null, so every call's cacheRead reads 0 even while the server's
+# prefix cache is hitting.  Its Prometheus counters are the only place the
+# realized reuse is visible.  Snapshot them around a cell and the delta is
+# that cell's realized reuse.  The counters are in tokens: across three
+# runs the queries delta equalled the cell's total input tokens exactly,
+# which both fixes the unit and proves no other client shared the server.
+#
+#   vllm_cache_snapshot <output_json_path>
+# Writes nothing and returns 0 when no vLLM endpoint is reachable, so runs
+# against OpenAI or a down tunnel are unaffected.
+vllm_cache_snapshot() {
+    local out="$1"
+    local base="${VLLM_URL:-}"
+    # Say so when the reading is skipped.  A skipped snapshot leaves realized
+    # at 0, which in a report is indistinguishable from a measured 0 -- one
+    # GenoMAS run was read as "the cache is not working" when in fact the
+    # server was at 29% and nobody had asked it.
+    if [ -z "$base" ]; then
+        echo "  Note: VLLM_URL unset; not reading the server's prefix-cache" \
+             "counters. Realized reuse will be UNMEASURED, not zero." >&2
+        return 0
+    fi
+    base="${base%/}"
+    base="${base%/v1}"
+
+    local metrics
+    if ! metrics="$(curl -s --connect-timeout 3 --max-time 10 "$base/metrics" 2>/dev/null)" \
+       || [ -z "$metrics" ]; then
+        echo "  Warning: $base/metrics unreachable; realized reuse will be" \
+             "UNMEASURED for this cell." >&2
+        return 0
+    fi
+
+    local queries hits
+    queries="$(printf '%s\n' "$metrics" | awk '/^vllm:prefix_cache_queries_total/ {print $2; exit}')"
+    hits="$(printf '%s\n' "$metrics" | awk '/^vllm:prefix_cache_hits_total/ {print $2; exit}')"
+    if [ -z "$queries" ] || [ -z "$hits" ]; then
+        echo "  Warning: $base/metrics has no vllm:prefix_cache_* counters;" \
+             "realized reuse will be UNMEASURED for this cell." >&2
+        return 0
+    fi
+
+    printf '{"unix_time": %s, "prefix_cache_queries_total": %s, "prefix_cache_hits_total": %s}\n' \
+        "$(date +%s)" "$queries" "$hits" > "$out"
+
+    # The serving configuration this cell actually ran against: cache_dtype,
+    # block_size, prefix_match_unit, capacity, and everything else vLLM
+    # publishes.  Read once per cell, next to the counters -- a knob sweep is
+    # unattributable without it, and the server's live config answers for the
+    # server as it is now, not as it was during the run.
+    printf '%s\n' "$metrics" \
+        | awk '/^vllm:cache_config_info\{/ {print; exit}' \
+        | python3 -c '
+import json, re, sys
+line = sys.stdin.read().strip()
+inner = re.search(r"\{(.*)\}", line)
+config = {}
+if inner:
+    for pair in re.findall(r"([A-Za-z0-9_]+)=\"([^\"]*)\"", inner.group(1)):
+        config[pair[0]] = pair[1]
+json.dump(config, open(sys.argv[1], "w"), indent=1, sort_keys=True)
+' "${out%.json}_serving_config.json" 2>/dev/null || true
+}
+
+# Turn the two snapshots into the cell's realized token-level reuse.
+#   vllm_cache_delta <before.json> <after.json> <output_json>
+vllm_cache_delta() {
+    local before="$1" after="$2" out="$3"
+    [ -s "$before" ] && [ -s "$after" ] || return 0
+    python3 - "$before" "$after" "$out" <<'PY' || true
+import json, sys
+before, after, out = (json.load(open(sys.argv[1])), json.load(open(sys.argv[2])), sys.argv[3])
+dq = before["prefix_cache_queries_total"]
+dq = after["prefix_cache_queries_total"] - dq
+dh = after["prefix_cache_hits_total"] - before["prefix_cache_hits_total"]
+json.dump({
+    "source": "vllm_prometheus_prefix_cache",
+    # Verified against three runs: queries equals the cell's total input
+    # tokens exactly, so these counters are in tokens, and hits/queries is
+    # directly comparable to a vendor-reported cacheRead/input.
+    "unit": "tokens",
+    "queries": dq,
+    "hits": dh,
+    "hit_rate": (dh / dq) if dq > 0 else None,
+    # queries != this cell's total input tokens means another client was
+    # hitting the same server, and the delta is not attributable to this run.
+    "validity": "compare queries against total_input_tokens; equal means sole client",
+}, open(out, "w"), indent=1)
+PY
+}
+
 run_kvcache_report() {
     local python="$1"
     local run_root="$2"
@@ -184,6 +309,19 @@ return_results_ownership() {
 # and escalate INT -> TERM -> KILL on a bounded timer so a stuck tracer can
 # never hang the run. SIGINT first: the tracer drains its perf buffer and
 # flushes ebpf_events.log on that path, so KILL would truncate the trace.
+#
+# The tracer runs as root while this script may run as the regular user, and a
+# regular user cannot signal a root process: plain `kill` returns EPERM, which
+# `|| true` used to swallow.  Every signal then did nothing, the escalation ran
+# to SIGKILL, and the trace was truncated with an empty bcc.err.  So retry each
+# signal through sudo whenever the direct attempt is refused.
+_signal_tracer() {
+    local sig="$1" pid="$2"
+    kill -"$sig" "$pid" >/dev/null 2>&1 && return 0
+    [ -d "/proc/$pid" ] || return 0              # already gone, nothing to do
+    sudo -n kill -"$sig" "$pid" >/dev/null 2>&1 || true
+}
+
 stop_tracer() {
     local sudo_pid="$1"
     local grace="${2:-30}"
@@ -195,10 +333,15 @@ stop_tracer() {
 
     # "Alive" means the wrapper OR the tracer itself: if sudo were reaped first
     # we would otherwise return while the tracer is still writing the log.
+    #
+    # Tested on the cluster: `kill -0` against the root-owned tracer returns
+    # EPERM for a regular user, which is indistinguishable from "no such
+    # process" and would report a running tracer as dead.  /proc answers
+    # regardless of who owns the process.
     _stop_tracer_alive() {
         local p
         for p in "$sudo_pid" $kids; do
-            kill -0 "$p" >/dev/null 2>&1 && return 0
+            [ -d "/proc/$p" ] && return 0
         done
         return 1
     }
@@ -207,7 +350,7 @@ stop_tracer() {
     for sig in INT TERM KILL; do
         _stop_tracer_alive || break
         for p in $kids "$sudo_pid"; do
-            kill -"$sig" "$p" >/dev/null 2>&1 || true
+            _signal_tracer "$sig" "$p"
         done
         waited=0
         while _stop_tracer_alive && [ "$waited" -lt "$grace" ]; do

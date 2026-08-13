@@ -146,6 +146,7 @@ for entry in "${WORKLOADS[@]}"; do
     echo "  Data:       $DATA"
     echo "  Prompt:     $PROMPT"
 
+    prepare_vllm_cache_for_cell
     set +e
     "$AGENT_PYTHON" -m agent_io_tracing.adapters.chemgraph.launcher \
         "$WORK" "$OUT" \

@@ -31,24 +31,27 @@ def fmt(n: Any) -> str:
 
 
 def pct(x: Any) -> str:
-    return f"{x:.0%}" if isinstance(x, (int, float)) else "n/a"
+    return f"{x:.2%}" if isinstance(x, (int, float)) else "n/a"
 
 
 def dur(seconds: Any) -> str:
-    """Seconds as m:ss above a minute, plain seconds below it."""
+    """Seconds with two decimal places, using minutes above one minute."""
     if not isinstance(seconds, (int, float)):
         return "n/a"
     if seconds < 60:
-        return f"{seconds:.1f}s"
-    return f"{int(seconds) // 60}m{int(seconds) % 60:02d}s"
+        return f"{seconds:.2f}s"
+    minutes = int(seconds) // 60
+    remainder = seconds - minutes * 60
+    return f"{minutes}m{remainder:05.2f}s"
 
 
 TOKEN_HEADERS = [
-    "vendor", "model", "calls", "total_input", "median_input", "total_output",
-    "cache_size", "resend×", "realized%", "logical%", "gap%",
+    "vendor", "model", "calls", "total input", "median input", "total output",
+    "cache size", "realized reuse", "logical reuse", "reuse gap",
 ]
 TIME_HEADERS = [
-    "vendor", "model", "calls", "Σinfer", "span", "median TTFT", "median TPOT",
+    "vendor", "model", "calls", "total inference", "wall", "median TTFT",
+    "median TPOT",
 ]
 
 
@@ -61,18 +64,60 @@ def _identity(r: dict[str, Any]) -> list[str]:
     ]
 
 
+def realized_cell(r: dict[str, Any]) -> str:
+    """Realized reuse, from the vendor when it reports it, else the server.
+
+    vLLM leaves ``usage.prompt_tokens_details`` null, so ``cacheRead`` is 0 on
+    every call even while its prefix cache runs at 46%.  Printing that 0 in the
+    headline table while the body of the same report states the real figure is
+    worse than printing nothing.  The dagger marks the number as cell-level,
+    read from the engine's counters rather than summed from per-call usage.
+    """
+    realized = r.get("realized_frac")
+    if realized:
+        return pct(realized)
+    server = r.get("server_prefix_cache") or {}
+    rate = server.get("hit_rate")
+    if rate is not None:
+        return f"{pct(rate)}†" if server.get("sole_client") else f"{pct(rate)}†?"
+    # Nothing reported anything.  "0%" would read as "the cache did nothing",
+    # which is a claim we cannot make -- one run displayed 0% while the server
+    # was at 29%, because its counters were never read.
+    if r.get("realized_provenance") == "unmeasured":
+        return "unmeasured"
+    return pct(realized)
+
+
+def gap_cell(r: dict[str, Any]) -> str:
+    """How much of the ideal reuse the backend left on the table.
+
+    ``gap_frac`` was computed against a realized of 0, so on vLLM it just
+    restated logical.  When the server reports its own hit rate, subtract that
+    instead -- the difference between 47% ideal and 46% achieved is the whole
+    point of the column.
+    """
+    if not r.get("realized_frac"):
+        rate = (r.get("server_prefix_cache") or {}).get("hit_rate")
+        aligned = r.get("logical_aligned_frac")
+        if rate is not None and aligned is not None:
+            return f"{pct(round(aligned - rate, 4))}†"
+        # gap = logical - realized is undefined when realized is unknown;
+        # printing logical again under a different heading invents a finding.
+        if r.get("realized_provenance") == "unmeasured":
+            return "unmeasured"
+    return pct(r.get("gap_frac"))
+
+
 def token_cells(r: dict[str, Any]) -> list[str]:
     seg = r.get("segments") or {}
-    resend = seg.get("resend_ratio")
     return _identity(r) + [
         fmt(r.get("total_input", 0)),
         fmt(r.get("median_input", 0)),
         fmt(r.get("total_output", 0)),
         fmt(seg["cache_size_tokens"]) if seg else "n/a",
-        f"{resend}x" if resend else "n/a",
-        pct(r.get("realized_frac")),
+        realized_cell(r),
         pct(r.get("logical_frac")),
-        pct(r.get("gap_frac")),
+        gap_cell(r),
     ]
 
 
@@ -84,7 +129,7 @@ def time_cells(r: dict[str, Any]) -> list[str]:
         dur((latency.get("overall") or {}).get("total_duration_s")),
         dur(latency.get("wall_clock_span_s")),
         dur(stream.get("median_ttft_s")),
-        f"{tpot * 1000:.1f}ms/token" if isinstance(tpot, (int, float)) else "n/a",
+        f"{tpot * 1000:.2f}ms/token" if isinstance(tpot, (int, float)) else "n/a",
     ]
 
 
@@ -130,8 +175,16 @@ def token_table(
     lead_headers: list[str] | None = None,
     lead_cells: Callable[[dict[str, Any]], list[str]] = _cell_name,
 ) -> list[str]:
-    return _table(rows, TOKEN_HEADERS, token_cells,
-                  lead_headers or ["cell"], lead_cells)
+    L = _table(rows, TOKEN_HEADERS, token_cells,
+               lead_headers or ["cell"], lead_cells)
+    # Explain the dagger where it is used, not in a distant legend.
+    if any(r.get("server_prefix_cache") for r in rows):
+        L.append("")
+        L.append(
+            "† cell-level, from the engine's own counters. `?` = another "
+            "client shared the server; not attributable."
+        )
+    return L
 
 
 def time_table(

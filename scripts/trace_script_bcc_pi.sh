@@ -104,6 +104,7 @@ for repo in "$CASES_DIR"/*/; do
     echo "=== Processing: $REPO_NAME ==="
     echo "  Start time: $(date +%H:%M:%S)"
 
+    prepare_vllm_cache_for_cell
     set +e
     # Start the agent paused so no tool activity runs before probes are active.
     "$AGENT_PYTHON" -m agent_io_tracing.adapters.pi.launcher "$repo" "$OUT" $PI_ANALYZE_ARGS \

@@ -378,7 +378,6 @@ def analyze_cell_segments(cell: Path) -> dict[str, Any]:
         "n_calls": len(calls),
         "prompt_tokens_total": written_total,
         "cache_size_tokens": resident,
-        "resend_ratio": round(written_total / resident, 3) if resident else None,
         "n_segments": len(segments),
         "sections": describe(grammar, ranges),
         "content_breakdown": _content_breakdown(segments, list(grammar.tags)),
@@ -438,8 +437,7 @@ def main() -> None:
         print(
             f"{cell}: {summary['n_calls']} calls, "
             f"{summary['prompt_tokens_total']:,} prompt tokens → "
-            f"{summary['cache_size_tokens']:,} cache tokens "
-            f"({summary['resend_ratio']}x resend)"
+            f"{summary['cache_size_tokens']:,} cache tokens"
         )
 
 

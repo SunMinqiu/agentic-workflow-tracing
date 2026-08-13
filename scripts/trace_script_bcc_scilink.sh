@@ -14,6 +14,12 @@
 
 set -euo pipefail
 
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Error: run this script as the regular SSH user, not through sudo." >&2
+    echo "The script elevates only the BCC tracer. Running the whole script as root writes SciLink's multi-gigabyte model cache to /root." >&2
+    exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CFG_DIR="$ROOT_DIR/config"
@@ -193,6 +199,7 @@ for entry in "${WORKLOADS[@]}"; do
     echo "  Session dir: $OUT/scilink_session"
     echo "  Data (Lustre):$DATA"
 
+    prepare_vllm_cache_for_cell
     set +e
     # Re-tokenize SRARGS so quoted multi-word inputs stay single argv elements
     # AND \$OUT / \$SCILINK_REPO / \$DATA expand to their per-workload values.
@@ -235,6 +242,29 @@ for entry in "${WORKLOADS[@]}"; do
     AGENT_PID=$!
     kill -STOP "$AGENT_PID" >/dev/null 2>&1 || true
 
+    vllm_cache_snapshot "$OUT/vllm_cache_before.json"
+
+    INSTRUMENTATION_LEVEL="ebpf"
+    if [ "${COLLECT_LUSTRE_COUNTERS:-0}" = "1" ] || [ "${COLLECT_LUSTRE_COUNTERS:-0}" = "true" ]; then
+        INSTRUMENTATION_LEVEL="ebpf+lustre-counters"
+    fi
+
+    # pull_agentic_run.sh treats manifest.json as the marker of a result cell,
+    # so every cell must write one even though SciLink has no replay cache.
+    "$POST_PYTHON" -m agent_io_tracing.experiments.run_manifest \
+        --output "$OUT/manifest.json" \
+        --workload "SciLink" \
+        --task-id "$NAME" \
+        --model "$SCILINK_MODEL" \
+        --agent-count 1 \
+        --pid "$AGENT_PID" \
+        --data-dir "$DATA" \
+        --work-dir "$WORK" \
+        --output-dir "$OUT" \
+        --instrumentation "$INSTRUMENTATION_LEVEL" \
+        --extra-json "{\"scilink_repo\": \"$SCILINK_REPO\", \"subcommand\": \"$SUBCMD\", \"cell\": \"$CELL\", \"embedding_model\": \"${SCILINK_EMBEDDING_MODEL:-}\"}" \
+        > "$OUT/manifest.log" 2>&1 || true
+
     BCC_NET_FLAG="${BCC_INCLUDE_NET:-1}"
     if [ "$BCC_NET_FLAG" = "1" ] || [ "$BCC_NET_FLAG" = "true" ]; then
         NET_ARG="--include-net"
@@ -242,7 +272,7 @@ for entry in "${WORKLOADS[@]}"; do
         NET_ARG="--no-include-net"
     fi
 
-    sudo -E env "PYTHONPATH=$PYTHONPATH" "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
+    sudo -n -E env "PYTHONPATH=$PYTHONPATH" "$TRACER_PYTHON" -m agent_io_tracing.tracing.bcc_tracer \
         --root-pid "$AGENT_PID" \
         --output "$OUT/ebpf_events.log" \
         $NET_ARG \
@@ -260,6 +290,10 @@ for entry in "${WORKLOADS[@]}"; do
 
     wait "$AGENT_PID"
     EXIT_CODE=$?
+
+    vllm_cache_snapshot "$OUT/vllm_cache_after.json"
+    vllm_cache_delta "$OUT/vllm_cache_before.json" "$OUT/vllm_cache_after.json" \
+        "$OUT/vllm_cache_realized.json"
 
     stop_tracer "$TRACER_PID"
     set -e

@@ -39,3 +39,5 @@ venv/
 .vscode/
 replay/bundles/
 replay/sweeps/
+
+/replay/

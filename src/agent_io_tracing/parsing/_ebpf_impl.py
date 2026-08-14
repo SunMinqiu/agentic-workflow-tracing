@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import heapq
 import json
 import posixpath
 import re
@@ -456,33 +457,64 @@ def parse_tool_calls(tool_log: Path) -> list[ToolCall]:
     return tool_calls
 
 
-def parse_events(events_log: Path) -> tuple[list[dict], dict | None]:
-    """Parse JSONL events, returning (events, meta_dict).
-
-    The meta dict (first line with ``type == "meta"``) is returned separately
-    so callers can use ``wall_start_ns`` for timezone-offset calibration.
-    """
-    events: list[dict] = []
-    meta: dict | None = None
+def read_event_meta(events_log: Path) -> dict | None:
+    """Return the trace metadata record without retaining event rows."""
     with events_log.open("r", encoding="utf-8") as f:
-        for idx, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
+        for line in f:
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
-                print(f"Warning: invalid JSON at {events_log}:{idx}", file=sys.stderr)
                 continue
             if obj.get("type") == "meta":
-                if meta is None:
-                    meta = obj
+                return obj
+    return None
+
+
+def iter_events(events_log: Path, reorder_window_ns: int = 1_000_000_000):
+    """Yield events in timestamp order with bounded memory.
+
+    Perf buffers from different CPUs can arrive slightly out of order. A
+    one-second heap window restores their order without retaining the full
+    trace. Events arriving later than that fail loudly instead of corrupting
+    descriptor and attribution state.
+    """
+    pending: list[tuple[int, int, dict]] = []
+    newest_ts = 0
+    sequence = 0
+    last_yielded_ts = -1
+    late_message = (
+        f"eBPF events exceeded the {reorder_window_ns / 1_000_000_000:g}-second "
+        "reorder window"
+    )
+    with events_log.open("r", encoding="utf-8") as f:
+        for line_number, line in enumerate(f, 1):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                print(
+                    f"Warning: invalid JSON at {events_log}:{line_number}",
+                    file=sys.stderr,
+                )
                 continue
-            if "ts_ns" not in obj:
+            if event.get("type") == "meta" or "ts_ns" not in event:
                 continue
-            events.append(obj)
-    events.sort(key=lambda e: int(e["ts_ns"]))
-    return events, meta
+            ts_ns = int(event["ts_ns"])
+            newest_ts = max(newest_ts, ts_ns)
+            heapq.heappush(pending, (ts_ns, sequence, event))
+            sequence += 1
+            cutoff = newest_ts - reorder_window_ns
+            while pending and pending[0][0] <= cutoff:
+                ts_ns, _, ready = heapq.heappop(pending)
+                if ts_ns < last_yielded_ts:
+                    raise RuntimeError(late_message)
+                last_yielded_ts = ts_ns
+                yield ready
+    while pending:
+        ts_ns, _, ready = heapq.heappop(pending)
+        if ts_ns < last_yielded_ts:
+            raise RuntimeError(late_message)
+        last_yielded_ts = ts_ns
+        yield ready
 
 
 def _compute_tz_offset(
@@ -540,21 +572,15 @@ def ns_to_epoch_ms(ts_ns: int) -> float:
     return ts_ns / 1_000_000.0
 
 
-def get_active_tool_calls(ts: datetime, tool_calls: list[ToolCall]) -> list[ToolCall]:
-    return [tc for tc in tool_calls if tc.contains(ts)]
-
-
 class ActiveToolIndex:
     """Sweep-line index of currently-active tool calls.
 
-    Replaces the O(events × tool_calls) per-event scan (get_active_tool_calls /
-    _single_active_tool_id) with an amortized O(events + tool_calls) sweep.
+    Replaces the O(events × tool_calls) per-event scan with an amortized
+    O(events + tool_calls) sweep.
 
     REQUIREMENT: ``advance_to(ts)`` must be called with non-decreasing ``ts``
-    (events are sorted by ts_ns in parse_events, so both build_state_tables and
-    the main loop iterate them in order). ``active()`` then returns exactly the
-    tools tc where ``tc.start_time <= ts <= tc.end_time`` — identical semantics
-    to ``get_active_tool_calls``, just without rescanning every tool each call.
+    as provided by ``iter_events``. ``active()`` then returns exactly the tools
+    where ``tc.start_time <= ts <= tc.end_time``.
     """
 
     def __init__(self, tool_calls: list[ToolCall]) -> None:
@@ -699,104 +725,80 @@ def _path_match(entry_path: str, tool_path: str) -> bool:
     )
 
 
-def _single_active_tool_id(ts: datetime, tool_calls: list[ToolCall]) -> str | None:
-    active = get_active_tool_calls(ts, tool_calls)
-    if len(active) == 1:
-        return active[0].tool_id
-    return None
+def update_state_tables(
+    event: dict,
+    fd_table: FDTable,
+    proc_tree: ProcessTree,
+    index: ActiveToolIndex,
+) -> None:
+    """Enrich one event and advance process and descriptor state."""
+    etype = event.get("type")
+    ts = ns_to_datetime(int(event["ts_ns"]))
+    index.advance_to(ts)
+    tool_id = index.single_active_id()
 
+    if etype == "fork":
+        parent = int(event.get("pid", -1))
+        child = int(event.get("child_pid", -1))
+        if parent > 0 and child > 0:
+            proc_tree.handle_fork(parent, child, tool_id)
+            fd_table.copy_table_for_child(parent, child)
+        return
+    if etype not in {"syscall", "libc_io"}:
+        return
 
-def build_state_tables(events: list[dict], tool_calls: list[ToolCall]) -> tuple[FDTable, ProcessTree]:
-    """
-    Pass over all events to:
-    - build process tree from fork events
-    - build fd->path state from open/close
-    - enrich fd-based syscall events with resolved path and opening tool id
-    """
-    fd_table = FDTable()
-    proc_tree = ProcessTree()
-    index = ActiveToolIndex(tool_calls)
-
-    for event in events:
-        etype = event.get("type")
-        ts = ns_to_datetime(int(event["ts_ns"]))
-        index.advance_to(ts)
-        tool_id = index.single_active_id()
-
-        if etype == "fork":
-            parent = int(event.get("pid", -1))
-            child = int(event.get("child_pid", -1))
-            if parent > 0 and child > 0:
-                proc_tree.handle_fork(parent, child, tool_id)
-                fd_table.copy_table_for_child(parent, child)
-            continue
-
-        if etype not in {"syscall", "libc_io"}:
-            continue
-
-        syscall = str(event.get("syscall") or event.get("function") or "unknown")
-        pid = int(event.get("pid", 0))
-        if syscall == "mmap":
-            # mmap(addr, length, prot, flags, fd, offset): fd is arg4, not arg0.
-            fd = int(event.get("arg4", -1))
-        elif event.get("type") == "libc_io" and syscall in {"fread", "fwrite"}:
+    syscall = str(event.get("syscall") or event.get("function") or "unknown")
+    pid = int(event.get("pid", 0))
+    if syscall == "mmap":
+        fd = int(event.get("arg4", -1))
+    elif etype == "libc_io" and syscall in {"fread", "fwrite"}:
+        try:
             raw_fd = event.get("stdio_fd")
-            try:
-                fd = int(raw_fd) if raw_fd is not None else None
-            except (TypeError, ValueError):
-                fd = None
-        else:
-            fd = int(event.get("arg0", -1)) if syscall in FD_BASED_SYSCALLS else None
+            fd = int(raw_fd) if raw_fd is not None else None
+        except (TypeError, ValueError):
+            fd = None
+    else:
+        fd = int(event.get("arg0", -1)) if syscall in FD_BASED_SYSCALLS else None
 
-        # Enrich fd-based events before any table mutation (especially close).
-        if fd is not None and fd >= 0:
-            info = fd_table.lookup(pid, fd)
-            if info:
-                if not event.get("path"):
-                    event["_resolved_path"] = info.path
-                event["_fd_tool_id"] = info.tool_id
-                event["_fd_generation"] = info.open_generation
-                event["_fd_open_flags"] = info.flags
+    if fd is not None and fd >= 0:
+        info = fd_table.lookup(pid, fd)
+        if info:
+            if not event.get("path"):
+                event["_resolved_path"] = info.path
+            event["_fd_tool_id"] = info.tool_id
+            event["_fd_generation"] = info.open_generation
+            event["_fd_open_flags"] = info.flags
 
-        # Resolve relative paths for *at() syscalls using the dirfd (arg0).
-        if syscall in DIRFD_BASED_SYSCALLS:
-            raw_path = event.get("path")
-            if isinstance(raw_path, str) and raw_path and not raw_path.startswith("/"):
-                dirfd = int(event.get("arg0", AT_FDCWD))
-                resolved = fd_table.resolve_path(pid, raw_path, dirfd)
-                if resolved != raw_path:
-                    event["path"] = resolved
+    if syscall in DIRFD_BASED_SYSCALLS:
+        raw_path = event.get("path")
+        if isinstance(raw_path, str) and raw_path and not raw_path.startswith("/"):
+            dirfd = int(event.get("arg0", AT_FDCWD))
+            event["path"] = fd_table.resolve_path(pid, raw_path, dirfd)
 
-        if etype != "syscall":
-            continue
-
-        if syscall == "openat":
-            ret = int(event.get("ret", -1))
-            path = event.get("path")
-            if ret >= 0 and isinstance(path, str) and path:
-                fd_table.handle_open(
-                    pid,
-                    ret,
-                    path,
-                    ts,
-                    tool_id,
-                    decode_open_flags(int(event.get("arg2", 0))),
-                )
-        elif syscall == "close" and fd is not None and fd >= 0:
-            fd_table.handle_close(pid, fd)
-        elif syscall == "chdir":
-            ret = int(event.get("ret", 0))
-            chdir_path = event.get("path")
-            if ret == 0 and isinstance(chdir_path, str) and chdir_path:
-                fd_table.handle_chdir(pid, chdir_path)
-        elif syscall == "fchdir":
-            ret = int(event.get("ret", 0))
-            if ret == 0 and fd is not None and fd >= 0:
-                info = fd_table.lookup(pid, fd)
-                if info and info.path:
-                    fd_table.handle_chdir(pid, info.path)
-
-    return fd_table, proc_tree
+    if etype != "syscall":
+        return
+    if syscall == "openat":
+        ret = int(event.get("ret", -1))
+        path = event.get("path")
+        if ret >= 0 and isinstance(path, str) and path:
+            fd_table.handle_open(
+                pid,
+                ret,
+                path,
+                ts,
+                tool_id,
+                decode_open_flags(int(event.get("arg2", 0))),
+            )
+    elif syscall == "close" and fd is not None and fd >= 0:
+        fd_table.handle_close(pid, fd)
+    elif syscall == "chdir":
+        path = event.get("path")
+        if int(event.get("ret", 0)) == 0 and isinstance(path, str) and path:
+            fd_table.handle_chdir(pid, path)
+    elif syscall == "fchdir" and int(event.get("ret", 0)) == 0 and fd is not None:
+        info = fd_table.lookup(pid, fd)
+        if info and info.path:
+            fd_table.handle_chdir(pid, info.path)
 
 
 def match_event_to_tool(
@@ -1198,7 +1200,7 @@ def process_trace_dir(
         raise FileNotFoundError(f"ebpf_events.log not found in {trace_dir}")
 
     tool_calls = parse_tool_calls(tool_log)
-    events, meta = parse_events(events_log)
+    meta = read_event_meta(events_log)
 
     # Calibrate timezone offset so ebpf epoch timestamps align with the
     # local-time-of-day strings in tool_calls.log.
@@ -1208,16 +1210,18 @@ def process_trace_dir(
     else:
         _tz_offset_seconds = 0.0
 
-    _fd_table, proc_tree = build_state_tables(events, tool_calls)
-
     window_start, window_end = get_tool_window(tool_calls)
 
     fs_entries: list[FsEntry] = []
     lib_io_entries: list[LibIoEntry] = []
     total_events = 0
     lifecycle_types = {"fork", "exec", "exit"}
-    index = ActiveToolIndex(tool_calls)
-    for event in events:
+    state_index = ActiveToolIndex(tool_calls)
+    attribution_index = ActiveToolIndex(tool_calls)
+    fd_table = FDTable()
+    proc_tree = ProcessTree()
+    for event in iter_events(events_log):
+        update_state_tables(event, fd_table, proc_tree, state_index)
         etype = event.get("type")
         if etype in {"syscall", "libc_io"}:
             total_events += 1
@@ -1241,8 +1245,8 @@ def process_trace_dir(
             continue
 
         if is_lib_io_entry:
-            index.advance_to(lib_entry.timestamp)
-            active_tools = index.active()
+            attribution_index.advance_to(lib_entry.timestamp)
+            active_tools = attribution_index.active()
             lib_entry.matched_tool_call = match_pid_event_to_tool(
                 lib_entry.pid,
                 lib_entry.function,
@@ -1263,8 +1267,8 @@ def process_trace_dir(
 
         # Sweep index gives the active tool set in O(1) amortized instead of an
         # O(tool_calls) rescan per event.
-        index.advance_to(entry.timestamp)
-        active_tools = index.active()
+        attribution_index.advance_to(entry.timestamp)
+        active_tools = attribution_index.active()
 
         entry.matched_tool_call = match_event_to_tool(
             entry,
@@ -1319,11 +1323,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output path (default: <trace_dir>/parsed.json)",
     )
     parser.add_argument(
-        "--compact",
-        action="store_true",
-        help="Write compact JSON",
-    )
-    parser.add_argument(
         "--workspace-path",
         type=str,
         default=None,
@@ -1342,7 +1341,7 @@ def main() -> int:
     output_path = args.output if args.output else (trace_dir / "parsed.json")
     payload = result.to_dict()
     output_path.write_text(
-        json.dumps(payload, indent=None if args.compact else 2),
+        json.dumps(payload, separators=(",", ":")),
         encoding="utf-8",
     )
     print(f"Output written to {output_path}", file=sys.stderr)

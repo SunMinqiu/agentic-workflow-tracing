@@ -1914,7 +1914,11 @@ def _run_timeline_ms(
                 "Re-parse ebpf_events.log with a parser that writes absolute ts_ms; "
                 "do not use inference-overlap metrics from this parsed.json."
             )
-    if fs_bounds:
+    # Semantic events define the run wall clock. Filesystem calls may begin in
+    # interpreter startup or end in teardown and must not create artificial
+    # inference gaps. Fall back to filesystem bounds only for traces without
+    # semantic timing.
+    if fs_bounds and not event_bounds:
         event_bounds.extend(fs_bounds)
 
     wall_start = min(event_bounds) if event_bounds else 0.0

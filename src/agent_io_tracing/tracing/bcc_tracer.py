@@ -13,10 +13,14 @@ import os
 import signal
 import sys
 import time
+from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
-from bcc import BPF
+try:
+    from bcc import BPF
+except ImportError:  # Allows source-level tests on non-BCC development hosts.
+    BPF = None
 
 
 BPF_PROGRAM = r"""
@@ -135,17 +139,7 @@ static __always_inline int is_traced_syscall(u64 id) {
         case __NR_getcwd:
         case __NR_execve:
         case __NR_clone:
-        case __NR_poll:
-        case __NR_select:
-        case __NR_pselect6:
-        case __NR_ppoll:
-        case __NR_epoll_wait:
-        case __NR_epoll_pwait:
-        case __NR_futex:
-        case __NR_nanosleep:
-        case __NR_clock_nanosleep:
-        case __NR_wait4:
-        case __NR_waitid:
+__WAIT_SYSCALL_CASES__
 __NET_SYSCALL_CASES__
             return 1;
         default:
@@ -235,6 +229,13 @@ TRACEPOINT_PROBE(raw_syscalls, sys_enter) {
 
     u64 id = args->id;
     if (!is_traced_syscall(id)) {
+        return 0;
+    }
+
+    // Anonymous mmap dominates scientific Python traces but carries no file
+    // I/O information. Keep only mappings backed by a real file descriptor.
+    if (id == __NR_mmap &&
+        ((s32)args->args[4] < 0 || (args->args[3] & 0x20))) {
         return 0;
     }
 
@@ -745,11 +746,27 @@ NET_SYSCALL_CASES_C = """\
         case __NR_recvmmsg:
 """
 
+WAIT_SYSCALL_CASES_C = """\
+        case __NR_poll:
+        case __NR_select:
+        case __NR_pselect6:
+        case __NR_ppoll:
+        case __NR_epoll_wait:
+        case __NR_epoll_pwait:
+        case __NR_futex:
+        case __NR_nanosleep:
+        case __NR_clock_nanosleep:
+        case __NR_wait4:
+        case __NR_waitid:
+"""
 
-def build_bpf_program(include_net: bool) -> str:
-    placeholder = "__NET_SYSCALL_CASES__"
-    replacement = NET_SYSCALL_CASES_C if include_net else ""
-    return BPF_PROGRAM.replace(placeholder, replacement)
+
+def build_bpf_program(include_net: bool, include_waits: bool = False) -> str:
+    return (
+        BPF_PROGRAM
+        .replace("__NET_SYSCALL_CASES__", NET_SYSCALL_CASES_C if include_net else "")
+        .replace("__WAIT_SYSCALL_CASES__", WAIT_SYSCALL_CASES_C if include_waits else "")
+    )
 
 
 def syscall_name(syscall_id: int) -> str:
@@ -965,6 +982,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "measurement set.",
     )
     parser.add_argument(
+        "--include-waits",
+        action="store_true",
+        help="Trace scheduler and event-loop waits for runtime debugging. "
+             "Disabled by default because these events are not I/O metrics.",
+    )
+    parser.add_argument(
         "--hdf5-lib",
         action="append",
         default=[],
@@ -981,6 +1004,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
+    if BPF is None:
+        raise SystemExit("bcc Python bindings are required to run the tracer")
     if args.perf_pages <= 0 or args.perf_pages & (args.perf_pages - 1):
         raise SystemExit("--perf-pages must be a positive power of two")
 
@@ -1000,9 +1025,13 @@ def main() -> int:
     wall_start_ns = int(time.time() * 1_000_000_000)
     mono_start_ns = int(time.monotonic() * 1_000_000_000)
 
-    bpf_text = build_bpf_program(include_net=args.include_net)
+    bpf_text = build_bpf_program(
+        include_net=args.include_net,
+        include_waits=args.include_waits,
+    )
     print(
-        f"BPF program built (include_net={args.include_net})",
+        f"BPF program built (include_net={args.include_net}, "
+        f"include_waits={args.include_waits})",
         file=sys.stderr,
     )
     bpf = BPF(text=bpf_text)
@@ -1044,6 +1073,7 @@ def main() -> int:
             pass
 
     with out_path.open("w", encoding="utf-8") as f:
+        event_counts: Counter[str] = Counter()
         meta = {
             "type": "meta",
             "wall_start_ns": wall_start_ns,
@@ -1059,7 +1089,7 @@ def main() -> int:
         def handle_event(_cpu: int, data: ctypes.c_void_p, _size: int) -> None:
             evt = ctypes.cast(data, ctypes.POINTER(EventStruct)).contents
             evt_type = int(evt.event_type)
-            payload = {  # type: Dict[str, object]
+            payload: dict[str, object] = {
                 "ts_ns": _to_wall_ns(int(evt.mono_ts_ns)),
                 "pid": int(evt.pid),
                 "tid": int(evt.tid),
@@ -1129,6 +1159,7 @@ def main() -> int:
             else:
                 return
 
+            event_counts[str(payload.get("syscall") or payload["type"])] += 1
             f.write(json.dumps(payload) + "\n")
 
         lost_events = [0]
@@ -1170,7 +1201,23 @@ def main() -> int:
             bpf.perf_buffer_poll(timeout=50)
         f.flush()
 
-    print(f"Tracer stopped. lost_events={lost_events[0]}", file=sys.stderr)
+    stats = {
+        "schema_version": 1,
+        "include_net": args.include_net,
+        "include_waits": args.include_waits,
+        "anonymous_mmap_filtered": True,
+        "lost_events": lost_events[0],
+        "events_by_kind": dict(sorted(event_counts.items())),
+        "events_emitted": sum(event_counts.values()),
+        "trace_bytes": out_path.stat().st_size,
+    }
+    stats_path = out_path.with_name("trace_stats.json")
+    stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    print(
+        f"Tracer stopped. lost_events={lost_events[0]} "
+        f"events_emitted={stats['events_emitted']} trace_bytes={stats['trace_bytes']}",
+        file=sys.stderr,
+    )
     return 0
 
 

@@ -330,7 +330,13 @@ def parse_iso_ts(s: str) -> float:
 
 # --- Step 1: load + attribute --------------------------------------
 
-def load_codeexec_index(trace_dir: Path) -> dict:
+def load_parsed_trace(trace_dir: Path) -> dict:
+    parsed = json.load((trace_dir / "parsed.json").open())
+    annotate_parsed_execution_units(parsed, load_execution_units(trace_dir))
+    return parsed
+
+
+def load_codeexec_index(trace_dir: Path, parsed: dict | None = None) -> dict:
     """Build metadata for every parsed tool call, including non-code tools.
 
     ``parsed.json.tool_calls`` is the canonical source because adapters such as
@@ -338,39 +344,36 @@ def load_codeexec_index(trace_dir: Path) -> dict:
     ``generated_code.jsonl`` enrich those records with role, phase, error, and
     code-classification fields when available.
     """
+    if parsed is None:
+        parsed = load_parsed_trace(trace_dir)
     index: dict[str, dict] = {}
 
-    parsed_path = trace_dir / "parsed.json"
-    if parsed_path.is_file():
-        with parsed_path.open(encoding="utf-8") as f:
-            parsed = json.load(f)
-        annotate_parsed_execution_units(parsed, load_execution_units(trace_dir))
-        for call in parsed.get("tool_calls", []):
-            rid = call.get("tool_id")
-            if not isinstance(rid, str) or not rid:
-                continue
-            params = call.get("input_params") or {}
-            start = call.get("start_time")
-            end = call.get("end_time")
-            try:
-                start_ms = parse_iso_ts(start) * 1000.0 if isinstance(start, str) else 0.0
-            except (TypeError, ValueError):
-                start_ms = 0.0
-            try:
-                end_ms = parse_iso_ts(end) * 1000.0 if isinstance(end, str) else start_ms
-            except (TypeError, ValueError):
-                end_ms = start_ms
-            index[rid] = {
-                "role": "?",
-                "tool_name": call.get("tool_name") or "",
-                "code_len": int(params.get("script_len") or params.get("code_len") or 0),
-                "stdout_len": 0,
-                "t_start_ms": start_ms,
-                "t_end_ms": end_ms,
-                "error": None,
-                "phase": None,
-                "io_layers": [],
-            }
+    for call in parsed.get("tool_calls", []):
+        rid = call.get("tool_id")
+        if not isinstance(rid, str) or not rid:
+            continue
+        params = call.get("input_params") or {}
+        start = call.get("start_time")
+        end = call.get("end_time")
+        try:
+            start_ms = parse_iso_ts(start) * 1000.0 if isinstance(start, str) else 0.0
+        except (TypeError, ValueError):
+            start_ms = 0.0
+        try:
+            end_ms = parse_iso_ts(end) * 1000.0 if isinstance(end, str) else start_ms
+        except (TypeError, ValueError):
+            end_ms = start_ms
+        index[rid] = {
+            "role": "?",
+            "tool_name": call.get("tool_name") or "",
+            "code_len": int(params.get("script_len") or params.get("code_len") or 0),
+            "stdout_len": 0,
+            "t_start_ms": start_ms,
+            "t_end_ms": end_ms,
+            "error": None,
+            "phase": None,
+            "io_layers": [],
+        }
 
     pending: dict[str, dict] = {}
     with (trace_dir / "pi_events.jsonl").open() as f:
@@ -426,16 +429,12 @@ def load_codeexec_index(trace_dir: Path) -> dict:
     return index
 
 
-def load_parsed_entries(trace_dir: Path) -> list[dict]:
-    parsed = json.load((trace_dir / "parsed.json").open())
-    annotate_parsed_execution_units(parsed, load_execution_units(trace_dir))
+def load_parsed_entries(parsed: dict) -> list[dict]:
     return parsed.get("fs_entries", [])
 
 
-def load_data_io_events(trace_dir: Path) -> list[dict]:
+def load_data_io_events(parsed: dict) -> list[dict]:
     """Filter fs_entries to read/write on workload artifacts with size>0."""
-    parsed = json.load((trace_dir / "parsed.json").open())
-    annotate_parsed_execution_units(parsed, load_execution_units(trace_dir))
     out = []
     for e in parsed.get("fs_entries", []):
         syscall = e.get("syscall")
@@ -571,7 +570,7 @@ def build_namespace_summary(parsed_entries: list[dict],
     }
 
 
-def load_all_captured_io_totals(trace_dir: Path) -> dict:
+def load_all_captured_io_totals(parsed: dict) -> dict:
     """Read/write byte totals over the WHOLE agent process tree (no workload
     filter), straight from parsed.json.
 
@@ -580,7 +579,6 @@ def load_all_captured_io_totals(trace_dir: Path) -> dict:
     NB: this is the agent's process tree, not literally every process on the
     box; the tracer only follows root-pid + descendants.
     """
-    parsed = json.load((trace_dir / "parsed.json").open())
     r_bytes = w_bytes = 0
     n_r = n_w = 0
     for e in parsed.get("fs_entries", []):
@@ -1678,9 +1676,10 @@ def main():
     out_dir.mkdir(exist_ok=True)
 
     configure_paths_from_manifest(trace_dir)
-    codeexec_index = load_codeexec_index(trace_dir)
-    parsed_entries = load_parsed_entries(trace_dir)
-    io_events = load_data_io_events(trace_dir)
+    parsed = load_parsed_trace(trace_dir)
+    codeexec_index = load_codeexec_index(trace_dir, parsed)
+    parsed_entries = load_parsed_entries(parsed)
+    io_events = load_data_io_events(parsed)
     per_artifact = per_artifact_summary(io_events, codeexec_index)
     if not per_artifact:
         print(
@@ -1699,7 +1698,7 @@ def main():
     load_true_sizes(trace_dir, per_artifact)
     annotate_reuse(per_artifact)
 
-    all_captured = load_all_captured_io_totals(trace_dir)
+    all_captured = load_all_captured_io_totals(parsed)
     io_summary = build_io_volume_summary(io_events, per_artifact, all_captured)
     io_summary["by_role"] = build_role_io_attribution(io_events, codeexec_index, per_artifact)
     io_summary["namespace"] = build_namespace_summary(parsed_entries, per_artifact)

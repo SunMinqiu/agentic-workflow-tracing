@@ -11,7 +11,6 @@ This is adapted from visualize_traces.py for the strace parser output format.
 
 import argparse
 import csv
-import html
 import json
 import re
 import sys
@@ -25,7 +24,6 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -111,7 +109,6 @@ SYSCALL_CATEGORY_COLORS = {
     "control":  "#7FB3D5",   # Sky blue
     "modify":   "#A2D9CE",   # Pale teal
     "process":  "#3498DB",   # Blue
-    "blocking": "#85C1E9",   # Pale blue (currently never appears — see notes)
     "network":  "#2980B9",   # Deep blue
     "other":    "#AAB7B8",   # Cool gray
 }
@@ -172,13 +169,6 @@ SYSCALL_CATEGORIES = {
     "process": {
         "clone", "clone3", "fork", "vfork",
         "execve",
-        "wait4", "waitpid", "waitid",
-    },
-    "blocking": {
-        "select", "pselect6", "poll", "ppoll",
-        "epoll_wait", "epoll_pwait",
-        "futex",
-        "nanosleep", "clock_nanosleep",
     },
     "network": {
         "recvfrom", "sendto",
@@ -193,7 +183,6 @@ SYSCALL_CATEGORY_TO_RESOURCE = {
     "metadata": "File-IO",
     "data": "File-IO",
     "modify": "File-IO",
-    "blocking": "Wait",
     "process": "Process-mgmt",
 }
 
@@ -1069,11 +1058,9 @@ _RASTER_PX = 2000
 #      under their parent).
 #   2. Tool lane    — one row per unique tool name (real tools only; subagents
 #      have been moved to subagent_calls.log by langchain_tool_logger.py).
-#   3. System lane  — FS syscalls split into the 8 syscall categories
-#      (metadata / data / control / modify / process / blocking / network /
-#      other). Bars (not dots), width = duration. The tracer captures common
-#      blocking/wait syscalls (futex / poll / epoll_wait / nanosleep / wait4)
-#      so long model waits and subprocess waits do not render as blank gaps.
+#   3. System lane  — filesystem, process, and network syscalls. Runtime waits
+#      are deliberately absent because semantic logs already measure LLM,
+#      tool, and subagent spans without guessing from scheduler activity.
 #
 # Health check: after computing all bar intervals, the time-union of
 # LLM ∪ tool ∪ subagent intervals should approximately cover the trace's
@@ -1698,7 +1685,7 @@ def _fmt_duration(s: float) -> str:
 # real width-encoded bars.
 SYS_BAR_MIN_S = 0.1   # 100 ms — user-tunable threshold
 
-# Categories that count as file-system I/O (vs process/network/blocking/other).
+# Categories that count as file-system I/O.
 FILE_IO_CATEGORIES = ("metadata", "data", "control", "modify")
 
 
@@ -1713,14 +1700,12 @@ def _effective_category_series(fs_df):
     """
     op = fs_df["operation"]
     cat = op.map(_SYSCALL_TO_CATEGORY).fillna("other")
-    # wait4/waitpid/waitid = waiting for a child process, NOT process creation.
-    cat = cat.where(~op.isin({"wait4", "waitpid", "waitid"}), "wait")
     # Only open/close control calls are storage time. mmap/ioctl/fcntl/chdir
     # are process/control overhead and must not inflate File-IO.
     cat = cat.where(~((cat == "control") & ~op.isin(STORAGE_CONTROL_SYSCALLS)), "other")
     # read/write on a NON-file (pipe / stdin / stdout / socket; no resolved path)
-    # is IPC / blocking-on-a-subprocess, not file I/O. Both go to the "wait"
-    # sentinel, which is NOT one of the System-lane rows, so they are excluded.
+    # is IPC, not file I/O. Both go to an internal sentinel excluded from the
+    # System lane.
     if "path" in fs_df.columns:
         path = fs_df["path"]
         pathless = path.isna() | (path.astype(str).str.len() == 0) | (path.astype(str) == "None")
@@ -1799,7 +1784,7 @@ def create_agent_timeline_plotly(trace_dir: Path, output_path: Path) -> None:
     )
     tool_labels = [r["label"] for r in tool_rows]
 
-    # System lane: fixed row order (blocking/wait dropped — not charted).
+    # System lane: fixed row order.
     syscall_rows = ["metadata", "data", "control", "modify", "process",
                     "network", "other"]
 

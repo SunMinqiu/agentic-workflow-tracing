@@ -549,6 +549,8 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
 
 Launcher 会拦截重试循环。连续发送 20 次相同 prompt 时，进程以退出码 3 终止。`SCILINK_MAX_REPEAT_CALLS` 可以修改该阈值，设为 0 可关闭检查。`SCILINK_MAX_CALLS` 限制总调用数，默认值 0 表示不限制。
 
+SciLink 默认不采集 `futex`、`epoll_wait` 等运行时等待事件，也不采集匿名 `mmap`。这些事件不能直接证明 agent 的有效 I/O，却会显著增加 trace 体积。文件映射仍会采集。只有调试调度和阻塞问题时才应直接为 tracer 添加 `--include-waits`。后处理默认最多并行执行两个互不依赖的步骤，可通过 `POSTPROCESS_MAX_WORKERS` 调整。
+
 如需事后统计调用数，执行：
 
 ```zsh
@@ -952,9 +954,10 @@ Duty cycle 为读写系统调用时间区间并集除以对应 wall time。全�
 | `phase1_metrics.json`       | 聚合指标      | 文件非空且 JSON 可解析         |
 | `bcc.err`                   | tracer 状态 | 最后一行包含 `lost_events=0` |
 | `visualizations/index.html` | 单 cell 报告 | 文件非空                   |
+| `trace_stats.json`          | 采集事件统计    | 文件非空且 JSON 可解析         |
 
 
-GenoMAS 和 SciLink 还必须包含 `pi_events.jsonl` 和 `tool_calls.log`。`pi_events.jsonl` 的每个非空行必须是合法 JSON。
+GenoMAS 和 SciLink 还必须包含 `pi_events.jsonl` 和 `tool_calls.log`。`pi_events.jsonl` 的每个非空行必须是合法 JSON。SciLink 还会生成 `postprocess_timings.json`，其中每个后处理步骤的退出码必须为 0。
 
 拉回结果后，在 Mac 执行：
 

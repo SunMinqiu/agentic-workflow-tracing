@@ -484,7 +484,7 @@ def active_degree(
     }
 
 
-def _load_observed_pid_intervals(trace_dir: Path) -> list[tuple[float, float]]:
+def _load_observed_pid_intervals(parsed: dict[str, Any]) -> list[tuple[float, float]]:
     """
     Coarse OS-process parallelism from parsed.json.
 
@@ -493,14 +493,7 @@ def _load_observed_pid_intervals(trace_dir: Path) -> list[tuple[float, float]]:
     process overlap and may overstate true CPU activity when a child is alive
     but idle.
     """
-    parsed_json = trace_dir / "parsed.json"
-    if not parsed_json.exists():
-        return []
-    try:
-        data = json.loads(parsed_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    fs_entries = data.get("fs_entries")
+    fs_entries = parsed.get("fs_entries")
     if not isinstance(fs_entries, list):
         return []
     by_pid: dict[int, list[datetime]] = defaultdict(list)
@@ -562,7 +555,10 @@ def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, 
     return merged
 
 
-def _load_io_busy_worker_intervals(trace_dir: Path) -> tuple[list[tuple[float, float]], dict[str, Any]]:
+def _load_io_busy_worker_intervals(
+    trace_dir: Path,
+    parsed: dict[str, Any],
+) -> tuple[list[tuple[float, float]], dict[str, Any]]:
     """
     Worker-level I/O-busy intervals from parsed data I/O events.
 
@@ -571,15 +567,7 @@ def _load_io_busy_worker_intervals(trace_dir: Path) -> tuple[list[tuple[float, f
     worker's own intervals are merged first so the active degree counts workers,
     not raw syscall events.
     """
-    parsed_json = trace_dir / "parsed.json"
-    if not parsed_json.exists():
-        return [], {"workers": 0, "events": 0}
-    try:
-        data = json.loads(parsed_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return [], {"workers": 0, "events": 0}
-
-    annotate_parsed_execution_units(data, load_execution_units(trace_dir))
+    annotate_parsed_execution_units(parsed, load_execution_units(trace_dir))
     artifact_path = trace_dir / "lineage" / "artifacts.csv"
     workload_paths: set[str] = set()
     if artifact_path.is_file():
@@ -587,11 +575,11 @@ def _load_io_busy_worker_intervals(trace_dir: Path) -> tuple[list[tuple[float, f
             workload_paths = {
                 row["path"] for row in csv.DictReader(handle) if row.get("path")
             }
-    tool_workers = _tool_worker_index(data)
+    tool_workers = _tool_worker_index(parsed)
     by_worker: dict[str, list[tuple[float, float]]] = defaultdict(list)
     events = 0
     bytes_seen = 0
-    for entry in data.get("fs_entries", []):
+    for entry in parsed.get("fs_entries", []):
         if not isinstance(entry, dict):
             continue
         syscall = str(entry.get("syscall") or "")
@@ -844,7 +832,12 @@ def compute_trace_summary(trace_dir: Path) -> dict[str, Any]:
     starts = [ev.start_ms for ev in events.values()]
     ends = [ev.end_ms for ev in events.values()]
     wall_ms = max(ends) - min(starts)
-    pid_intervals = _load_observed_pid_intervals(trace_dir)
+    parsed_path = trace_dir / "parsed.json"
+    try:
+        parsed = json.loads(parsed_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        parsed = {}
+    pid_intervals = _load_observed_pid_intervals(parsed)
     summary["parallel_degree"]["observed_processes"] = {
         **active_degree(pid_intervals, wall_ms),
         "unit": "pid",
@@ -854,7 +847,7 @@ def compute_trace_summary(trace_dir: Path) -> dict[str, Any]:
             "Thread-level parallelism is unavailable unless the tracer records TIDs separately.",
         ],
     }
-    io_intervals, io_meta = _load_io_busy_worker_intervals(trace_dir)
+    io_intervals, io_meta = _load_io_busy_worker_intervals(trace_dir, parsed)
     summary["parallel_degree"]["io_busy_workers"] = {
         **active_degree(io_intervals, wall_ms),
         "unit": "worker",

@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from agent_io_tracing.analysis.phase1_metrics import (
     compute_byte_normalized_summary,
     compute_inter_arrival,
     compute_request_size_cdf,
+    _run_timeline_ms,
 )
 from agent_io_tracing.analysis.execution_units import annotate_parsed_execution_units
 from agent_io_tracing.analysis.workload_paths import workload_path_index
@@ -109,6 +113,32 @@ class ComparisonMetricTests(unittest.TestCase):
         self.assertEqual(result["read"]["p50_s"], 1.0)
         self.assertEqual(result["write"]["n_intervals"], 1)
         self.assertEqual(result["write"]["p50_s"], 2.0)
+
+    def test_runtime_syscalls_do_not_expand_semantic_wall_clock(self) -> None:
+        events = {
+            "llm": SimpleNamespace(
+                start_ms=1_000.0, end_ms=2_000.0, kind="llm", run_id="llm",
+            ),
+            "tool": SimpleNamespace(
+                start_ms=2_000.0, end_ms=3_000.0, kind="tool", run_id="tool",
+                name="Read", role=None, args={},
+            ),
+        }
+        parsed = {
+            "fs_entries": [
+                {"ts_ms": 100.0, "duration": 0.0},
+                {"ts_ms": 9_000.0, "duration": 0.0},
+            ]
+        }
+        with patch(
+            "agent_io_tracing.analysis.parallelism.load_events",
+            return_value=events,
+        ):
+            timeline = _run_timeline_ms(Path("/missing"), parsed, {}, {})
+
+        self.assertEqual(timeline["wall_start_ms"], 1_000.0)
+        self.assertEqual(timeline["wall_end_ms"], 3_000.0)
+        self.assertEqual(timeline["wall_s"], 2.0)
 
     def test_classic_pid_interval_becomes_execution_unit(self) -> None:
         parsed = {

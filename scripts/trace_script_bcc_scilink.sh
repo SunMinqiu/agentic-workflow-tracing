@@ -329,74 +329,15 @@ for ws_out in "$BASE_OUT"/*/; do
     echo "Processing: $NAME"
     set +e
     failed_step=""
-
-    echo "  Parsing eBPF logs..."
-    run_postprocess_module "$POST_PYTHON" "$ws_out" parse_ebpf parse.log \
-        agent_io_tracing.parsing.ebpf "$ws_out"
-    PARSE_RC=$?
-    sed 's/^/    /' "$ws_out/parse.log" || true
-
-    if [ -f "$ws_out/parsed.json" ]; then
-        if [ -f "$ws_out/pi_events.jsonl" ] && [ -f "$ws_out/tool_calls.log" ]; then
-            echo "  Summarizing pi-compat events..."
-            run_postprocess_module "$POST_PYTHON" "$ws_out" summarize summarize.log \
-                agent_io_tracing.analysis.summary "$ws_out"
-            sed 's/^/    /' "$ws_out/summarize.log" || true
-
-        else
-            echo "  Skipping pi summary (pi_events.jsonl or tool_calls.log missing)"
-        fi
-
-        echo "  Computing lineage/artifact metrics..."
-        LINEAGE_DATA_PATH_PREFIXES="$WS_OUT_ABS/scilink_session/:$WS_OUT_ABS/work/:$LINEAGE_WORKLOAD_DATA/:$SCILINK_REPO/examples/" \
-        LINEAGE_EXCLUDE_PATH_SUBSTRINGS="/.venv/" \
-        "$POST_PYTHON" -m agent_io_tracing.lineage.analyzer "$ws_out" \
-            > "$ws_out/lineage.log" 2>&1
-        LIN_RC=$?
-        sed 's/^/    /' "$ws_out/lineage.log" || true
-        [ $LIN_RC -ne 0 ] && failed_step="${failed_step:+$failed_step,}lineage"
-
-        if [ -f "$ws_out/pi_events.jsonl" ] && [ -f "$ws_out/tool_calls.log" ]; then
-            echo "  Computing DAG + parallelism metrics..."
-            run_postprocess_module "$POST_PYTHON" "$ws_out" parallelism parallelism.log \
-                agent_io_tracing.analysis.parallelism "$ws_out"
-            PAR_RC=$?
-            sed 's/^/    /' "$ws_out/parallelism.log" || true
-            if [ $PAR_RC -eq 0 ]; then
-                [ -f "$ws_out/call_dag.html" ] && echo "    DAG HTML: $ws_out/call_dag.html"
-                [ -f "$ws_out/parallelism_summary.json" ] && echo "    Metrics:  $ws_out/parallelism_summary.json"
-            fi
-        fi
-
-        echo "  Computing phase-1 I/O metrics..."
-        run_postprocess_module "$POST_PYTHON" "$ws_out" phase1_metrics phase1_metrics.log \
-            agent_io_tracing.analysis.phase1_metrics "$ws_out"
-        sed 's/^/    /' "$ws_out/phase1_metrics.log" || true
-
-        run_postprocess_module "$POST_PYTHON" "$ws_out" execution_units execution_units.log \
-            agent_io_tracing.analysis.execution_units "$ws_out"
-
-        run_postprocess_module "$POST_PYTHON" "$ws_out" trace_quality trace_quality.log \
-            agent_io_tracing.analysis.trace_quality "$ws_out"
-
-        echo "  Generating per-run I/O characterization figures..."
-        run_postprocess_module "$POST_PYTHON" "$ws_out" per_run_io_char per_run_io_char.log \
-            agent_io_tracing.analysis.per_run_io_char --results "$ws_out" --runs .
-        sed 's/^/    /' "$ws_out/per_run_io_char.log" || true
-
-        echo "  Generating visualizations..."
-        run_postprocess_module "$POST_PYTHON" "$ws_out" visualize visualize.log \
-            agent_io_tracing.viz.trace "$ws_out"
-        VIZ_RC=$?
-        sed 's/^/    /' "$ws_out/visualize.log" || true
-        if [ $VIZ_RC -eq 0 ]; then
-            [ -f "$ws_out/visualizations/index.html" ] && echo "    Viz index: $ws_out/visualizations/index.html"
-            [ -f "$ws_out/visualizations/agent_timeline.html" ] && echo "    Agent timeline: $ws_out/visualizations/agent_timeline.html"
-        fi
-    else
-        echo "  Skipping visualization (parsed.json not found)"
-        failed_step="${failed_step:+$failed_step,}no_parsed_json"
-    fi
+    LINEAGE_DATA_PATH_PREFIXES="$WS_OUT_ABS/scilink_session/:$WS_OUT_ABS/work/:$LINEAGE_WORKLOAD_DATA/:$SCILINK_REPO/examples/" \
+    LINEAGE_EXCLUDE_PATH_SUBSTRINGS="/.venv/" \
+    "$POST_PYTHON" -m agent_io_tracing.analysis.postprocess "$ws_out" \
+        --python "$POST_PYTHON" \
+        --max-workers "${POSTPROCESS_MAX_WORKERS:-2}" \
+        >"$ws_out/postprocess.log" 2>&1
+    POSTPROCESS_RC=$?
+    sed 's/^/    /' "$ws_out/postprocess.log" || true
+    [ "$POSTPROCESS_RC" -ne 0 ] && failed_step="postprocess"
     set -e
 
     if [ -n "$failed_step" ]; then

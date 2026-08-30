@@ -82,7 +82,9 @@ def test_run_bundle_prints_request_progress(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         runner,
         "_completion",
-        lambda endpoint, model, item: {"index": item["index"]},
+        lambda endpoint, model, item, output_tokens, cache_salt: {
+            "index": item["index"],
+        },
     )
     bundle = {
         "served_model": "model",
@@ -99,3 +101,33 @@ def test_run_bundle_prints_request_progress(monkeypatch, capsys) -> None:
     assert "replay: starting 2 requests (mode=packed, workers=2)" in progress
     assert "replay: completed 1/2 requests" in progress
     assert "replay: completed 2/2 requests" in progress
+
+
+def test_serial_replay_uses_one_worker_and_unique_salts(monkeypatch, capsys) -> None:
+    observed = []
+    monkeypatch.setattr(
+        runner,
+        "_completion",
+        lambda endpoint, model, item, output_tokens, cache_salt: observed.append(
+            (item["index"], output_tokens, cache_salt)
+        ) or {"index": item["index"]},
+    )
+    bundle = {
+        "served_model": "model",
+        "requests": [
+            {"index": 0, "request_id": "a"},
+            {"index": 1, "request_id": "b"},
+        ],
+    }
+
+    runner.run_bundle(
+        bundle,
+        object(),
+        "serial",
+        output_tokens=7,
+        cache_salt_mode="unique",
+        cache_salt="test",
+    )
+
+    assert observed == [(0, 7, "test:0:a"), (1, 7, "test:1:b")]
+    assert "mode=serial, workers=1" in capsys.readouterr().err

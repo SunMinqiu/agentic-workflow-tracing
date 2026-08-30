@@ -91,6 +91,17 @@ if ! "$AGENT_PYTHON" -c "import sys; sys.path.insert(0,'$GENOMAS_REPO'); import 
     exit 1
 fi
 
+# GenoMAS validates --model against a closed registry in utils/llm.py and aborts
+# with "Could not detect a provider" for anything missing from it.  The served
+# vLLM model name is only known now (VLLM_SERVED_MODEL), and any re-clone of the
+# GenoMAS checkout drops a previous deploy-time registration, so make sure the
+# name is registered on every run rather than trusting deploy state.
+if ! "$AGENT_PYTHON" "$SCRIPT_DIR/ensure_genomas_model.py" \
+        --repo "$GENOMAS_REPO" --model "$GENOMAS_MODEL"; then
+    echo "Error: could not register '$GENOMAS_MODEL' in GenoMAS's model registry." >&2
+    exit 1
+fi
+
 # GenoMAS catches provider failures and converts them into empty responses, so
 # its process may still exit 0 after a 401.  Verify the live provider before
 # starting BCC and fail the whole run early.  Replay runs do not need network.
@@ -161,6 +172,7 @@ echo "Output dir: $BASE_OUT"
 echo "Model:      $GENOMAS_MODEL"
 echo "Vendor:     ${GENOMAS_VENDOR:-unrecorded}"
 echo "Stream timing: ${GENOMAS_CAPTURE_STREAM_TIMING:-1}"
+echo "Prompt prefix: ${GENOMAS_PROMPT_PREFIX_TOKENS:-0} tokens"
 echo "Cells:      ${#WORKLOADS[@]} (= max-workers values × reps)"
 echo "Inter-run sleep: ${INTER_RUN_SLEEP_SEC}s"
 [ -n "${RUN_WORKLOADS:-}" ] && echo "RUN_WORKLOADS filter: $RUN_WORKLOADS"
@@ -335,7 +347,7 @@ done
 
 if [ "$CELL_IDX" -eq 0 ]; then
     echo "Error: RUN_WORKLOADS selected zero GenoMAS cells: ${RUN_WORKLOADS:-<empty>}" >&2
-    echo "Available cells: A_c1_w1,A_c2_w1,A_c2_w2,A_c3_w1,A_c3_w2,A_c4_w1,A_c4_w2,A_c4_w4,A_c8_w1,A_c8_w4,B_t1_w2,B_t2_w2,B_t4_w2,full_c1_w2" >&2
+    echo "Available cells: A_c1_w1,A_c2_w1,A_c2_w2,A_c3_w1,A_c3_w2,A_c4_w1,A_c4_w2,A_c4_w4,A_c8_w1,A_c8_w4,A_c10_w2,A_c10_w4,B_t1_w2,B_t2_w2,B_t4_w2,full_c1_w2" >&2
     exit 2
 fi
 

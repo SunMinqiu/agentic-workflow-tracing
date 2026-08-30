@@ -21,6 +21,7 @@ from agent_io_tracing.analysis.kvcache.logical import (
 from agent_io_tracing.analysis.kvcache.latency import (
     LATENCY_TIMELINE_PNG,
     OUTPUT_LATENCY_PNG,
+    analyze_latency,
     plot_latency_breakdown,
     plot_output_vs_latency,
     plot_ttft_vs_fresh_input,
@@ -50,6 +51,38 @@ def test_per_call_reuse_returns_each_call_ratio() -> None:
     assert x == [0, 1, 2]
     assert realized == [0.0, 0.05, 0.1]
     assert logical == [0.0, 0.08, 0.16]
+
+
+def test_latency_uses_vllm_per_request_metrics_separately_from_client_timing() -> None:
+    calls = []
+    for index, ttft_ms in enumerate((100.0, 300.0)):
+        calls.append({
+            "role": "agent",
+            "phase": "main",
+            "duration_ms": 1000.0,
+            "start_ms": index * 1000.0,
+            "end_ms": index * 1000.0 + 1000.0,
+            "first_token_ms": index * 1000.0 + 500.0,
+            "last_token_ms": index * 1000.0 + 900.0,
+            "input": 100,
+            "fresh_input": 100,
+            "cacheRead": 0,
+            "output": 5,
+            "server_metrics": {
+                "time_to_first_token_ms": ttft_ms,
+                "queue_time_ms": 20.0,
+                "generation_time_ms": 600.0,
+                "mean_itl_ms": 12.0,
+                "tokens_per_second": 80.0,
+            },
+        })
+
+    latency = analyze_latency({"per_call": calls})
+
+    assert latency["stream_timing"]["median_ttft_s"] == 0.5
+    assert latency["server_timing"]["median_ttft_s"] == 0.2
+    assert latency["server_timing"]["median_queue_s"] == 0.02
+    assert latency["server_timing"]["median_itl_s"] == 0.012
 
 
 def test_per_call_reuse_handles_zero_input() -> None:
@@ -405,7 +438,9 @@ def test_logical_analysis_reads_cache_geometry_from_serving_manifest(
     assert summary["cache_geometry"] == {
         "block_size": 4,
         "prefix_match_unit": 2,
+        "alignment_unit": 4,
         "source": "trace/legacy",
+        "arms": [],
     }
     assert summary["logical_aligned_frac"] > 0
     assert summary["block_demand"]["cumulative_unique_blocks"] > 0
@@ -415,8 +450,9 @@ def test_logical_analysis_reads_cache_geometry_from_serving_manifest(
 def test_serving_config_supplies_cache_geometry(tmp_path):
     """The captured server config decides the geometry when the trace lacks it.
 
-    Without it the match unit falls back to LEGACY_MATCH_UNIT=128 while the
-    server actually matches on 16, so logical_aligned floors away real reuse.
+    Without it the geometry falls back to LEGACY_MATCH_UNIT=128 instead of the
+    1568-token blocks this arm actually served, so logical_aligned is floored
+    on the wrong unit.
     """
     import json as _json
     from agent_io_tracing.analysis.kvcache.logical import analyze_cell_logical
@@ -449,7 +485,11 @@ def test_serving_config_supplies_cache_geometry(tmp_path):
     assert summary["cache_geometry"] == {
         "block_size": 1568,
         "prefix_match_unit": 16,
+        # The engine bills whole blocks, so alignment follows block_size even
+        # though it advertises a 16-token match unit.
+        "alignment_unit": 1568,
         "source": "server",
+        "arms": [],
     }
     assert summary["serving_config"]["cache_dtype"] == "fp8"
 

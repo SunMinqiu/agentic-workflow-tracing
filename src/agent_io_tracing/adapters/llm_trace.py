@@ -55,6 +55,10 @@ def field(obj: Any, *names: str) -> Any:
     """Return the first non-null attribute or mapping value."""
     for name in names:
         value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+        if value is None and not isinstance(obj, dict):
+            model_extra = getattr(obj, "model_extra", None)
+            if isinstance(model_extra, dict):
+                value = model_extra.get(name)
         if value is not None:
             return value
     return None

@@ -102,6 +102,9 @@ def main() -> int:
         "llm_cache_path": args.llm_cache_path,
         "cached_response_hash": cache_hash,
         "prompt_template_hash": prompt_hash,
+        "prompt_prefix_target_tokens": int(
+            os.environ.get("GENOMAS_PROMPT_PREFIX_TOKENS", "0") or 0
+        ),
         "agent_count": args.agent_count,
         "client_node": args.client_node,
         "pid": args.pid,

@@ -53,6 +53,17 @@ BASE_OUT="$(cd "$BASE_OUT" && pwd)"
     exit 1
 }
 
+# GenoMAS validates --model against a closed registry in utils/llm.py and aborts
+# with "Could not detect a provider" for anything missing from it.  The served
+# vLLM model name is only known now (VLLM_SERVED_MODEL), and any re-clone of the
+# GenoMAS checkout drops a previous deploy-time registration, so make sure the
+# name is registered on every run rather than trusting deploy state.
+if ! "$AGENT_PYTHON" "$SCRIPT_DIR/ensure_genomas_model.py" \
+        --repo "$GENOMAS_REPO" --model "$GENOMAS_MODEL"; then
+    echo "Error: could not register '$GENOMAS_MODEL' in GenoMAS's model registry." >&2
+    exit 1
+fi
+
 # --- Generate the cell list from the fanout knobs --------------------------
 # Each cell: "name|axis|param|geospec|n_traits|smoke_traits_csv"
 read -r -a SCT_ARR <<< "$SINGLE_COHORT_TRAITS"

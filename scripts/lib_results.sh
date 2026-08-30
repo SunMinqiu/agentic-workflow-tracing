@@ -217,6 +217,12 @@ vllm_cache_snapshot() {
              "UNMEASURED for this cell." >&2
         return 0
     fi
+    printf '%s\n' "$metrics" > "${out%.json}_metrics.prom"
+    curl -fsS --connect-timeout 3 --max-time 10 \
+        "$base/version" > "${out%.json}_version.json" 2>/dev/null || true
+    curl -fsS --connect-timeout 3 --max-time 10 \
+        "$base/server_info?config_format=json" \
+        > "${out%.json}_server_info.json" 2>/dev/null || true
 
     local queries hits
     queries="$(printf '%s\n' "$metrics" | awk '/^vllm:prefix_cache_queries_total/ {print $2; exit}')"

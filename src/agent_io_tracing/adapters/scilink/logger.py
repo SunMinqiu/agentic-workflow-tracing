@@ -321,6 +321,10 @@ observed_cache: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "scilink_observed_cache", default=None
 )
 
+observed_server_metrics: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "scilink_observed_server_metrics", default=None
+)
+
 
 def _last_token_ms(start_ms: float, end_ms: float) -> float:
     """Observed last-token instant when the stream gave one, else end_ms."""
@@ -559,6 +563,13 @@ class LiteLLMToolLogger(TraceFileWriter):
                 },
                 "stream_timing_available": first_token_ms is not None,
             }
+            server_metrics = field(completion_response, "metrics")
+            if hasattr(server_metrics, "model_dump"):
+                server_metrics = server_metrics.model_dump()
+            if not isinstance(server_metrics, dict):
+                server_metrics = observed_server_metrics.get()
+            if server_metrics:
+                end_event["server_metrics"] = dict(server_metrics)
             if parent:
                 start_event["parent_run_id"] = parent
                 end_event["parent_run_id"] = parent

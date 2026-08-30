@@ -289,7 +289,7 @@ def main() -> int:
 
     from agent_io_tracing.adapters.genomas.logger import GenoMASToolLogger, install_global
 
-    handler = GenoMASToolLogger(log_dir=log_dir)
+    handler = GenoMASToolLogger(log_dir=log_dir, model=args.model)
 
     # cd into the GenoMAS repo so `./metadata/task_info.json` and
     # `./tools/preprocess.py` resolve correctly inside main.py.  We cd

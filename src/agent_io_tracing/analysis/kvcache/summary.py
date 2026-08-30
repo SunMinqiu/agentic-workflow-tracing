@@ -47,11 +47,12 @@ def dur(seconds: Any) -> str:
 
 TOKEN_HEADERS = [
     "vendor", "model", "calls", "total input", "median input", "total output",
-    "cache queried", "cached tokens", "realized reuse", "logical reuse", "reuse gap",
+    "cache queried", "cache-hit tokens", "realized reuse", "logical reuse", "reuse gap",
 ]
 TIME_HEADERS = [
-    "vendor", "model", "calls", "total inference", "wall", "median TTFT",
-    "median TPOT",
+    "vendor", "model", "calls", "total inference", "median inference", "wall",
+    "median TTFT (client)", "median TTFT (server)", "median queue (server)",
+    "median TPOT (client)", "median ITL (server)",
 ]
 
 
@@ -128,14 +129,17 @@ def token_cells(r: dict[str, Any]) -> list[str]:
         queried_cell,
         fmt(cached) if cached is not None else "unmeasured",
         realized_cell(r),
-        pct(r.get("logical_frac")),
+        # Block-aligned, the same basis the gap column uses. The unaligned
+        # figure counts shared prefixes too short to fill a block, which no
+        # cache can serve, so the two columns would not subtract.
+        pct(r.get("logical_aligned_frac")),
         gap_cell(r),
     ]
 
 
 def _capacity_lines(rows: list[dict[str, Any]]) -> list[str]:
-    """Render each distinct physical vLLM capacity once as experiment config."""
-    capacities: dict[tuple[str, str, int], set[str]] = {}
+    """Map each experiment to the vLLM capacity it actually used."""
+    capacities: list[list[str]] = []
     for row in rows:
         serving = row.get("serving_config") or {}
         raw = serving.get("kv_cache_size_tokens")
@@ -146,25 +150,52 @@ def _capacity_lines(rows: list[dict[str, Any]]) -> list[str]:
         runtime = row.get("runtime") or {}
         vendor = ", ".join(runtime.get("vendors") or ["unknown"])
         model = ", ".join(runtime.get("models") or ["unknown"])
-        key = (vendor, model, capacity)
-        capacities.setdefault(key, set()).add(str(row.get("cell") or "?"))
+        prefix_on = str(serving.get("enable_prefix_caching")).lower() == "true"
+        cell = str(row.get("cell") or "?")
+        run = str(row.get("run") or "")
+        experiment = f"{run} / {cell}" if run else cell
+        capacities.append([
+            experiment,
+            f"{vendor} · {model}",
+            f"{capacity:,} tokens",
+            fmt(serving.get("num_gpu_blocks"))
+            if serving.get("num_gpu_blocks") is not None else "n/a",
+            str(serving.get("block_size") or "n/a"),
+            str(serving.get("cache_dtype") or "auto"),
+            "on" if prefix_on else "off",
+            str(serving.get("gpu_memory_utilization") or "n/a"),
+        ])
     if not capacities:
         return []
-    lines = ["", "**KV-cache capacity used by these experiments**", ""]
-    for vendor, model, capacity in sorted(capacities):
-        lines.append(f"- {vendor} · {model}: {capacity:,} tokens")
+    lines = [
+        "",
+        "**KV-cache capacity used by these experiments**",
+        "",
+        "| experiment | vendor · model | capacity | GPU blocks | block size | KV dtype | prefix caching | GPU memory utilization |",
+        "| --- | --- | ---: | ---: | ---: | --- | --- | ---: |",
+    ]
+    for capacity_row in sorted(capacities):
+        lines.append("| " + " | ".join(capacity_row) + " |")
     return lines
 
 
 def time_cells(r: dict[str, Any]) -> list[str]:
     latency = r.get("latency") or {}
+    overall = latency.get("overall") or {}
     stream = latency.get("stream_timing") or {}
+    server = latency.get("server_timing") or {}
     tpot = stream.get("median_tpot_s")
+    server_itl = server.get("median_itl_s")
     return _identity(r) + [
-        dur((latency.get("overall") or {}).get("total_duration_s")),
+        dur(overall.get("total_duration_s")),
+        dur(overall.get("median_duration_s")),
         dur(latency.get("wall_clock_span_s")),
         dur(stream.get("median_ttft_s")),
+        dur(server.get("median_ttft_s")),
+        dur(server.get("median_queue_s")),
         f"{tpot * 1000:.2f}ms/token" if isinstance(tpot, (int, float)) else "n/a",
+        f"{server_itl * 1000:.2f}ms/token"
+        if isinstance(server_itl, (int, float)) else "n/a",
     ]
 
 
@@ -216,7 +247,7 @@ def token_table(
     if any(r.get("server_prefix_cache") for r in rows):
         L.append("")
         L.append(
-            "† cell-level cached-token result from the engine's counters. "
+            "† cell-level cache-hit token result from the engine's counters. "
             "`?` means the counter interval does not match this cell's input, "
             "so shared or overlapping server traffic prevents attribution."
         )

@@ -1,6 +1,8 @@
 import json
 import re
 
+import pytest
+
 from agent_io_tracing.replay import runner, sweep
 from agent_io_tracing.serving.vllm_endpoint import (
     parse_cache_config,
@@ -29,6 +31,15 @@ class FakeEndpoint:
     def reset_prefix_cache(self) -> None:
         self.resets += 1
 
+    def version(self):
+        return {"version": "0.26.0"}
+
+    def models(self):
+        return ["m"]
+
+    def server_info(self):
+        return {"vllm_config": {"cache_config": {"cache_dtype": "fp8"}}}
+
 
 def test_automatic_label_uses_live_config_and_timestamp() -> None:
     endpoint = FakeEndpoint()
@@ -39,6 +50,10 @@ def test_automatic_label_uses_live_config_and_timestamp() -> None:
         r"block1568_dtype-fp8_prefix-on_gpuunknown_\d{8}T\d{6}",
         label,
     )
+
+
+def test_eviction_timeline_uses_fixed_ten_second_bins() -> None:
+    assert sweep.EVICTION_TIMELINE_BIN_S == 10.0
 
 
 def test_cache_config_and_prefix_cache_come_from_the_server() -> None:
@@ -58,7 +73,7 @@ def test_replay_records_the_config_that_was_actually_serving(tmp_path, monkeypat
     monkeypatch.setattr(
         runner,
         "run_bundle",
-        lambda bundle, endpoint, mode: [
+        lambda bundle, endpoint, mode, **options: [
             {
                 "index": 0, "request_id": "a", "prompt_tokens": 1000,
                 "output_tokens": 11, "ttft_ms": 800.0, "total_ms": 1000.0,
@@ -81,10 +96,57 @@ def test_replay_records_the_config_that_was_actually_serving(tmp_path, monkeypat
     assert summary["serving_config"]["cache_dtype"] == "fp8"
     assert summary["prefix_cache"]["hit_rate"] == 0.6
     assert summary["median_ttft_ms"] == 800.0
+    assert summary["p95_ttft_ms"] == 800.0
     assert summary["median_tpot_ms"] == 20.0
     assert summary["output_tokens"] == 11
     assert summary["fixed_output_tokens_per_request"] == 32
     assert (tmp_path / "rep0" / "metrics_before.prom").is_file()
+    assert (tmp_path / "rep0" / "metrics_window.json").is_file()
+    server_info = json.loads(
+        (tmp_path / "rep0" / "server_info.json").read_text(encoding="utf-8")
+    )
+    assert server_info["version"] == {"version": "0.26.0"}
+    assert server_info["server_info"]["vllm_config"]["cache_config"]["cache_dtype"] == "fp8"
+    assert summary["server_metadata"]["full_config_captured"] is True
+
+
+def test_warmup_is_recorded_but_excluded_from_measurement_window(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_run(bundle, endpoint, mode, **options):
+        calls.append(options)
+        return [{
+            "index": 0,
+            "request_id": "a",
+            "prompt_tokens": 4,
+            "output_tokens": 2,
+            "cached_tokens": 4 if len(calls) > 1 else 0,
+            "ttft_ms": 10.0,
+            "tpot_ms": 2.0,
+            "total_ms": 12.0,
+            "server_metrics": {},
+            "cache_salt": options["cache_salt"],
+        }]
+
+    monkeypatch.setattr(runner, "run_bundle", fake_run)
+    endpoint = FakeEndpoint()
+
+    summary = runner.replay_to_dir(
+        {"served_model": "m", "requests": [{"index": 0}]},
+        endpoint,
+        "serial",
+        tmp_path / "rep0",
+        reset_before=True,
+        cache_salt_mode="shared",
+        cache_salt="stable",
+        warmup_repetitions=1,
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["cache_salt"] == calls[1]["cache_salt"] == "stable"
+    assert summary["warmup"][0]["cached_tokens"] == 0
+    assert summary["per_request_cache"]["cached_tokens"] == 4
+    assert (tmp_path / "rep0" / "warmup0_requests.jsonl").is_file()
 
 
 def test_replay_requests_32_output_tokens_and_measures_tpot(monkeypatch) -> None:
@@ -103,7 +165,16 @@ def test_replay_requests_32_output_tokens_and_measures_tpot(monkeypatch) -> None
                 chunk = {
                     "id": "result",
                     "choices": [{"text": "x", "token_ids": [index]}],
-                    "usage": {"completion_tokens": 32} if index == 31 else None,
+                    "usage": {
+                        "completion_tokens": 32,
+                        "prompt_tokens_details": {"cached_tokens": 16},
+                    } if index == 31 else None,
+                    "metrics": {
+                        "time_to_first_token_ms": 12.5,
+                        "queue_time_ms": 2.0,
+                        "generation_time_ms": 31.0,
+                        "mean_itl_ms": 1.0,
+                    } if index == 31 else None,
                 }
                 chunks.append(f"data: {json.dumps(chunk)}\n".encode())
             return iter(chunks + [b"data: [DONE]\n"])
@@ -130,6 +201,42 @@ def test_replay_requests_32_output_tokens_and_measures_tpot(monkeypatch) -> None
     assert "stop" not in sent
     assert result["output_tokens"] == 32
     assert result["tpot_ms"] is not None
+    assert result["cached_tokens"] == 16
+    assert result["server_metrics"]["queue_time_ms"] == 2.0
+
+
+def test_replay_passes_shared_cache_salt_and_custom_output_length(monkeypatch) -> None:
+    sent = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return iter([
+                b'data: {"choices":[{"text":"x","token_ids":[1]}],"usage":{"completion_tokens":1}}\n',
+                b"data: [DONE]\n",
+            ])
+
+    def fake_urlopen(request, timeout):
+        sent.update(json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr(runner, "urlopen", fake_urlopen)
+    runner._completion(
+        VLLMEndpoint("http://server"),
+        "model",
+        {"index": 0, "request_id": "a", "prompt_token_ids": [1, 2]},
+        output_tokens=1,
+        cache_salt="shared-test-salt",
+    )
+
+    assert sent["min_tokens"] == 1
+    assert sent["max_tokens"] == 1
+    assert sent["cache_salt"] == "shared-test-salt"
 
 
 def _write_arm(sweep_dir, label, block_size, ttft, hit_rate, at,
@@ -148,6 +255,7 @@ def _write_arm(sweep_dir, label, block_size, ttft, hit_rate, at,
         "serving_config": {"block_size": block_size, "cache_dtype": "fp8"},
         "prefix_cache": {"hit_rate": hit_rate},
         "median_ttft_ms": ttft,
+        "p95_ttft_ms": ttft + 500.0,
         "median_tpot_ms": 14.4,
         "median_total_ms": 3000.0,
         "wall_s": 60.0,
@@ -166,14 +274,115 @@ def test_report_columns_only_the_knobs_that_changed(tmp_path) -> None:
     assert "median TPOT" in text
     assert "14.40ms/token" in text
     assert "1.00s" in text
+    assert "p95 TTFT" in text
+    assert "1.50s" in text
+    assert "p99 TTFT" not in text
     assert "3.00s" in text
     assert "60.00s" in text
     assert "+50.00% TTFT" in text
     assert "Not comparable" not in text
 
 
+def test_old_replay_backfills_tail_ttft_from_requests(tmp_path) -> None:
+    rep = tmp_path / "arm" / "rep0"
+    rep.mkdir(parents=True)
+    (rep / "summary.json").write_text(json.dumps({
+        "median_ttft_ms": 20.0,
+    }), encoding="utf-8")
+    (rep / "requests.jsonl").write_text("\n".join(
+        json.dumps({"ttft_ms": value}) for value in [10.0, 20.0, 30.0]
+    ), encoding="utf-8")
+
+    summary = sweep.load_repetition_summary(rep / "summary.json")
+
+    assert summary["p95_ttft_ms"] == 29.0
+
+
+def test_repetition_backfills_windowed_eviction_analysis(tmp_path) -> None:
+    rep = tmp_path / "arm" / "rep0"
+    rep.mkdir(parents=True)
+    (rep / "summary.json").write_text(json.dumps({
+        "started_at_epoch_s": 10.0,
+        "ended_at_epoch_s": 20.0,
+        "prompt_tokens": 1000,
+        "kv_events": {"buffer_truncated": False},
+    }), encoding="utf-8")
+    (rep / "requests.jsonl").write_text(
+        json.dumps({"request_id": "r", "ttft_ms": 10.0}),
+        encoding="utf-8",
+    )
+    (rep / "metrics_before.prom").write_text("""\
+vllm:kv_block_idle_before_evict_seconds_bucket{le="1"} 0
+vllm:kv_block_idle_before_evict_seconds_bucket{le="5"} 0
+vllm:kv_block_idle_before_evict_seconds_bucket{le="+Inf"} 0
+vllm:kv_block_idle_before_evict_seconds_count 0
+vllm:kv_block_idle_before_evict_seconds_sum 0
+vllm:num_preemptions_total 0
+""", encoding="utf-8")
+    (rep / "metrics_after.prom").write_text("""\
+vllm:kv_block_idle_before_evict_seconds_bucket{le="1"} 0
+vllm:kv_block_idle_before_evict_seconds_bucket{le="5"} 2
+vllm:kv_block_idle_before_evict_seconds_bucket{le="+Inf"} 2
+vllm:kv_block_idle_before_evict_seconds_count 2
+vllm:kv_block_idle_before_evict_seconds_sum 6
+vllm:num_preemptions_total 0
+""", encoding="utf-8")
+    events = [
+        {"sequence": 0, "batch_ts": 11.0, "event_type": "AllBlocksCleared"},
+        {"sequence": 0, "batch_ts": 11.0, "event_type": "BlockStored",
+         "group_idx": 0, "block_hashes": ["h"], "block_size": 1,
+         "token_ids": [1], "kv_cache_spec_kind": "full_attention"},
+        {"sequence": 1, "batch_ts": 13.0, "event_type": "BlockRemoved",
+         "group_idx": 0, "block_hashes": ["h"], "medium": "GPU"},
+    ]
+    (rep / "kv_events.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in events), encoding="utf-8"
+    )
+
+    summary = sweep.load_repetition_summary(rep / "summary.json")
+    eviction = summary["eviction"]
+
+    assert eviction["physical_block_evictions"] == 2
+    assert eviction["removed_cached_hashes"] == 1
+    assert eviction["mean_idle_before_evict_s"] == 3
+    assert eviction["clears_during_measurement"] == 0
+    assert eviction["by_group"]["0"]["kinds"] == {"full_attention": 1}
+
+
+def test_strict_config_ignores_restart_ids_but_checks_other_environment() -> None:
+    old = {
+        "vllm_config": {"instance_id": "old"},
+        "vllm_env": {
+            "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME": "buffer-old",
+        },
+        "system_env": {
+            "env_vars": (
+                "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME=buffer-old\n"
+                "VLLM_KV_METRICS_SAMPLE=0.01"
+            ),
+        },
+    }
+    new = {
+        "vllm_config": {"instance_id": "new"},
+        "vllm_env": {
+            "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME": "buffer-new",
+        },
+        "system_env": {
+            "env_vars": (
+                "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME=buffer-new\n"
+                "VLLM_KV_METRICS_SAMPLE=1.0"
+            ),
+        },
+    }
+
+    assert sweep._server_config_changes(old, new) == {
+        "system_env.env_vars.VLLM_KV_METRICS_SAMPLE"
+    }
+
+
 def test_sweep_report_has_normal_kv_sections_and_artifacts(tmp_path) -> None:
     _write_arm(tmp_path, "block16", "16", 1000.0, 0.46, at=1)
+    _write_arm(tmp_path, "block32", "32", 900.0, 0.52, at=2)
 
     report = sweep.write_report(tmp_path)
 
@@ -182,12 +391,22 @@ def test_sweep_report_has_normal_kv_sections_and_artifacts(tmp_path) -> None:
     assert "Summary — tokens" in page
     assert "Summary — time and configuration" in page
     assert "Fixed-input Test" in page
+    assert "Eviction pressure" in page
+    assert "physical eviction observations" in page
+    assert "Eviction by KV group" in page
     assert "Per arm" in page
     assert "metrics before" in page
     assert not (tmp_path / "sweep.html").exists()
     assert not (tmp_path / "sweep.md").exists()
     assert not (tmp_path / "kvcache_report.md").exists()
     assert (tmp_path / "visualizations" / "sweep_comparison.png").is_file()
+
+
+def test_comparison_report_requires_two_arms(tmp_path) -> None:
+    _write_arm(tmp_path, "block16", "16", 1000.0, 0.46, at=1)
+
+    with pytest.raises(ValueError, match="requires at least two arms"):
+        sweep.write_report(tmp_path)
 
 
 def test_a_restarted_engine_counts_as_cold_without_a_reset_endpoint() -> None:

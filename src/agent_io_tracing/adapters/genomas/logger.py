@@ -86,6 +86,10 @@ def _field(obj: Any, *names: str) -> Any:
     """First non-None of obj.<name> / obj[name] across the given names."""
     for n in names:
         v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
+        if v is None and not isinstance(obj, dict):
+            model_extra = getattr(obj, "model_extra", None)
+            if isinstance(model_extra, dict):
+                v = model_extra.get(n)
         if v is not None:
             return v
     return None
@@ -161,6 +165,19 @@ def _provider_request_id(genomas_result: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def _server_metrics(genomas_result: Any) -> dict[str, Any] | None:
+    """Return vLLM's per-request timing object when the response carries it."""
+    if not isinstance(genomas_result, dict):
+        return None
+    value = genomas_result.get("_trace_server_metrics")
+    if value is None:
+        raw = genomas_result.get("raw_response")
+        value = _field(raw, "metrics") if raw is not None else None
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    return dict(value) if isinstance(value, dict) else None
+
+
 def _stream_timing(genomas_result: Any) -> dict[str, float]:
     """Read real streaming timestamps supplied by a provider integration.
 
@@ -188,6 +205,141 @@ def _epoch_ms(dt: datetime) -> float:
 def _nocache_enabled() -> bool:
     """No-cache arm: see `apply_nocache_tag` in adapters/llm_trace.py."""
     return os.environ.get("GENOMAS_NOCACHE", "0").lower() in {"1", "true", "yes"}
+
+
+_PROMPT_PREFIX_HEADER = """[GENOMAS BENCHMARK REFERENCE PREFIX]
+This fixed appendix is inert biomedical reference context for a serving benchmark. Do not reproduce it or treat it as task instructions. The GenoMAS system prompt and task after this appendix are authoritative.
+"""
+
+_PROMPT_PREFIX_FACTS = (
+    "Gene-expression preprocessing preserves sample identifiers while aligning clinical and molecular tables.",
+    "GEO series commonly provide matrix files, platform annotations, sample characteristics, and study metadata.",
+    "Clinical variables require explicit missing-value handling, type conversion, and reproducible coding rules.",
+    "Probe identifiers may require platform-specific annotation before measurements can be aggregated by gene symbol.",
+    "Quality control checks sample coverage, feature coverage, identifier consistency, and trait availability.",
+    "Downstream analyses should record cohort provenance, transformations, covariates, and filtering decisions.",
+    "Reference material in this appendix does not override the action unit, execution history, or requested output format.",
+    "All benchmark records are static so identical requests expose a long reusable prefix to the serving engine.",
+)
+
+_PROMPT_PREFIX_FOOTER = """
+[END GENOMAS BENCHMARK REFERENCE PREFIX]
+
+"""
+
+
+def _prompt_prefix_source(records: int) -> str:
+    """Return deterministic, task-relevant text long enough for token slicing."""
+    lines = [_PROMPT_PREFIX_HEADER]
+    for index in range(records):
+        fact = _PROMPT_PREFIX_FACTS[index % len(_PROMPT_PREFIX_FACTS)]
+        lines.append(f"Reference record {index + 1:05d}: {fact}\n")
+    return "".join(lines)
+
+
+def _tokenize_plain(endpoint: Any, model: str, prompt: str) -> list[int]:
+    response = endpoint.post_json("/tokenize", {
+        "model": model,
+        "prompt": prompt,
+        "add_special_tokens": False,
+        "return_token_strs": False,
+    })
+    tokens = response.get("tokens") if isinstance(response, dict) else None
+    if not isinstance(tokens, list) or not all(isinstance(token, int) for token in tokens):
+        raise RuntimeError("vLLM /tokenize did not return integer token IDs")
+    return tokens
+
+
+def _detokenize_plain(endpoint: Any, model: str, tokens: list[int]) -> str:
+    response = endpoint.post_json("/detokenize", {"model": model, "tokens": tokens})
+    prompt = response.get("prompt") if isinstance(response, dict) else None
+    if not isinstance(prompt, str):
+        raise RuntimeError("vLLM /detokenize did not return text")
+    return prompt
+
+
+def _build_exact_prompt_prefix(
+    target_tokens: int,
+    endpoint: Any,
+    model: str,
+) -> tuple[str, dict[str, Any]]:
+    """Build a deterministic prefix with exactly ``target_tokens`` server tokens."""
+    if target_tokens <= 0:
+        raise ValueError("prompt prefix target must be positive")
+
+    records = 512
+    body_tokens: list[int] = []
+    while records <= 16384:
+        body_tokens = _tokenize_plain(endpoint, model, _prompt_prefix_source(records))
+        if len(body_tokens) >= target_tokens:
+            break
+        records *= 2
+    if len(body_tokens) < target_tokens:
+        raise RuntimeError(
+            f"could not generate {target_tokens} prompt-prefix tokens"
+        )
+
+    footer_tokens = _tokenize_plain(endpoint, model, _PROMPT_PREFIX_FOOTER)
+    body_count = target_tokens - len(footer_tokens)
+    if body_count <= 0:
+        raise ValueError("prompt prefix target is shorter than its footer")
+
+    prefix = ""
+    actual_tokens: list[int] = []
+    for _ in range(8):
+        candidate_tokens = body_tokens[:body_count] + footer_tokens
+        prefix = _detokenize_plain(endpoint, model, candidate_tokens)
+        actual_tokens = _tokenize_plain(endpoint, model, prefix)
+        if len(actual_tokens) == target_tokens:
+            break
+        body_count += target_tokens - len(actual_tokens)
+        if body_count <= 0 or body_count > len(body_tokens):
+            break
+    if len(actual_tokens) != target_tokens:
+        raise RuntimeError(
+            "server tokenizer could not round-trip an exact prompt prefix: "
+            f"target={target_tokens}, actual={len(actual_tokens)}"
+        )
+
+    metadata = {
+        "target_tokens": target_tokens,
+        "actual_tokens": len(actual_tokens),
+        "characters": len(prefix),
+        "sha256": hashlib.sha256(prefix.encode("utf-8")).hexdigest(),
+        "model": model,
+        "tokenizer": "vllm_/tokenize",
+        "generation_records": records,
+    }
+    return prefix, metadata
+
+
+def _prepend_prompt_prefix(messages: Any, prefix: str) -> Any:
+    """Return a copy with the fixed prefix before the first message content."""
+    if not prefix or not isinstance(messages, list) or not messages:
+        return messages
+    first = messages[0]
+    if isinstance(first, dict) and isinstance(first.get("content"), str):
+        patched = dict(first)
+        patched["content"] = prefix + first["content"]
+        return [patched, *messages[1:]]
+    return [{"role": "system", "content": prefix}, *messages]
+
+
+def _strip_prompt_prefix(messages: Any, prefix: str) -> Any:
+    """Remove the benchmark prefix from a copy used only for phase analysis."""
+    if not prefix or not isinstance(messages, list) or not messages:
+        return messages
+    first = messages[0]
+    if not isinstance(first, dict) or not isinstance(first.get("content"), str):
+        return messages
+    content = first["content"]
+    if content == prefix:
+        return messages[1:]
+    if not content.startswith(prefix):
+        return messages
+    patched = dict(first)
+    patched["content"] = content[len(prefix):]
+    return [patched, *messages[1:]]
 
 
 def _llm_cache_key(client: Any, messages: Any) -> str:
@@ -295,7 +447,11 @@ class GenoMASToolLogger(TraceFileWriter):
     GenoMAS's six LLMClient subclasses.  install_global is idempotent.
     """
 
-    def __init__(self, log_dir: str | os.PathLike) -> None:
+    def __init__(
+        self,
+        log_dir: str | os.PathLike,
+        model: str | None = None,
+    ) -> None:
         self._log_dir = Path(log_dir).resolve()
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -315,6 +471,55 @@ class GenoMASToolLogger(TraceFileWriter):
         self._dump_messages = os.environ.get("GENOMAS_DUMP_MESSAGES", "1").lower() in {
             "1", "true", "yes"
         }
+
+        prefix_raw = os.environ.get("GENOMAS_PROMPT_PREFIX_TOKENS", "0")
+        try:
+            self._prompt_prefix_target_tokens = int(prefix_raw or 0)
+        except ValueError as exc:
+            raise ValueError(
+                "GENOMAS_PROMPT_PREFIX_TOKENS must be a nonnegative integer"
+            ) from exc
+        if self._prompt_prefix_target_tokens < 0:
+            raise ValueError("GENOMAS_PROMPT_PREFIX_TOKENS must be nonnegative")
+        self._prompt_prefix = ""
+        self._prompt_prefix_metadata: dict[str, Any] | None = None
+        if self._prompt_prefix_target_tokens:
+            from agent_io_tracing.serving.vllm_endpoint import VLLMEndpoint
+
+            prefix_model = model or os.environ.get("GENOMAS_MODEL")
+            prefix_url = (
+                os.environ.get("VLLM_URL")
+                or os.environ.get("OPENAI_BASE_URL")
+                or os.environ.get("OPENAI_API_BASE")
+            )
+            if not prefix_model or not prefix_url:
+                raise RuntimeError(
+                    "32K GenoMAS prompt prefix requires a model and VLLM_URL or OPENAI_BASE_URL"
+                )
+            endpoint = VLLMEndpoint(
+                prefix_url,
+                os.environ.get("VLLM_API_KEY") or "",
+                timeout_s=300.0,
+            )
+            self._prompt_prefix, self._prompt_prefix_metadata = _build_exact_prompt_prefix(
+                self._prompt_prefix_target_tokens,
+                endpoint,
+                prefix_model,
+            )
+            (self._log_dir / "prompt_prefix.txt").write_text(
+                self._prompt_prefix,
+                encoding="utf-8",
+            )
+            (self._log_dir / "prompt_prefix.json").write_text(
+                json.dumps(self._prompt_prefix_metadata, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(
+                "[genomas_tool_logger] prompt prefix: "
+                f"{self._prompt_prefix_metadata['actual_tokens']} tokens, "
+                f"sha256={self._prompt_prefix_metadata['sha256'][:12]}",
+                flush=True,
+            )
 
         self._cache_path = Path(
             os.environ.get("GENOMAS_LLM_CACHE_PATH") or str(self._llm_cache_log)
@@ -425,7 +630,9 @@ class GenoMASToolLogger(TraceFileWriter):
             role = _infer_role_from_stack()
             provider = getattr(getattr(client, "config", None), "provider", "?")
             model = getattr(getattr(client, "config", None), "model_name", "?")
-            phase = _infer_llm_phase(messages)
+            phase = _infer_llm_phase(
+                _strip_prompt_prefix(messages, self._prompt_prefix)
+            )
             # Tool name must be plain \w+ for summarize_pi_events.py's regex;
             # model+provider live in the input dict, not the name.
             provider_request_id = _provider_request_id(result)
@@ -457,6 +664,10 @@ class GenoMASToolLogger(TraceFileWriter):
                 "provider_request_id": provider_request_id,
                 "attempt": attempt,
                 "nocache": bool(nocache_tag),
+                "prompt_prefix_tokens": self._prompt_prefix_target_tokens,
+                "prompt_prefix_sha256": (
+                    self._prompt_prefix_metadata or {}
+                ).get("sha256"),
             }
 
             # pi_events.jsonl
@@ -493,6 +704,9 @@ class GenoMASToolLogger(TraceFileWriter):
                 "monotonic_ns": ended_monotonic_ns,
                 "stream_timing_available": "first_token_ms" in timing,
             }
+            server_metrics = _server_metrics(result)
+            if server_metrics:
+                end_event["server_metrics"] = server_metrics
             if error is not None:
                 end_event["error"] = repr(error)
             self._append_event(request_start_event)
@@ -564,6 +778,7 @@ def _make_async_wrapper(
 ) -> Callable[..., Awaitable[Any]]:
     """Build an async wrapper around an LLMClient.generate_completion."""
     async def wrapper(self, messages, *args, **kwargs):
+        messages = _prepend_prompt_prefix(messages, handler._prompt_prefix)
         started_at = datetime.now()
         started_monotonic_ns = time.monotonic_ns()
         run_id = uuid.uuid4().hex
@@ -688,6 +903,7 @@ def _install_openai_stream_timing(llm_mod: Any) -> bool:
             last_token_ms = None
             content_parts: list[str] = []
             usage = None
+            server_metrics = None
             response_id = None
             response_model = self.model_name
             async for chunk in stream:
@@ -697,6 +913,9 @@ def _install_openai_stream_timing(llm_mod: Any) -> bool:
                 chunk_usage = _field(chunk, "usage")
                 if chunk_usage is not None:
                     usage = chunk_usage
+                chunk_metrics = _field(chunk, "metrics")
+                if chunk_metrics is not None:
+                    server_metrics = chunk_metrics
                 choices = _field(chunk, "choices") or []
                 delta = _field(choices[0], "delta") if choices else None
                 content = _field(delta, "content") if delta is not None else None
@@ -730,6 +949,7 @@ def _install_openai_stream_timing(llm_mod: Any) -> bool:
                 "id": response_id,
                 "model": response_model,
                 "usage": usage_dict,
+                "metrics": server_metrics,
             }
             result = self._format_response(
                 content="".join(content_parts),
@@ -749,6 +969,14 @@ def _install_openai_stream_timing(llm_mod: Any) -> bool:
                 prefix_cache_counters(),
                 int(_field(usage, "prompt_tokens", "input_tokens") or 0),
             )
+            if server_metrics is not None:
+                result["_trace_server_metrics"] = (
+                    server_metrics.model_dump()
+                    if hasattr(server_metrics, "model_dump")
+                    else dict(server_metrics)
+                    if isinstance(server_metrics, dict)
+                    else None
+                )
             return result
         except Exception as exc:
             return self.handle_exception(exc)

@@ -2,105 +2,110 @@
 
 ## 第一部分：运行手册
 
-### 0. 从当前状态开始
+### 0. 机器与执行路径
 
-三台机器的职责如下。
+| 机器 | 变量 | 职责 |
+| --- | --- | --- |
+| Mac | 无 | 配置节点、部署代码、启动实验、拉回结果 |
+| Lustre MGS + MDT | `MGS_NODE` | 管理 Lustre |
+| Lustre OST | `OST_NODE` | 保存 Lustre 数据 |
+| Workflow client | `CLIENT_NODE`、`WORKFLOW_NODE` | 运行 workflow、BCC 和后处理 |
+| vLLM cluster | `VLLM_NODE` | 运行 vLLM server |
 
+`WORKFLOW_NODE` 始终等于 `CLIENT_NODE`。
 
-| 机器               | 变量              | 职责                   |
-| ---------------- | --------------- | -------------------- |
-| Mac              | 无               | 发起操作并拉回结果            |
-| Workflow cluster | `WORKFLOW_NODE` | 运行 workflow、BCC 和后处理 |
-| vLLM cluster     | `VLLM_NODE`     | 运行 vLLM server       |
+| 当前状态 | 执行顺序 |
+| --- | --- |
+| 新节点，GenoMAS + OpenAI | 1 → 2.1 → 2.2 → 4.1 → 6.1 → 7 → 8 |
+| 新节点，GenoMAS + FreeInference | 1 → 2.1 → 2.2 → 4.2 → 6.1 → 7 → 8 |
+| 新节点，GenoMAS 或 SciLink + vLLM | 1 → 2.1 → 2.2 → 3 → 4.3 → 6 → 7 → 8 |
+| 新节点，SciLink + OpenAI | 1 → 2.1 → 2.2 → 4.1 → 6.2 → 7 → 8 |
+| 新节点，1000 Genomes | 1 → 2.1 → 2.3 → 5 → 6.3 → 7 → 8 |
+| 新节点，Montage | 1 → 2.1 → 2.3 → 2.4 → 5 → 6.4 → 7 → 8 |
+| 已配置，新开 Mac terminal | 4.4 → 6 → 7 → 8 |
+| 只改代码 | 5 → 6 → 7 → 8 |
+| 只换 API key、后端或模型 | 4 → 6 → 7 → 8 |
+| 只换 vLLM cluster | 3 → 4 → 6 → 7 → 8 |
+| 实验正在运行 | 7 → 8 |
+| 实验已经完成 | 8 |
 
+### 1. 更换 CloudLab allocation
 
-现有脚本读取 `CLIENT_NODE`。本手册始终令 `CLIENT_NODE="$WORKFLOW_NODE"`。
+在 Mac 编辑 `cloudlab_env.sh`：
 
-根据当前状态选择入口，然后按章节编号向后执行。
-
-
-| 当前状态                                         | 执行顺序                                  |
-| -------------------------------------------- | ------------------------------------- |
-| 新 Workflow cluster，GenoMAS 使用 OpenAI         | 1 → 2.1 → 2.2 → 4.1 → 6.1 → 7 → 8     |
-| 新 Workflow cluster，GenoMAS 使用 FreeInference  | 1 → 2.1 → 2.2 → 4.2 → 6.1 → 7 → 8     |
-| 新 Workflow cluster，GenoMAS 或 SciLink 使用 vLLM | 1 → 2.1 → 2.2 → 3 → 4.3 → 6 → 7 → 8   |
-| 新 Workflow cluster，SciLink 使用 OpenAI         | 1 → 2.1 → 2.2 → 4.1 → 6.2 → 7 → 8     |
-| 新 Workflow cluster，运行 1000 Genomes           | 1 → 2.1 → 2.3 → 5 → 6.3 → 7 → 8       |
-| 新 Workflow cluster，运行 Montage                | 1 → 2.1 → 2.3 → 2.4 → 5 → 6.4 → 7 → 8 |
-| 两个 cluster 已配置，新开 Mac terminal               | 1 → 4.4 → 6 → 7 → 8                   |
-| 只改了代码                                        | 1 → 5 → 6 → 7 → 8                     |
-| 只换了 API key、后端或模型                            | 1 → 4 → 6 → 7 → 8                     |
-| 只换了 Workflow cluster                         | 按上方对应的新 Workflow cluster 路径执行         |
-| 只换了 vLLM cluster                             | 1 → 3 → 4 → 6 → 7 → 8                 |
-| 只运行新实验                                       | 1 → 4.4 → 6 → 7 → 8                   |
-| 实验正在运行                                       | 1 → 7 → 8                             |
-| 实验已经完成                                       | 1 → 8                                 |
-| 用已有 vLLM 结果扫描服务器配置                           | 1 → 3 → 9                             |
-
-
-
-
-### 1. 每个新 Mac terminal
-
-换节点时先编辑 `cloudlab_env.sh` 第 16 至 18 行的 `MGS_NODE`、`OST_NODE`、`CLIENT_NODE`，改完开一个新的 terminal 窗口。这三行写作 `${VAR:-默认值}`，变量已有值时 `source` 不覆盖，用过旧节点的窗口会一直用旧机器名。必须留在原窗口时先清空：
-
-```zsh
-unset MGS_NODE OST_NODE CLIENT_NODE WORKFLOW_NODE
+```bash
+export MGS_NODE="MGS 的完整主机名"
+export OST_NODE="OST 的完整主机名"
+export CLIENT_NODE="Workflow client 的完整主机名"
 ```
 
-在 Mac 的仓库根目录执行：
+在仓库根目录加载新配置：
 
 ```zsh
 source cloudlab_env.sh
-export WORKFLOW_NODE="$CLIENT_NODE"
-printf 'MGS=%s\nOST=%s\nWORKFLOW=%s\nVLLM_NODE=%s\nVLLM_URL=%s\n' \
-  "$MGS_NODE" "$OST_NODE" "$WORKFLOW_NODE" "${VLLM_NODE:-not-set}" "${VLLM_URL:-not-set}"
-ssh "$SSH_USER@$WORKFLOW_NODE" hostname
+printf 'MGS=%s\nOST=%s\nWORKFLOW=%s\n' \
+  "$MGS_NODE" "$OST_NODE" "$WORKFLOW_NODE"
 ```
 
-看到 `[cloudlab_env] keys OK`，三个机器名与本次分配一致，且 SSH 返回远端 hostname，即可继续。
+主机名必须与本次 CloudLab allocation 一致。
 
-CloudLab 复用旧机器名时 SSH 会报 host key 变更，删掉旧指纹后重连：
+验证三台节点：
 
 ```zsh
-ssh-keygen -R "$WORKFLOW_NODE"
+for node in "$MGS_NODE" "$OST_NODE" "$CLIENT_NODE"; do
+  ssh "$SSH_USER@$node" hostname
+done
 ```
 
-使用 vLLM 时，`VLLM_URL` 必须指向 Workflow cluster 上的隧道端口。显示 `not-set` 时执行：
+出现 `REMOTE HOST IDENTIFICATION HAS CHANGED` 时删除旧指纹：
 
 ```zsh
-export VLLM_URL="http://127.0.0.1:18080"
+for node in "$MGS_NODE" "$OST_NODE" "$CLIENT_NODE"; do
+  ssh-keygen -R "$node"
+done
 ```
 
-使用 OpenAI 或 FreeInference 时执行 `unset VLLM_URL`。否则 trace 脚本会把无关的 vLLM 计数器写入当前结果。
-
-### 2. 第一次拿到 Workflow cluster
-
-本节只在新节点执行。部署会创建虚拟环境。代码更新不得执行本节。
-
-#### 2.1 公共配置
-
-检查 Lustre：
+重新连接：
 
 ```zsh
-ssh "$SSH_USER@$WORKFLOW_NODE" "mountpoint -q '$MOUNT_PATH' && echo mounted"
+for node in "$MGS_NODE" "$OST_NODE" "$CLIENT_NODE"; do
+  ssh "$SSH_USER@$node" hostname
+done
 ```
 
-未打印 `mounted` 时建 Lustre。三台机器全部换新：
+三条命令都必须返回远端 hostname。
+
+### 2. 初始化新的 Workflow cluster
+
+#### 2.1 配置 Lustre 和 BCC
+
+三台节点全部更换时执行：
 
 ```zsh
 bash scripts/setup_lustre_simple.sh
 ```
 
-MGS 与 OST 沿用旧节点、只换 client 时改用下面这条，避免重新格式化 MDT：
+该脚本会格式化 MGS 和 OST 的非系统盘。仅用于新分配的空节点。
+
+MGS + MDT 已完成，OST 或 client 配置中断时执行：
 
 ```zsh
 bash scripts/setup_lustre_ost_client_only.sh
 ```
 
-完成后重新执行上面的 `mountpoint` 检查。
+该脚本会重新格式化 OST 的非系统盘。
 
-安装 BCC：
+验证三个挂载点：
+
+```zsh
+ssh "$SSH_USER@$MGS_NODE" 'mountpoint -q /mnt/mgs_mdt && echo mgs-mounted'
+ssh "$SSH_USER@$OST_NODE" 'mountpoint -q /mnt/ost0 && echo ost-mounted'
+ssh "$SSH_USER@$CLIENT_NODE" "mountpoint -q '$MOUNT_PATH' && echo client-mounted"
+```
+
+输出必须包含 `mgs-mounted`、`ost-mounted` 和 `client-mounted`。
+
+在 Workflow client 安装 BCC：
 
 ```zsh
 ssh "$SSH_USER@$WORKFLOW_NODE" '
@@ -111,95 +116,32 @@ ssh "$SSH_USER@$WORKFLOW_NODE" '
 '
 ```
 
-通过标准：输出最后一行为 `bcc-ready`。
+输出最后一行必须是 `bcc-ready`。
 
 #### 2.2 Agentic workflow
 
-部署所需 workflow：
+##### 2.2.1 GenoMAS
 
-```zsh
-bash scripts/deploy_genomas_to_client.sh
-bash scripts/deploy_scilink_to_client.sh
-```
-
-只执行需要的一行。两个都需要时依次执行。分别检查：
-
-```zsh
-ssh "$SSH_USER@$WORKFLOW_NODE" 'test -x "$HOME/GenoMAS/.venv/bin/python" && echo genomas-ready'
-ssh "$SSH_USER@$WORKFLOW_NODE" 'test -x "$HOME/SciLink/.venv/bin/python" && echo scilink-ready'
-```
-
-只检查已经部署的 workflow。通过标准：输出对应的 `*-ready`。
-
-##### 2.2.1 将 GenoMAS 数据从 Mac 上传到 Lustre
-
-每个新的 Workflow cluster 都没有 GenoMAS 输入数据。Mac 上的标准数据源是 `/Users/minqiu/Desktop/Benchmarking_Agents/GenoMAS_Datasets`，远端固定写入 Lustre 的 `/mnt/lustrefs/genomas_data`。不要把数据写入远端 `$HOME` 或 `/root`。
-
-本地目录结构必须保持为：
-
-```text
-GenoMAS_Datasets/
-├── GEO/<trait>/GSE*/...
-└── TCGA/<trait>/...
-```
-
-新节点第一次部署 GenoMAS 时，部署脚本默认会同步数据：
+该命令部署 tracing harness 和 GenoMAS，创建虚拟环境，并将 Mac 数据同步到 Lustre：
 
 ```zsh
 source cloudlab_env.sh
-export WORKFLOW_NODE="$CLIENT_NODE"
 LOCAL_GENOMAS_DATASET="/Users/minqiu/Desktop/Benchmarking_Agents/GenoMAS_Datasets" \
-SYNC_GENOMAS_DATASET=1 \
 bash scripts/deploy_genomas_to_client.sh
 ```
 
-脚本使用 `rsync --delete`，将本地标准数据完整镜像到 `/mnt/lustrefs/genomas_data`。只有确认新节点的 Lustre 已经有完整数据时，才可以设置 `SYNC_GENOMAS_DATASET=0`。
+输出最后一行必须是 `genomas-ready`。
 
-如果 GenoMAS 已经部署，只需单独上传数据：
+##### 2.2.2 SciLink
 
 ```zsh
 source cloudlab_env.sh
-export WORKFLOW_NODE="$CLIENT_NODE"
-LOCAL_GENOMAS_DATASET="/Users/minqiu/Desktop/Benchmarking_Agents/GenoMAS_Datasets"
-REMOTE_GENOMAS_DATASET="$MOUNT_PATH/genomas_data"
-
+bash scripts/deploy_scilink_to_client.sh
 ssh "$SSH_USER@$WORKFLOW_NODE" \
-  "sudo mkdir -p '$REMOTE_GENOMAS_DATASET/GEO' '$REMOTE_GENOMAS_DATASET/TCGA' &&
-   sudo chown -R '$SSH_USER' '$REMOTE_GENOMAS_DATASET'"
-
-rsync -az --partial --progress \
-  --exclude '.DS_Store' \
-  "$LOCAL_GENOMAS_DATASET/" \
-  "$SSH_USER@$WORKFLOW_NODE:$REMOTE_GENOMAS_DATASET/"
+  'test -x "$HOME/SciLink/.venv/bin/python" && echo scilink-ready'
 ```
 
-两个源目录末尾的 `/` 不能省略。上传后检查数据：
-
-```zsh
-ssh "$SSH_USER@$WORKFLOW_NODE" '
-  set -e
-  root=/mnt/lustrefs/genomas_data
-  test -d "$root/GEO" && test -d "$root/TCGA"
-  test "$(find "$root/GEO/Type_1_Diabetes" -mindepth 1 -maxdepth 1 -type d -name "GSE*" | wc -l)" -ge 8
-  file_count="$(find "$root" -type f | wc -l)"
-  test "$file_count" -gt 0
-  printf "files: %s\n" "$file_count"
-  du -sh "$root"
-  find "$root/GEO/Type_1_Diabetes" -mindepth 1 -maxdepth 1 -type d -name "GSE*" -printf "%f\n" | sort
-'
-```
-
-通过标准：命令退出码为 0，文件数不是 0，容量与本地约 1.5 GiB 接近，并列出至少 8 个 `GSE*` 目录。这些检查足以确认 workflow 所需的数据和目录结构已经就绪。
-
-当前 workload 的输入不是随机选择。定义保存在 `config/config_genomas.env`。每个 trait 下只选择名称以 `GSE` 开头的目录，按名称排序后取前 N 个。运行前可以预览这三个 workload 将使用的前 8 个 cohort：
-
-```zsh
-ssh "$SSH_USER@$WORKFLOW_NODE" '
-  find /mnt/lustrefs/genomas_data/GEO/Type_1_Diabetes \
-    -mindepth 1 -maxdepth 1 -type d -name "GSE*" -printf "%f\n" |
-    sort | head -8
-'
-```
+输出最后一行必须是 `scilink-ready`。
 
 使用 OpenAI 或 FreeInference 时前往第 4 节。使用 vLLM 时前往第 3 节。
 
@@ -266,7 +208,7 @@ REMOTE
 本仓库不启动 vLLM server。保持 vLLM 的 `srun` terminal 运行，在新的 Mac terminal 设置计算节点：
 
 ```zsh
-export VLLM_NODE="nid001232"
+export VLLM_NODE="nid008384"
 ```
 
 建立 Perlmutter 到 Mac 的 tunnel。该 terminal 保持运行：
@@ -276,6 +218,7 @@ ssh -N \
   -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=60 \
   -L "18000:$VLLM_NODE:8000" \
+  -L "15558:$VLLM_NODE:5558" \
   mqsun@perlmutter.nersc.gov
 ```
 
@@ -314,7 +257,7 @@ export VLLM_SERVED_MODEL="Qwen3.6-27B"
 unset VLLM_API_KEY
 ```
 
-连接路径为 `Workflow cluster:18080 → Mac:18000 → Perlmutter compute node:8000`。更换 vLLM compute node 后重建第一个 tunnel。更换 Workflow cluster 后重建第二个 tunnel。成功后执行第 4.3 节。
+HTTP 连接路径为 `Workflow cluster:18080 → Mac:18000 → Perlmutter compute node:8000`。KV event replay 路径为 `Mac:15558 → Perlmutter compute node:5558`，仅供 Mac 上的固定输入测试使用。更换 vLLM compute node 后重建第一个 tunnel。更换 Workflow cluster 后重建第二个 tunnel。成功后执行第 4.3 节。
 
 ### 4. 配置推理后端
 
@@ -328,13 +271,13 @@ GenoMAS 支持三种后端。SciLink 的图像 workload 需要视觉模型。
 | vLLM          | `VLLM_API_KEY` 或占位值      | `VLLM_URL/v1`      | served model |
 
 
-
-
 #### 4.1 OpenAI
 
 在 Mac 设置模型：
 
 ```zsh
+source cloudlab_env.sh
+unset VLLM_URL
 export GENOMAS_MODEL="gpt-4o-mini-2024-07-18"
 export SCILINK_MODEL="gpt-4o-mini"
 ```
@@ -365,6 +308,8 @@ EOF
 在 Mac 设置：
 
 ```zsh
+source cloudlab_env.sh
+unset VLLM_URL
 export GENOMAS_MODEL="qwen3.6-35b"
 ```
 
@@ -388,6 +333,7 @@ FreeInference 不用于当前 SciLink 图像 workload。
 在 Mac 执行：
 
 ```zsh
+source cloudlab_env.sh
 source config/config_vllm_endpoint.env
 ```
 
@@ -421,6 +367,7 @@ EOF
 选择本次 workflow 的环境文件：
 
 ```zsh
+source cloudlab_env.sh
 REMOTE_ENV=".env.genomas"  # SciLink 改为 .env.scilink
 ```
 
@@ -453,6 +400,7 @@ REMOTE
 在 Mac 执行。该命令以整个仓库为同步范围，不重建虚拟环境，不覆盖 key 和结果：
 
 ```zsh
+source cloudlab_env.sh
 rsync -az --delete \
   --exclude '.git/' --exclude '__pycache__/' --exclude '*.pyc' \
   --exclude 'results/' --exclude '.venv/' --exclude '.env*' \
@@ -475,6 +423,7 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
 远端日志目录。每个新 Workflow cluster 建一次即可，已经建过的节点可以跳过；重复执行无副作用：
 
 ```zsh
+source cloudlab_env.sh
 ssh "$SSH_USER@$WORKFLOW_NODE" 'mkdir -p "$HOME/logs"'
 ```
 
@@ -494,7 +443,7 @@ full_c1_w2
 
 ```zsh
 : "${VLLM_URL:?先 export VLLM_URL=http://127.0.0.1:18080；使用 OpenAI 或 FreeInference 时跳过此检查}"
-RUN_WORKLOADS="A_c3_w1,A_c4_w1,A_c8_w1"
+RUN_WORKLOADS="A_c8_w4"
 REMOTE_LOG="logs/genomas_${RUN_WORKLOADS}_$(date +%Y%m%d_%H%M%S).log"
 ssh "$SSH_USER@$WORKFLOW_NODE" \
   "cd pi-ebpf-tracing-handoff &&
@@ -636,6 +585,7 @@ ssh "$SSH_USER@$WORKFLOW_NODE" \
 查看日志：
 
 ```zsh
+source cloudlab_env.sh
 ssh "$SSH_USER@$WORKFLOW_NODE" "tail -f \"\$HOME/$REMOTE_LOG\""
 ```
 
@@ -670,6 +620,7 @@ printf 'RUN_NAME=%s\n' "$RUN_NAME"
 #### 8.1 GenoMAS 和 SciLink
 
 ```zsh
+source cloudlab_env.sh
 bash scripts/pull_agentic_run.sh "$REMOTE_LOG"
 ```
 
@@ -680,6 +631,7 @@ bash scripts/pull_agentic_run.sh "$REMOTE_LOG"
 GenoMAS 和 SciLink 不需要本节，8.1 的脚本自己建目录。下面第二行是每次运行都要执行的：每个 run 有各自的 `$RUN_NAME`，接收目录不会重复。
 
 ```zsh
+source cloudlab_env.sh
 LOCAL_RUN="results/$RUN_NAME"
 mkdir -p "$LOCAL_RUN"
 rsync -az --progress --checksum --partial \
@@ -752,9 +704,8 @@ test -s results/index.html && echo kvcache-report-ready
 选择一个已拉回 Mac 的 cell。该目录必须包含 `messages.jsonl` 和 `pi_events.jsonl`。
 
 ```zsh
-export RUN_NAME="results/GenoMAS_A_c2_w1_20260811_111925"
-
-CELL="$RUN_NAME/A_c2_w1"
+RUN_NAME="GenoMAS_A_c8_w4_20260818_153414"
+CELL="results/$RUN_NAME/A_c8_w4"
 test -s "$CELL/messages.jsonl" && test -s "$CELL/pi_events.jsonl"
 ```
 
@@ -762,9 +713,11 @@ test -s "$CELL/messages.jsonl" && test -s "$CELL/pi_events.jsonl"
 
 ```zsh
 MAC_VLLM_URL="http://127.0.0.1:18000"
+VLLM_SERVED_MODEL="$(curl -fsS "$MAC_VLLM_URL/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
 BUNDLE="replay/bundles/${RUN_NAME}_$(basename "$CELL").json"
 
 curl -fsS "$MAC_VLLM_URL/v1/models" >/dev/null && echo tunnel-ok
+mkdir -p replay/bundles
 PYTHONPATH=src python3 -m agent_io_tracing.replay.bundle \
   "$CELL" \
   --output "$BUNDLE" \
@@ -783,13 +736,176 @@ python3 -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x' "$BUNDLE"
 
 先在 Perlmutter 上使用待测参数启动 vLLM。重放工具不会设置 server knob。它会读取 `cache_config_info`，记录服务器实际使用的配置。
 
+第一次在 Mac 的仓库目录运行 replay 时安装 KV event collector 依赖：
+
+```bash
+python3 -m pip install -e '.[observability]'
+```
+
+在 Mac 将观测配置复制到 Perlmutter。登录节点和 compute node 共享 `$HOME`，每次代码更新后执行一次：
+
 ```zsh
-SWEEP_DIR="replay/no_cache"
+scp config/config_vllm_observability.sh \
+  mqsun@perlmutter.nersc.gov:~/config_vllm_observability.sh
+```
+
+在 Perlmutter 原本启动 vLLM 的 `srun` shell 中加载配置：
+
+```bash
+source "$HOME/config_vllm_observability.sh"
+printf 'observability arguments loaded: %s\n' "${VLLM_OBSERVABILITY_ARGS[*]}"
+```
+
+通过标准：输出包含 `--enable-prompt-tokens-details` 和 `--kv-events-config`。随后重新执行你当前使用的完整 `vllm serve` 命令，只在命令末尾增加 `"${VLLM_OBSERVABILITY_ARGS[@]}"`。本仓库不保存 Perlmutter 的模型路径、容器命令和 tensor-parallel 参数，因此教程不能安全地重写这条启动命令。不要改动它的模型路径、tensor parallel、Mamba 或其他原有参数。
+
+这会启用逐请求 cached tokens、逐请求 server timing、KV residency histograms、调度 iteration 日志、prefix-cache reset 和带 replay buffer 的 KV block events。replay 保存原始 `kv_events.jsonl`，并将 `BlockRemoved` hash 与此前的 `BlockStored` 对齐后写入 `kv_removals.jsonl`。后者包含可恢复的 block token IDs 和 bundle request 候选位置。Mamba 或 SSM group 的事件会标为 ambiguous，不据此硬推 token 到 hash 的映射。第 3 节的 Perlmutter 到 Mac tunnel 已经转发 5558。回到 Mac 的仓库 terminal 设置：
+
+```zsh
+export VLLM_KV_EVENTS_REPLAY_ENDPOINT="tcp://127.0.0.1:15558"
+```
+
+正式 latency 运行应将 `VLLM_KV_METRICS_SAMPLE=0.01`，并按需从启动参数数组中移除 iteration logging 和 KV events。`1.0` 采样和全量事件适合诊断 eviction，不适合作为无观测开销的性能结果。
+
+```zsh
+MAC_VLLM_URL="http://127.0.0.1:18000"
+VLLM_KV_EVENTS_REPLAY_ENDPOINT="tcp://127.0.0.1:15558"
+SWEEP_DIR="replay/c8w4_warmup_$(date +%Y%m%d_%H%M%S)"
+
+test -s "$BUNDLE"
+curl -fsS "$MAC_VLLM_URL/v1/models" >/dev/null
+
 PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep arm \
   --bundle "$BUNDLE" \
   --sweep-dir "$SWEEP_DIR" \
-  --url "$MAC_VLLM_URL"
+  --label prefix_on_cold \
+  --url "$MAC_VLLM_URL" \
+  --mode serial \
+  --cache-salt-mode shared \
+  --output-tokens 256 \
+  --kv-events-replay-endpoint "$VLLM_KV_EVENTS_REPLAY_ENDPOINT"
 ```
+
+同一个 server 不重启，随后测预热过一次的相同 bundle：
+
+```zsh
+PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep arm \
+  --bundle "$BUNDLE" \
+  --sweep-dir "$SWEEP_DIR" \
+  --label prefix_on_prewarmed \
+  --url "$MAC_VLLM_URL" \
+  --mode serial \
+  --cache-salt-mode shared \
+  --warmup-repetitions 1 \
+  --output-tokens 256 \
+  --strict-config \
+  --kv-events-replay-endpoint "$VLLM_KV_EVENTS_REPLAY_ENDPOINT"
+
+PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep report \
+  --sweep-dir "$SWEEP_DIR" \
+  --results results
+open "$SWEEP_DIR/kvcache_report.html"
+```
+
+这两个 arm 都保持 `enable_prefix_caching=True`。`prefix_on_cold` 从空 cache 开始，但 bundle 后面的请求仍可命中前面请求写入的 prefix。`prefix_on_prewarmed` 在正式测量前多执行一次 bundle，但预热内容可能因容量不足被淘汰。这是一组 warm-up/retention 补充实验，不是原设计的 prefix cache OFF/ON 对照。
+
+#### 9.2.1 原设计 A0/A1：prefix cache OFF 对 ON
+
+新建一个 sweep，并固定 bundle、mode、输出长度和观测参数：
+
+```zsh
+SWEEP_DIR="replay/c8w4_prefix_off_on_$(date +%Y%m%d_%H%M%S)"
+```
+
+先停止 vLLM，在原启动命令中明确增加 `--no-enable-prefix-caching`，同时保留 `"${VLLM_OBSERVABILITY_ARGS[@]}"`。重启成功后确认实际配置：
+
+```zsh
+curl -fsS "$MAC_VLLM_URL/server_info?config_format=json" |
+python3 -c 'import json,sys; c=json.load(sys.stdin)["vllm_config"]["cache_config"]; print("prefix=",c["enable_prefix_caching"],"mamba=",c["mamba_cache_mode"])'
+```
+
+通过标准：输出 `prefix= False mamba= none`。然后记录 A0：
+
+```zsh
+PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep arm \
+  --bundle "$BUNDLE" \
+  --sweep-dir "$SWEEP_DIR" \
+  --label prefix_off \
+  --url "$MAC_VLLM_URL" \
+  --mode packed \
+  --output-tokens 256 \
+  --kv-events-replay-endpoint "$VLLM_KV_EVENTS_REPLAY_ENDPOINT"
+```
+
+再次停止 vLLM，把 `--no-enable-prefix-caching` 改为 `--enable-prefix-caching`，其他参数不变。重启后用同一检查命令确认输出 `prefix= True mamba= align`，然后记录 A1：
+
+```zsh
+PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep arm \
+  --bundle "$BUNDLE" \
+  --sweep-dir "$SWEEP_DIR" \
+  --label prefix_on \
+  --url "$MAC_VLLM_URL" \
+  --mode packed \
+  --output-tokens 256 \
+  --strict-config \
+  --allow-config-change enable_prefix_caching \
+  --kv-events-replay-endpoint "$VLLM_KV_EVENTS_REPLAY_ENDPOINT"
+```
+
+vLLM 0.26 在关闭 prefix caching 时会自动把 hybrid 模型的 `mamba_cache_mode` 设为 `none`，开启时则使用当前解析出的 `align`。因此 A0/A1 测量的是 vLLM 完整的 prefix-caching feature OFF/ON，包括这项必然的 Mamba 派生变化，并不是只切换 hash lookup 的内部 microbenchmark。
+
+#### 9.2.2 保持 Mamba 不变，只测跨请求 reuse
+
+本实验不重启 server。确保 server 保持 `enable_prefix_caching=True` 和 `mamba_cache_mode=align`，然后在 Mac 仓库 terminal 从头定义本节使用的全部变量：
+
+```zsh
+cd /Users/minqiu/Desktop/Benchmarking_Agents/pi-ebpf-tracing-handoff
+
+RUN_NAME="GenoMAS_A_c8_w4_20260818_153414"
+BUNDLE="replay/bundles/${RUN_NAME}_A_c8_w4.json"
+MAC_VLLM_URL="http://127.0.0.1:18000"
+VLLM_KV_EVENTS_REPLAY_ENDPOINT="tcp://127.0.0.1:15558"
+SWEEP_DIR="replay/c8w4_reuse_unique_shared_$(date +%Y%m%d_%H%M%S)"
+
+test -s "$BUNDLE"
+curl -fsS "$MAC_VLLM_URL/server_info?config_format=json" |
+python3 -c 'import json,sys; c=json.load(sys.stdin)["vllm_config"]["cache_config"]; assert c["enable_prefix_caching"] is True and c["mamba_cache_mode"] == "align"; print("server-ready: prefix=True mamba=align")'
+```
+
+先测禁止跨请求复用。工具在 reset 后为 108 个请求分别生成不同 cache salt。Token IDs、Mamba mode 和其他 server 配置不变，但任何请求都不能读取其他请求写入的 prefix：
+
+```zsh
+PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep arm \
+  --bundle "$BUNDLE" \
+  --sweep-dir "$SWEEP_DIR" \
+  --label reuse_blocked_unique_salt \
+  --url "$MAC_VLLM_URL" \
+  --mode serial \
+  --cache-salt-mode unique \
+  --output-tokens 256 \
+  --kv-events-replay-endpoint "$VLLM_KV_EVENTS_REPLAY_ENDPOINT"
+```
+
+同一个 server 不重启，随后测允许真实跨请求复用。工具再次 reset cache，但本次 108 个请求共享一个 cache salt：
+
+```zsh
+PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep arm \
+  --bundle "$BUNDLE" \
+  --sweep-dir "$SWEEP_DIR" \
+  --label reuse_allowed_shared_salt \
+  --url "$MAC_VLLM_URL" \
+  --mode serial \
+  --cache-salt-mode shared \
+  --output-tokens 256 \
+  --strict-config \
+  --kv-events-replay-endpoint "$VLLM_KV_EVENTS_REPLAY_ENDPOINT"
+
+PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep report \
+  --sweep-dir "$SWEEP_DIR" \
+  --results results
+open "$SWEEP_DIR/kvcache_report.html"
+```
+
+预期 `reuse_blocked_unique_salt` 的逐请求 `cached_tokens` 全部为 0，`reuse_allowed_shared_salt` 则恢复 bundle 内自然形成的命中。两者都不使用 warm-up。这个差值回答跨请求 reuse 本身对 TTFT、TPOT 和 wall time 的影响，不包含 prefix OFF 导致的 Mamba mode 变化。完成 serial 机制验证后，可以另建 sweep，把两个 arm 的 mode 同时改成 `packed`，测量原设计的并发性能。
 
 通过标准：进度到达 `completed <总数>/<总数> requests`，命令退出码为 0，新增 arm 的 `rep0/summary.json` 非空。
 
@@ -806,12 +922,34 @@ replay: completed 11/11 requests
 
 工具根据服务器配置和纽约时间自动命名 arm 目录，例如 `block784_dtype-auto_prefix-on_gpu0.9_20260811T113012`。报告使用同一个时间，并以与普通 task 相同的 `月-日 时:分` 格式显示。`--label <名称>` 可以覆盖自动名称。名称只决定结果目录，不会改变服务器配置。已有的 arm 目录不会被覆盖。
 
-重放支持两种请求节奏：
+重放支持三种请求节奏：
 
 - `packed` 是默认模式。它移除原运行中 agent 和工具执行产生的空档，以原 trace 的峰值并发数连续发送请求。该模式用于机制、容量和 block size 扫描。
 - `paced` 按原 trace 的请求到达时间发送，保留请求间隔。该模式用于 retention 和定时清缓存扫描。
+- `serial` 严格一次只发送一个请求，用于隔离 intrinsic TTFT、server queue 和 cache hit 的关系，不代表 c8_w4 的并发行为。
 
-同一个 sweep 不能混用两种模式。使用 `paced` 时在 arm 命令中添加 `--mode paced`。
+同一个 sweep 不能混用不同请求模式。使用 `paced` 时在 arm 命令中添加 `--mode paced`。
+
+`--cache-salt-mode shared` 让 bundle 内所有请求共享一个不进入模型输入的 cache namespace。`--cache-salt-mode unique` 为每个请求使用不同 salt，在 prefix caching 和 Mamba mode 保持开启的情况下禁止跨请求复用。两者使用相同 token IDs，可以替代 prefix caching on/off 对照。
+
+`--warmup-repetitions 1` 在 reset 后先完整重放一次 bundle，再抓取正式测量的 metrics-before 并重放同一个 bundle。预热和正式测量复用同一个 cache salt。正式 summary 和 Prometheus delta 不包含预热，`warmup0_requests.jsonl` 保留预热逐请求结果。
+
+输出默认仍固定为 32 tokens。`--output-tokens N` 可用于额外的 TTFT 或稳态 TPOT microbenchmark，`--max-concurrency N` 可以限制 replay 客户端并发，但不会改变原始 workflow 的 `max-workers`。
+
+capacity sweep 在 server 启动命令中使用 `--num-gpu-blocks-override N`。从第二个 arm 开始建议增加强校验：
+
+```zsh
+PYTHONPATH=src python3 -m agent_io_tracing.replay.sweep arm \
+  --bundle "$BUNDLE" \
+  --sweep-dir "$SWEEP_DIR" \
+  --url "$MAC_VLLM_URL" \
+  --mode paced \
+  --cache-salt-mode shared \
+  --strict-config \
+  --allow-config-change num_gpu_blocks_override
+```
+
+每个 repetition 都保存 `server_info.json`。它包含 vLLM version、served models 和 dev-mode `/server_info?config_format=json` 返回的完整 `VllmConfig`。强校验会比较完整 `VllmConfig` 和 Prometheus `CacheConfig`，只允许目标 knob 及其派生的 `num_gpu_blocks`、`kv_cache_size_tokens` 和 `kv_cache_max_concurrency` 变化。Mamba mode、block size 或其他字段意外变化时，replay 会在发送请求前停止。
 
 工具默认在每次重放前调用 `/reset_prefix_cache`，让每次结果都从冷缓存开始。启动 vLLM 时需要设置 `VLLM_SERVER_DEV_MODE=1` 才能启用该接口。`--repeat N` 只适用于能够清空缓存的 server，报告会对 N 次结果取中位数。
 
@@ -955,9 +1093,10 @@ Duty cycle 为读写系统调用时间区间并集除以对应 wall time。全�
 | `bcc.err`                   | tracer 状态 | 最后一行包含 `lost_events=0` |
 | `visualizations/index.html` | 单 cell 报告 | 文件非空                   |
 | `trace_stats.json`          | 采集事件统计    | 文件非空且 JSON 可解析         |
+| `postprocess_timings.json`  | 后处理耗时统计   | 所有步骤退出码为 0             |
 
 
-GenoMAS 和 SciLink 还必须包含 `pi_events.jsonl` 和 `tool_calls.log`。`pi_events.jsonl` 的每个非空行必须是合法 JSON。SciLink 还会生成 `postprocess_timings.json`，其中每个后处理步骤的退出码必须为 0。
+GenoMAS 和 SciLink 还必须包含 `pi_events.jsonl` 和 `tool_calls.log`。`pi_events.jsonl` 的每个非空行必须是合法 JSON。
 
 拉回结果后，在 Mac 执行：
 

@@ -274,6 +274,7 @@ def streamed_completion(
     chunks = []
     first_ms = None
     last_ms = None
+    server_metrics = None
     for chunk in original_completion(*c_args, **c_kwargs):
         if _chunk_has_content(chunk):
             now_ms = time.time() * 1000.0
@@ -283,6 +284,20 @@ def streamed_completion(
             # carries no token, and timing TPOT to that would count a round
             # trip the model never spent generating.
             last_ms = now_ms
+        chunk_metrics = getattr(chunk, "metrics", None)
+        model_extra = getattr(chunk, "model_extra", None)
+        if chunk_metrics is None and isinstance(model_extra, dict):
+            chunk_metrics = model_extra.get("metrics")
+        if chunk_metrics is None and isinstance(chunk, dict):
+            chunk_metrics = chunk.get("metrics")
+        if chunk_metrics is not None:
+            server_metrics = (
+                chunk_metrics.model_dump()
+                if hasattr(chunk_metrics, "model_dump")
+                else dict(chunk_metrics)
+                if isinstance(chunk_metrics, dict)
+                else None
+            )
         chunks.append(chunk)
     if not chunks:
         raise RuntimeError("forced-stream completion produced no chunks")
@@ -322,6 +337,8 @@ def streamed_completion(
         logger_module.observed_first_token_ms.set(first_ms)
     if last_ms is not None:
         logger_module.observed_last_token_ms.set(last_ms)
+    if server_metrics is not None:
+        logger_module.observed_server_metrics.set(server_metrics)
     return rebuilt
 
 
@@ -508,6 +525,7 @@ def main() -> int:
         scilink_logger.observed_first_token_ms.set(None)
         scilink_logger.observed_last_token_ms.set(None)
         scilink_logger.observed_cache.set(None)
+        scilink_logger.observed_server_metrics.set(None)
         cache_before = prefix_cache_counters()
 
         def _finish(response):

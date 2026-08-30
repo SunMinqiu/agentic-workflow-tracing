@@ -122,6 +122,20 @@ def analyze_latency(summary: dict[str, Any]) -> dict[str, Any]:
         for call in stream_calls
         if call["output"] > 1
     ]
+
+    server_calls = [
+        call for call in calls if isinstance(call.get("server_metrics"), dict)
+        and call["server_metrics"]
+    ]
+
+    def server_stat(key: str, scale: float = 1.0) -> float | None:
+        values = [
+            float(call["server_metrics"][key]) * scale
+            for call in server_calls
+            if isinstance(call["server_metrics"].get(key), (int, float))
+        ]
+        return round(statistics.median(values), 4) if values else None
+
     return {
         "overall": _stats(calls),
         "wall_clock_span_s": round(
@@ -148,6 +162,14 @@ def analyze_latency(summary: dict[str, Any]) -> dict[str, Any]:
             "p90_ttft_s": round(_percentile(ttft, 0.90), 4) if ttft else None,
             "median_tpot_s": round(statistics.median(tpot), 4) if tpot else None,
             "p90_tpot_s": round(_percentile(tpot, 0.90), 4) if tpot else None,
+        },
+        "server_timing": {
+            "n": len(server_calls),
+            "median_ttft_s": server_stat("time_to_first_token_ms", 0.001),
+            "median_queue_s": server_stat("queue_time_ms", 0.001),
+            "median_generation_s": server_stat("generation_time_ms", 0.001),
+            "median_itl_s": server_stat("mean_itl_ms", 0.001),
+            "median_tokens_per_second": server_stat("tokens_per_second"),
         },
         "slowest": [
             {
@@ -309,5 +331,4 @@ def plot_latency_breakdown(summary: dict[str, Any], out_png: Path) -> None:
     fig.tight_layout()
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
-
 

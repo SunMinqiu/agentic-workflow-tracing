@@ -1,31 +1,15 @@
 #!/bin/bash
 #
-# Phase-1 deploy of GenoMAS (https://github.com/Liu-Hy/GenoMAS) to a CloudLab
-# CentOS Stream 8 client node.  This pass is INTENTIONALLY MINIMAL: it does
-# NOT install BCC, does NOT install the eBPF .env, does NOT touch the SRAgent
-# or SciLink state.  Goal: prove that
-#
-#   python main.py --version smoke --model gpt-5-mini-2025-08-07 --api 1 \
-#       --quick-test --data-root /mnt/lustrefs/genomas_data
-#
-# runs end-to-end against OpenAI on the client.  Once that's green, Phase 2
-# layers in the LLM-call logger (genomas_tool_logger.py), and Phase 3 adds
-# the eBPF tracer.
+# Deploy the tracing harness, GenoMAS, its virtual environment, configuration,
+# and canonical dataset to the CloudLab workflow client.
 #
 # Run from the laptop, AFTER sourcing cloudlab_env.sh:
 #
 #     source ~/Desktop/Benchmarking_Agents/pi-ebpf-tracing-handoff/cloudlab_env.sh
 #     bash deploy_genomas_to_client.sh
 #
-# Re-runnable: clone uses pull-if-exists, uv venv is --clear, and .env files
-# are overwritten. The canonical laptop dataset is mirrored to Lustre unless
-# SYNC_GENOMAS_DATASET=0 explicitly reuses an existing remote copy.
-#
-# Key differences from deploy_scilink_to_client.sh:
-#   - Python 3.10 (GenoMAS requirements.txt is pinned via README)
-#   - .env uses `_1` suffix for keys (GenoMAS load-balancing convention)
-#   - OpenAI requires BOTH OPENAI_API_KEY_1 AND OPENAI_ORGANIZATION_1
-#   - Data layout is `<root>/GEO/<trait>/GSE*` + `<root>/TCGA/<trait>/<files>`
+# Re-running updates the repositories, rebuilds the virtual environment,
+# overwrites generated environment files, and mirrors the dataset to Lustre.
 #
 
 set -euo pipefail
@@ -40,7 +24,6 @@ MOUNT_PATH="${MOUNT_PATH:-/mnt/lustrefs}"
 # Local source dir for the tracing harness (rsync'd to remote).
 LOCAL_HARNESS="${LOCAL_HARNESS:-$HOME/Desktop/Benchmarking_Agents/pi-ebpf-tracing-handoff}"
 LOCAL_GENOMAS_DATASET="${LOCAL_GENOMAS_DATASET:-$HOME/Desktop/Benchmarking_Agents/GenoMAS_Datasets}"
-SYNC_GENOMAS_DATASET="${SYNC_GENOMAS_DATASET:-1}"
 
 # Remote layout — independent of ~/SRAgent and ~/SciLink so all three coexist.
 REMOTE_HARNESS_NAME="${REMOTE_HARNESS_NAME:-pi-ebpf-tracing-handoff}"
@@ -125,33 +108,20 @@ REMOTE_LUSTRE
 # ----------------------------------------------------------------
 # 1a) Mirror the laptop's canonical GenoMAS dataset onto Lustre.
 # ----------------------------------------------------------------
-case "$SYNC_GENOMAS_DATASET" in
-1|true|TRUE|yes|YES)
-    if [ ! -d "$LOCAL_GENOMAS_DATASET/GEO" ] || [ ! -d "$LOCAL_GENOMAS_DATASET/TCGA" ]; then
-        echo "Error: expected GEO/ and TCGA/ under LOCAL_GENOMAS_DATASET=$LOCAL_GENOMAS_DATASET" >&2
-        echo "       Set LOCAL_GENOMAS_DATASET or use SYNC_GENOMAS_DATASET=0 only when Lustre is already populated." >&2
-        exit 1
-    fi
-    echo "==> [1a] rsync GenoMAS dataset → $CLIENT_NODE:$REMOTE_DATA_DIR/"
-    rsync -az --delete --partial --progress \
-        --exclude '.DS_Store' \
-        "$LOCAL_GENOMAS_DATASET/" \
-        "$SSH_USER@$CLIENT_NODE:$REMOTE_DATA_DIR/"
-    ssh "$SSH_USER@$CLIENT_NODE" \
-        "find '$REMOTE_DATA_DIR' -name .DS_Store -type f -delete"
-    ;;
-0|false|FALSE|no|NO)
-    echo "==> [1a] dataset sync skipped by SYNC_GENOMAS_DATASET=$SYNC_GENOMAS_DATASET"
-    ;;
-*)
-    echo "Error: SYNC_GENOMAS_DATASET must be 0 or 1, got: $SYNC_GENOMAS_DATASET" >&2
+if [ ! -d "$LOCAL_GENOMAS_DATASET/GEO" ] || [ ! -d "$LOCAL_GENOMAS_DATASET/TCGA" ]; then
+    echo "Error: expected GEO/ and TCGA/ under LOCAL_GENOMAS_DATASET=$LOCAL_GENOMAS_DATASET" >&2
     exit 1
-    ;;
-esac
+fi
+echo "==> [1a] rsync GenoMAS dataset → $CLIENT_NODE:$REMOTE_DATA_DIR/"
+rsync -az --delete --partial --progress \
+    --exclude '.DS_Store' \
+    "$LOCAL_GENOMAS_DATASET/" \
+    "$SSH_USER@$CLIENT_NODE:$REMOTE_DATA_DIR/"
+ssh "$SSH_USER@$CLIENT_NODE" \
+    "find '$REMOTE_DATA_DIR' -name .DS_Store -type f -delete"
 
 # ----------------------------------------------------------------
-# 1b) rsync the tracing harness (so future Phase-2 logger + Phase-3 tracer
-#      land on the client without needing a second sync round).
+# 1b) Sync the tracing harness.
 # ----------------------------------------------------------------
 echo "==> [1b] rsync $LOCAL_HARNESS/ → $CLIENT_NODE:~/$REMOTE_HARNESS_NAME/"
 rsync -av \
@@ -253,7 +223,7 @@ fi
 echo "  Installing GenoMAS requirements..."
 uv pip install --python .venv/bin/python -r requirements.txt
 
-# Post-processing extras for visualize_strace.py (Phase 3).  pandas/numpy/
+# Post-processing extras for visualize_strace.py. pandas/numpy/
 # matplotlib are already in requirements.txt; only plotly is extra.
 echo "  Installing tracing analysis dependencies..."
 uv pip install --python .venv/bin/python Markdown plotly tiktoken
@@ -288,33 +258,21 @@ PYEOF
 # Confirm GenoMAS entry point file is present.
 test -f main.py || { echo "ERROR: GenoMAS main.py missing"; exit 1; }
 
-# --- FreeInference (custom OpenAI-compatible endpoint) model registration ---
+# --- OpenAI-compatible endpoint model registration --------------------------
 # GenoMAS's utils/llm.py has a CLOSED MODEL_INFO registry; validate_model()
-# rejects any model not in it ("Could not detect a provider").  When a custom
-# OPENAI_BASE_URL + GENOMAS_MODEL are configured, register that model under
-# MODEL_INFO['openai'] so it routes through OpenAIClient, whose AsyncOpenAI is
-# built with NO base_url and therefore auto-reads OPENAI_BASE_URL from env.
-# Idempotent; no-op unless both values are set (i.e. FreeInference mode).
+# rejects any model not in it ("Could not detect a provider").  Register the
+# model here so a deploy leaves a usable checkout, using the same helper the
+# trace scripts run at preflight -- one implementation, and it verifies the
+# edit still parses instead of trusting a blind string replace.
+#
+# This is a convenience only.  The registration that actually matters happens
+# at run time, because the served model name is set by config_vllm_endpoint.env
+# when a run starts and is generally NOT in this deploying shell.
 GENOMAS_MODEL_REG="${GENOMAS_MODEL:-}"
-OPENAI_BASE_REG="${OPENAI_BASE_URL:-}"
-if [ -n "\$OPENAI_BASE_REG" ] && [ -n "\$GENOMAS_MODEL_REG" ]; then
-  .venv/bin/python - "\$GENOMAS_MODEL_REG" << 'PYEOF'
-import sys
-model = sys.argv[1]
-path = "utils/llm.py"
-src = open(path).read()
-if f"'{model}'" in src:
-    print(f"  [freeinference] model {model} already in MODEL_INFO; skip")
-else:
-    anchor = "    'openai': {\n"
-    if anchor in src:
-        entry = (f"        '{model}': {{'input_price': 0.0, 'output_price': 0.0}},"
-                 f"  # FreeInference (OpenAI-compatible via OPENAI_BASE_URL)\n")
-        open(path, "w").write(src.replace(anchor, anchor + entry, 1))
-        print(f"  [freeinference] registered {model} under MODEL_INFO['openai']")
-    else:
-        print("  [freeinference] WARNING: MODEL_INFO['openai'] anchor not found; skipped")
-PYEOF
+if [ -n "\$GENOMAS_MODEL_REG" ]; then
+  .venv/bin/python "\$HOME/$REMOTE_HARNESS_NAME/scripts/ensure_genomas_model.py" \\
+    --repo "\$PWD" --model "\$GENOMAS_MODEL_REG" || \\
+    echo "  [model-registry] WARNING: deploy-time registration failed; the trace script will retry at run time"
 fi
 
 # --- deterministic cohort-count knob for I/O experiments ---
@@ -378,8 +336,8 @@ REMOTE_UV
 # 3) Write two .env files:
 #    a) ~/GenoMAS/.env             — used by main.py via python-dotenv
 #       (`cd ~/GenoMAS; python main.py ...`)
-#    b) ~/pi-ebpf-tracing-handoff/.env.genomas — used by the future
-#       trace_script_bcc_genomas.sh (Phase 3).  Absolute paths so
+#    b) ~/pi-ebpf-tracing-handoff/.env.genomas — used by
+#       trace_script_bcc_genomas.sh. Absolute paths so
 #       `sudo -E` (HOME=/root) doesn't break AGENT_PYTHON resolution.
 # ----------------------------------------------------------------
 REMOTE_HOME=$(ssh -T "$SSH_USER@$CLIENT_NODE" 'echo $HOME')
@@ -431,7 +389,7 @@ ssh "$SSH_USER@$CLIENT_NODE" \
     "cat > $REMOTE_HARNESS_NAME/.env.genomas && chmod 600 $REMOTE_HARNESS_NAME/.env.genomas" \
     << REMOTE_TRACE_ENV
 # Auto-generated by deploy_genomas_to_client.sh -- do not commit.
-# Sourced by trace_script_bcc_genomas.sh (Phase 3) so sudo -E (HOME=/root)
+# Sourced by trace_script_bcc_genomas.sh so sudo -E (HOME=/root)
 # doesn't strip these.  Paths absolute.
 export OPENAI_API_KEY_1="${OPENAI_API_KEY}"
 export OPENAI_ORGANIZATION_1="${OPENAI_ORGANIZATION:-}"
@@ -449,7 +407,7 @@ export TRACER_PYTHON="/usr/bin/python3"
 export AGENT_PYTHON="${REMOTE_HOME}/$REMOTE_GENOMAS_DIR/.venv/bin/python"
 export POST_PYTHON="${REMOTE_HOME}/$REMOTE_GENOMAS_DIR/.venv/bin/python"
 
-# Defaults for the workload matrix (Phase 4).
+# Defaults for the workload matrix.
 # Override GENOMAS_MODEL in the local env (cloudlab_env.sh) to switch providers,
 # e.g. export GENOMAS_MODEL="openai/glm-5.1" for FreeInference.
 export GENOMAS_MODEL="${GENOMAS_MODEL:-gpt-5-mini-2025-08-07}"
@@ -457,78 +415,17 @@ export DATA_DIR="${REMOTE_DATA_DIR}"
 REMOTE_TRACE_ENV
 
 # ----------------------------------------------------------------
-# 4) Data presence check (does NOT download; tells the user what to do)
+# 4) Verify deployment
 # ----------------------------------------------------------------
-echo "==> [4/5] Data dir status"
-ssh -T "$SSH_USER@$CLIENT_NODE" "bash -s" << REMOTE_DATA
-set -u
-GEO_TRAITS=\$(find "${REMOTE_DATA_DIR}/GEO" -mindepth 1 -maxdepth 1 -type d | wc -l)
-GEO_COHORTS=\$(find "${REMOTE_DATA_DIR}/GEO" -mindepth 2 -maxdepth 2 -type d -name 'GSE*' | wc -l)
-TCGA_TRAITS=\$(find "${REMOTE_DATA_DIR}/TCGA" -mindepth 1 -maxdepth 1 -type d | wc -l)
-echo "  GEO traits:   \$GEO_TRAITS"
-echo "  GEO cohorts:  \$GEO_COHORTS"
-echo "  TCGA traits:  \$TCGA_TRAITS"
-for trait_dir in "${REMOTE_DATA_DIR}"/GEO/*; do
-    [ -d "\$trait_dir" ] || continue
-    count=\$(find "\$trait_dir" -mindepth 1 -maxdepth 1 -type d -name 'GSE*' | wc -l)
-    echo "    \$(basename "\$trait_dir"): \$count cohorts"
-done
-if [ "\$GEO_TRAITS" -eq 0 ] && [ "\$TCGA_TRAITS" -eq 0 ]; then
-    echo "  → Data dir is empty.  Smoke run will fail until you populate it."
-fi
-REMOTE_DATA
+echo "==> [4/5] Verifying GenoMAS and dataset"
+ssh -T "$SSH_USER@$CLIENT_NODE" "bash -s" << REMOTE_VERIFY
+set -euo pipefail
+test -x "${REMOTE_HOME}/${REMOTE_GENOMAS_DIR}/.venv/bin/python"
+test -d "${REMOTE_DATA_DIR}/GEO"
+test -d "${REMOTE_DATA_DIR}/TCGA"
+test "\$(find "${REMOTE_DATA_DIR}" -type f | wc -l)" -gt 0
+test "\$(find "${REMOTE_DATA_DIR}/GEO/Type_1_Diabetes" -mindepth 1 -maxdepth 1 -type d -name 'GSE*' | wc -l)" -ge 8
+REMOTE_VERIFY
 
-# ----------------------------------------------------------------
-# 5) Final pointer + verification recipe
-# ----------------------------------------------------------------
-cat <<EOF
-
-==> [5/5] Deploy complete
-
-A. Confirm the venv works (no LLM call, no data needed):
-
-  ssh $SSH_USER@$CLIENT_NODE
-  cd ~/$REMOTE_GENOMAS_DIR
-  .venv/bin/python -c "import sys; print(sys.version)"
-  .venv/bin/python main.py --help | head -30
-
-B. Dataset placement:
-
-   The deploy mirrored the canonical laptop dataset with this layout:
-     ${LOCAL_GENOMAS_DATASET}/GEO/<trait>/GSE* -> ${REMOTE_DATA_DIR}/GEO/<trait>/GSE*
-     ${LOCAL_GENOMAS_DATASET}/TCGA/<trait>/... -> ${REMOTE_DATA_DIR}/TCGA/<trait>/...
-
-   To reuse an existing remote copy, confirm its required layout, then run a
-   later deploy with SYNC_GENOMAS_DATASET=0:
-        ssh $SSH_USER@$CLIENT_NODE
-        test -d "${REMOTE_DATA_DIR}/GEO" && test -d "${REMOTE_DATA_DIR}/TCGA"
-        test "\$(find "${REMOTE_DATA_DIR}" -type f | wc -l)" -gt 0
-        test "\$(find "${REMOTE_DATA_DIR}/GEO/Type_1_Diabetes" -mindepth 1 -maxdepth 1 -type d -name 'GSE*' | wc -l)" -ge 8
-        du -sh "${REMOTE_DATA_DIR}"
-
-C. Smoke run (no tracer, no logger, just GenoMAS):
-   Note: this will iterate over EVERY pair in metadata/task_info.json.
-   For a true small-scale smoke, Phase 2 will install a task_info.json
-   slicer in analyze_codebase_genomas.py.  For now, expect the full
-   benchmark run unless you slice metadata/task_info.json yourself.
-
-  ssh $SSH_USER@$CLIENT_NODE
-  cd ~/$REMOTE_GENOMAS_DIR
-  .venv/bin/python main.py \\
-      --version smoke \\
-      --model gpt-5-mini-2025-08-07 \\
-      --api 1 \\
-      --quick-test \\
-      --data-root ${REMOTE_DATA_DIR}
-
-  # Logs land in ./output/log_smoke.txt
-  # Per-cohort preprocess output in ./output/preprocess/<trait>/
-
-D. Next phases:
-   - Phase 2: write genomas_tool_logger.py + analyze_codebase_genomas.py
-              (slices task_info.json, installs LLMClient.generate_completion
-              monkey-patch BEFORE GenoMAS imports).
-   - Phase 3: write config_genomas.env + trace_script_bcc_genomas.sh
-              (BCC tracer for FS+net syscalls, parses to parsed.json).
-
-EOF
+echo "==> [5/5] Deploy complete"
+echo genomas-ready

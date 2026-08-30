@@ -33,10 +33,23 @@ ROW = {
     "realized_frac": 0.29,
     "logical_frac": 0.36,
     "gap_frac": 0.06,
-    "latency": {"overall": {"total_duration_s": 431.0}, "wall_clock_span_s": 433.0,
-                "stream_timing": {"median_ttft_s": 0.7, "median_tpot_s": 0.0143}},
+    "latency": {"overall": {"total_duration_s": 431.0, "median_duration_s": 21.25},
+                "wall_clock_span_s": 433.0,
+                "stream_timing": {"median_ttft_s": 0.7, "median_tpot_s": 0.0143},
+                "server_timing": {
+                    "median_ttft_s": 0.65,
+                    "median_queue_s": 0.02,
+                    "median_itl_s": 0.012,
+                }},
     "runtime": {"vendors": ["vLLM"], "models": ["Qwen3.6-27B"]},
-    "serving_config": {"kv_cache_size_tokens": "1325785"},
+    "serving_config": {
+        "kv_cache_size_tokens": "1325785",
+        "num_gpu_blocks": "1760",
+        "block_size": "784",
+        "cache_dtype": "auto",
+        "enable_prefix_caching": "True",
+        "gpu_memory_utilization": "0.9",
+    },
     "segments": {"cache_size_tokens": 45376},
 }
 
@@ -52,8 +65,13 @@ def test_index_and_report_show_the_same_numbers():
     assert report.split(" | ")[1:] == index.split(" | ")[2:]
     rendered = "\n".join(token_table([ROW]))
     assert "cache size" not in rendered
+    assert "cache-hit tokens" in rendered
+    assert "cached tokens" not in rendered
     assert "21,692" in rendered
     assert "1,325,785 tokens" in rendered
+    assert "GenoMAS_A_c2_w1_20260805_152115 / A_c2_w1" in rendered
+    assert "1,760" in rendered
+    assert "0.9" in rendered
 
 
 def test_both_tables_have_a_column_for_every_header():
@@ -61,6 +79,15 @@ def test_both_tables_have_a_column_for_every_header():
                            (time_table([ROW]), TIME_HEADERS)):
         assert lines[0].count("|") == len(headers) + 2
         assert _data_row(lines).count("|") == len(headers) + 2
+
+
+def test_time_table_shows_median_inference_duration():
+    rendered = "\n".join(time_table([ROW]))
+    assert "median inference" in rendered
+    assert "21.25s" in rendered
+    assert "median TTFT (server)" in rendered
+    assert "0.65s" in rendered
+    assert "12.00ms/token" in rendered
 
 
 def test_every_task_links_to_both_of_its_reports():
@@ -151,6 +178,7 @@ def test_sweep_arms_are_included_in_the_results_index(tmp_path):
         "output_tokens": 448,
         "prefix_cache": {"hit_rate": 0.3073},
         "median_ttft_ms": 1118.3,
+        "p95_ttft_ms": 2118.3,
         "median_tpot_ms": 14.4,
         "median_total_ms": 1118.5,
         "wall_s": 14.1,
@@ -170,9 +198,53 @@ def test_sweep_arms_are_included_in_the_results_index(tmp_path):
     assert "sweeps/blocksize" in page
     assert "30.73%" in page
     assert "1.12s" in page
+    assert "2.12s" in page
+    assert "p99 TTFT" not in page
     assert "14.40ms/token" in page
     assert "14.10s" in page
     assert ">mode</th>" not in page
     assert ">cache</th>" not in page
     assert "1118.3ms" not in page
     assert "../replay/sweeps/blocksize/kvcache_report.html" in page
+    assert page.count("open comparison") == 1
+
+
+def test_sweep_index_ignores_symlinked_duplicate_arm(tmp_path):
+    results = tmp_path / "results"
+    results.mkdir()
+    replay = tmp_path / "replay"
+    source_sweep = replay / "source"
+    source_rep = source_sweep / "shared" / "rep0"
+    source_rep.mkdir(parents=True)
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text(json.dumps({
+        "source_cell": str(
+            results / "GenoMAS_A_c8_w4_20260818_153414" / "A_c8_w4"
+        ),
+    }), encoding="utf-8")
+    summary = {
+        "bundle": str(bundle),
+        "mode": "serial",
+        "cache_state": "cold_by_reset",
+        "requests": 108,
+        "prompt_tokens": 816288,
+        "output_tokens": 27648,
+        "prefix_cache": {"hit_rate": 0.4187},
+        "median_ttft_ms": 701.5,
+        "median_tpot_ms": 14.37,
+        "median_total_ms": 4356.0,
+        "wall_s": 477.1,
+        "started_at_epoch_s": 1,
+    }
+    (source_rep / "summary.json").write_text(
+        json.dumps(summary), encoding="utf-8"
+    )
+    (source_sweep / "kvcache_report.html").write_text("report", encoding="utf-8")
+    comparison = replay / "comparison"
+    comparison.mkdir()
+    (comparison / "shared_again").symlink_to(source_sweep / "shared")
+    (comparison / "kvcache_report.html").write_text("report", encoding="utf-8")
+
+    rows = discover_sweep_arms(results)
+
+    assert [row["arm"] for row in rows] == ["shared"]

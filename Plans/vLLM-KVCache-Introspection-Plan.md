@@ -1,6 +1,30 @@
 # 直接读取 vLLM 前缀缓存内容：实施计划
 
-2026-08-09 起草。**尚未实施**，本文只是方案。目标是把 `realized`（实际复用）从"猜"变成"看"，并据此判定 `logical`（模拟出来的上限）是否还有存在必要。
+2026-08-09 起草。目标是把 `realized`（实际复用）从"猜"变成"看"，并据此判定 `logical`（模拟出来的上限）是否还有存在必要。
+
+## 0. 2026-08-18 状态：阶段 2 和阶段 3 作废
+
+目标已经达成，但走的不是本文第 4 节那条路，**下面的阶段 2 和阶段 3 不要再实施**。
+
+上游 issue #44961 已于 2026-07-14 修复。我们运行的 vLLM 0.26.0 里，`vllm/entrypoints/openai/chat_completion/serving.py` 的 `_make_prompt_tokens_details()` 已经把 `RequestOutput.num_cached_tokens` 映射到响应的 `usage.prompt_tokens_details.cached_tokens`，流式和非流式、chat 和 completion 四条路径都有。它只要求服务器启动时带 `--enable-prompt-tokens-details`，客户端流式时带 `stream_options.include_usage`——后者本仓库一直就带着。逐次命中量因此直接可读，不需要导出 `BlockPool`，也不需要复现链式块哈希。
+
+对账验证（2026-08-18，bundle `GenoMAS_A_c2_w1_20260809_193357_A_c2_w1.json`，17 次调用 / 165,818 token，冷启动）：
+
+| 量 | 值 |
+| --- | --- |
+| 逐次 `cached_tokens` 求和 | 52,528 |
+| Prometheus `prefix_cache_hits_total` 增量 | 52,528 |
+| `queries` | 165,818，等于输入总量，说明本次独占服务器 |
+
+两条独立路径精确相等，逐次真值成立。
+
+**同时确认了记账粒度**：17 个逐次值全部是 `block_size` 784 的整数倍，没有一个是 `cache_config_info` 里那个 `prefix_match_unit` 16 的非 784 倍数。因此 `analysis/kvcache/logical.py` 的对齐单位已改为按物理块对齐，见该文件 `_cache_geometry`。
+
+**仍然未解**：离线按 784 分块重放这个 bundle，总量能精确复现 52,528，但逐次归属还有两处各差一块（第 8 次和第 14 次，一多一少抵消）。这说明 vLLM 决定"哪一块算命中、哪一块进缓存"的边界规则还没完全摸清，不影响上面的结论。
+
+给 `BlockPool` 加驱逐事件日志这件事**挂起**，理由在第 4 节末尾：当前配置从未发生驱逐，问了没有信息量。等容量扫描把容量压到真会驱逐再回来做。
+
+以下第 1 到 7 节保留原样，作为当时的推理记录。
 
 ## 1. 要解决什么
 

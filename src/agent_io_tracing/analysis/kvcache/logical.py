@@ -13,7 +13,7 @@ run that matches counts; the divergent tail is new):
 
   gap% = logical_aligned% − realized%  → reuse left on the table by the
          vendor's retention, eviction, or routing. Alignment uses the serving
-         arm's prefix-matching unit.
+         arm's physical block size, the unit the engine actually bills in.
 
 Sub-agents / multiple roles: a real shared prefix cache is GLOBAL — any call
 whose prefix matches anything cached hits, regardless of which agent issued it.
@@ -138,6 +138,7 @@ def load_joined_calls(cell: Path) -> list[dict[str, Any]]:
                 "vendor": o.get("vendor"),
                 "model": o.get("model"),
                 "cache_config": o.get("cache_config") or {},
+                "server_metrics": o.get("server_metrics") or {},
                 "error": o.get("error"),
             })
 
@@ -184,6 +185,7 @@ def load_joined_calls(cell: Path) -> list[dict[str, Any]]:
             "cacheReadSource": u.get("cacheReadSource"),
             "cache_key": o.get("cache_key") or u.get("cache_key"),
             "provider_request_id": u.get("provider_request_id"),
+            "server_metrics": u.get("server_metrics") or {},
         })
     calls.sort(key=lambda c: c["t"])
     return calls
@@ -250,11 +252,52 @@ def _positive_int(value: Any) -> int | None:
 SERVING_CONFIG = "vllm_cache_before_serving_config.json"
 
 
+def read_arm_geometries(cell: Path) -> list[dict[str, Any]]:
+    """Block geometries recorded by replay arms that re-served this cell.
+
+    Older cells predate the serving-config capture, so their own directory says
+    nothing about the engine that served them. The replay arms do: each one
+    names the bundle it replayed and records the live ``cache_config_info``.
+    Matching on the bundle name recovers the real block size — 784 or 1568 —
+    instead of falling back to LEGACY_MATCH_UNIT, which is no server's
+    geometry at all.
+
+    Arms with prefix caching off are skipped: they cache nothing, so their
+    block size never governed a reuse decision.
+    """
+    run = cell.parent.name
+    replay_root = cell.parents[2] / "replay"
+    if not replay_root.is_dir():
+        return []
+    geometries: dict[tuple[int, str], dict[str, Any]] = {}
+    for summary_path in sorted(replay_root.glob("*/*/rep*/summary.json")):
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if run not in Path(str(summary.get("bundle") or "")).name:
+            continue
+        config = summary.get("serving_config") or {}
+        if str(config.get("enable_prefix_caching")).lower() != "true":
+            continue
+        block = _positive_int(config.get("block_size"))
+        if block is None:
+            continue
+        dtype = str(config.get("cache_dtype") or "auto")
+        geometries.setdefault((block, dtype), {
+            "block_size": block,
+            "cache_dtype": dtype,
+            "prefix_match_unit": _positive_int(config.get("prefix_match_unit")),
+            "arm": summary_path.parents[1].name,
+        })
+    return [geometries[key] for key in sorted(geometries)]
+
+
 def read_serving_config(cell: Path) -> dict[str, Any]:
     """The server's own cache_config_info, captured beside the counters.
 
-    Without it the geometry falls back to LEGACY_MATCH_UNIT, and a knob sweep
-    cannot say which configuration produced which number.
+    Without it the geometry falls back to the replay arms' record, and only
+    then to LEGACY_MATCH_UNIT.
     """
     path = cell / SERVING_CONFIG
     if not path.is_file():
@@ -270,8 +313,14 @@ def _cache_geometry(
     block_size: int | None,
     prefix_match_unit: int | None,
     server_config: dict[str, Any] | None = None,
-) -> tuple[int, int]:
-    """Resolve physical storage and prefix-match units from the arm manifest."""
+    arm_geometries: list[dict[str, Any]] | None = None,
+) -> tuple[int, int, int]:
+    """Resolve the block geometry from the arm manifest.
+
+    Returns ``(physical_block_size, alignment_unit, reported_match_unit)``.
+    The alignment unit is the one logical reuse is floored to; see below for
+    why it follows the physical block rather than the reported match unit.
+    """
     observed: set[tuple[int | None, int | None]] = set()
     for call in calls:
         serving = (call.get("cache_config") or {}).get("serving") or {}
@@ -297,19 +346,36 @@ def _cache_geometry(
     # `serving` above is rebound inside the loop; the captured server config
     # arrives under its own name so the two cannot collide.
     server_config = server_config or {}
+    # An arm at the engine's default dtype is the closest stand-in for the
+    # config a live run was served under; fp8 doubles the block, so it only
+    # applies when it is the only record.
+    arms = arm_geometries or []
+    default_arm = next(
+        (arm for arm in arms if arm.get("cache_dtype") in (None, "auto")),
+        arms[0] if arms else None,
+    )
     physical = (
         _positive_int(block_size)
         or observed_block
         or _positive_int(server_config.get("block_size"))
+        or (default_arm or {}).get("block_size")
         or LEGACY_MATCH_UNIT
     )
-    matching = (
+    # What the engine *reports* as its prefix-match unit, kept for the record.
+    reported = (
         _positive_int(prefix_match_unit)
         or observed_match
         or _positive_int(server_config.get("prefix_match_unit"))
+        or (default_arm or {}).get("prefix_match_unit")
         or physical
     )
-    return physical, matching
+    # What the engine actually bills. Measured 2026-08-18 against vLLM 0.26.0:
+    # every per-request `cached_tokens` came back a whole multiple of
+    # block_size 784, never of the reported prefix_match_unit 16. Aligning on
+    # the reported unit credits partial blocks that the cache never serves, so
+    # alignment follows the physical block unless a caller overrides it.
+    matching = _positive_int(prefix_match_unit) or physical
+    return physical, matching, reported
 
 
 def _cache_block_references(tokens: list[int], block_size: int) -> list[str]:
@@ -560,12 +626,20 @@ def analyze_cell_logical(
         return None
 
     serving = read_serving_config(cell)
-    physical_block_size, match_unit = _cache_geometry(
+    arm_geometries = read_arm_geometries(cell)
+    physical_block_size, match_unit, reported_match_unit = _cache_geometry(
         calls,
         block_size,
         prefix_match_unit,
         serving,
+        arm_geometries,
     )
+    # Every block size this cell was ever served under, so the ceiling can be
+    # read off per arm instead of only at whichever geometry won above.
+    alignment_units = sorted(
+        {match_unit} | {arm["block_size"] for arm in arm_geometries}
+    )
+    sum_aligned_by_unit = dict.fromkeys(alignment_units, 0)
     enc = _encoding_for(calls[0]["model"])
     # When the serving engine tokenized these prompts for us, its counts are
     # the truth: they include the tools schema and price images as images.
@@ -627,6 +701,8 @@ def analyze_cell_logical(
         if g != trie_match:
             raise AssertionError(f"prefix trie mismatch at call {call_index}: {trie_match} != {g}")
         logical_match_aligned = (g // match_unit) * match_unit
+        for unit in alignment_units:
+            sum_aligned_by_unit[unit] += (g // unit) * unit
         logical_candidates = [
             i for i, matched in enumerate(lcp_lengths) if g > 0 and matched == g
         ]
@@ -777,8 +853,22 @@ def analyze_cell_logical(
         "logical_aligned_tokens": sum_logical_aligned,
         "cache_geometry": {
             "block_size": physical_block_size,
-            "prefix_match_unit": match_unit,
-            "source": "server" if serving else "trace/legacy",
+            "prefix_match_unit": reported_match_unit,
+            "alignment_unit": match_unit,
+            "source": (
+                "server" if serving
+                else "replay_arm" if arm_geometries
+                else "trace/legacy"
+            ),
+            "arms": arm_geometries,
+        },
+        # The same ceiling recomputed at every block size this cell's arms ran.
+        "logical_aligned_by_block": {
+            str(unit): {
+                "tokens": total,
+                "frac": round(total / denom, 4),
+            }
+            for unit, total in sorted(sum_aligned_by_unit.items())
         },
         # The server's own cache_config_info at cell start: which knobs this
         # cell actually ran under.
@@ -821,11 +911,14 @@ def analyze_cell_logical(
             encoding="utf-8",
         )
 
-    # sanity: an ideal cache cannot serve less than the real one
+    # The ceiling only covers prefixes this cell itself produced. A server that
+    # was already warm when the cell started serves more than that, so this is
+    # a note about what the run met, not proof the arithmetic is wrong.
     if summary["logical_frac"] + 0.02 < summary["realized_frac"]:
-        summary["WARNING"] = (
+        summary["NOTE"] = (
             f"logical {summary['logical_frac']:.2%} < realized "
-            f"{summary['realized_frac']:.2%} — tokenizer likely misaligned "
+            f"{summary['realized_frac']:.2%} — the server held cache from "
+            f"before this cell started, or our tokenizer disagrees with it "
             f"(tok_delta {summary['tok_delta_pct']}%)"
         )
     return summary

@@ -31,6 +31,10 @@ def test_scilink_logger_writes_joinable_prompt_usage_and_timing(tmp_path):
     response = SimpleNamespace(
         id="request-1",
         model="gpt-4o-mini-2024-07-18",
+        model_extra={"metrics": {
+            "time_to_first_token_ms": 400.0,
+            "queue_time_ms": 20.0,
+        }},
         choices=[
             SimpleNamespace(
                 message=SimpleNamespace(
@@ -67,6 +71,7 @@ def test_scilink_logger_writes_joinable_prompt_usage_and_timing(tmp_path):
     assert [event["type"] for event in events] == ["message_start", "message_end"]
     assert events[0]["run_id"] == events[1]["run_id"] == prompts[0]["run_id"]
     assert events[1]["message"]["usage"]["cacheRead"] == 768
+    assert events[1]["server_metrics"]["queue_time_ms"] == 20.0
     assert events[1]["provider_request_id"] == "request-1"
     assert events[1]["agent_role"] == "AnalysisOrchestratorAgent"
     assert events[1]["message"]["timestamp"] - events[0]["message"]["timestamp"] == 2500

@@ -40,6 +40,7 @@ from agent_io_tracing.analysis.kvcache.summary import (
     PAGE_CSS, token_table, time_table,
 )
 from agent_io_tracing.analysis.results_index import write_results_index
+from agent_io_tracing.serving.vllm_endpoint import prometheus_window
 from agent_io_tracing.analysis.kvcache.segments import (
     analyze_cell_segments,
     write_tables as write_segments_tables,
@@ -102,6 +103,30 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
         if server_cache is not None:
             lg["server_prefix_cache"] = server_cache
             row["server_prefix_cache"] = server_cache
+        metrics_before = cell / "vllm_cache_before_metrics.prom"
+        metrics_after = cell / "vllm_cache_after_metrics.prom"
+        if metrics_before.is_file() and metrics_after.is_file():
+            window = prometheus_window(
+                metrics_before.read_text(encoding="utf-8"),
+                metrics_after.read_text(encoding="utf-8"),
+            )
+            lg["prometheus_window"] = window
+            row["prometheus_window"] = window
+            (cell / "vllm_metrics_window.json").write_text(
+                json.dumps(window, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+        server_info_before = cell / "vllm_cache_before_server_info.json"
+        server_info_after = cell / "vllm_cache_after_server_info.json"
+        if server_info_before.is_file() and server_info_after.is_file():
+            try:
+                before_config = json.loads(server_info_before.read_text(encoding="utf-8"))
+                after_config = json.loads(server_info_after.read_text(encoding="utf-8"))
+                changed = before_config != after_config
+                lg["server_config_changed_during_cell"] = changed
+                row["server_config_changed_during_cell"] = changed
+            except json.JSONDecodeError:
+                pass
         # Record whether realized was measured at all, so the tables can print
         # "n/a" instead of a 0 that reads as a finding.
         lg["realized_provenance"] = realized_provenance(
@@ -332,6 +357,43 @@ def build_report(
                     f"another client shared the server."
                 )
             L.append("")
+        prometheus = r.get("prometheus_window") or {}
+        if r.get("server_config_changed_during_cell"):
+            L.append(
+                "- **Invalid control:** vLLM `/server_info` changed during this cell."
+            )
+            L.append("")
+        if prometheus:
+            metrics = prometheus.get("metrics") or {}
+            means = prometheus.get("histogram_window_means") or {}
+
+            def metric_value(fragment: str, field: str) -> Any:
+                for name, values in metrics.items():
+                    if fragment in name and not name.endswith(("_bucket", "_sum", "_count")):
+                        return values.get(field)
+                return None
+
+            L.append("**Server observability window**")
+            L.append("")
+            L.append("| signal | value |")
+            L.append("| --- | ---: |")
+            L.append(
+                f"| KV usage after cell | "
+                f"{_pct(metric_value('kv_cache_usage_perc', 'after'))} |"
+            )
+            L.append(
+                f"| preemptions during cell | "
+                f"{_fmt(metric_value('num_preemptions', 'delta'))} |"
+            )
+            for name, label in (
+                ("vllm:kv_block_lifetime_seconds", "sampled block lifetime mean"),
+                ("vllm:kv_block_idle_before_evict_seconds", "sampled idle-before-evict mean"),
+                ("vllm:kv_block_reuse_gap_seconds", "sampled reuse-gap mean"),
+            ):
+                value = (means.get(name) or {}).get("window_mean")
+                rendered = f"{value:.3f}s" if isinstance(value, (int, float)) else "n/a"
+                L.append(f"| {label} | {rendered} |")
+            L.append("")
         if r.get("has_logical"):
             L.append("**Possible sources per call**")
             L.append("")
@@ -453,7 +515,8 @@ def main() -> int:
         row = analyze_run(cell, dump_prefixes=args.dump_prefixes)
         by_run[cell.parent].append(row)
         print(f"  {cell.name}: realized={_pct(row.get('realized_frac'))} "
-              f"logical={_pct(row.get('logical_frac'))} gap={_pct(row.get('gap_frac'))}")
+              f"logical={_pct(row.get('logical_aligned_frac'))} "
+              f"gap={_pct(row.get('gap_frac'))}")
 
     # one report per task: a run holding three tasks is three experiments, and
     # the results index is what puts them side by side

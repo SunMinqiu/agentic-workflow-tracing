@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 from agent_io_tracing.adapters.genomas.logger import (
     GenoMASToolLogger,
+    _build_exact_prompt_prefix,
     _install_openai_stream_timing,
+    _make_async_wrapper,
+    _prepend_prompt_prefix,
+    _strip_prompt_prefix,
     _to_pi_usage,
 )
 
@@ -24,7 +28,7 @@ def _client():
     )
 
 
-def _result(trace_timing=None):
+def _result(trace_timing=None, server_metrics=None):
     result = {
         "content": "answer",
         "usage": {"input_tokens": 1200, "output_tokens": 30, "cost": 0},
@@ -35,7 +39,102 @@ def _result(trace_timing=None):
     }
     if trace_timing is not None:
         result["_trace_timing"] = trace_timing
+    if server_metrics is not None:
+        result["_trace_server_metrics"] = server_metrics
     return result
+
+
+class _CharacterTokenizerEndpoint:
+    """ASCII test tokenizer with one token per character."""
+
+    def post_json(self, path, payload):
+        if path == "/tokenize":
+            return {"tokens": [ord(char) for char in payload["prompt"]]}
+        if path == "/detokenize":
+            return {"prompt": "".join(chr(token) for token in payload["tokens"])}
+        raise AssertionError(path)
+
+
+def test_genomas_builds_exact_server_tokenized_prompt_prefix():
+    prefix, metadata = _build_exact_prompt_prefix(
+        32768,
+        _CharacterTokenizerEndpoint(),
+        "test-model",
+    )
+
+    assert len(prefix) == 32768
+    assert metadata["target_tokens"] == 32768
+    assert metadata["actual_tokens"] == 32768
+    assert metadata["characters"] == 32768
+    assert prefix.startswith("[GENOMAS BENCHMARK REFERENCE PREFIX]")
+    assert prefix.endswith("[END GENOMAS BENCHMARK REFERENCE PREFIX]\n\n")
+
+
+def test_genomas_prompt_prefix_is_copied_before_first_message():
+    original = [
+        {"role": "system", "content": "original system"},
+        {"role": "user", "content": "task"},
+    ]
+
+    padded = _prepend_prompt_prefix(original, "fixed prefix\n")
+
+    assert padded[0]["content"] == "fixed prefix\noriginal system"
+    assert padded[1] is original[1]
+    assert original[0]["content"] == "original system"
+    assert _strip_prompt_prefix(padded, "fixed prefix\n") == original
+
+
+def test_genomas_wrapper_sends_and_records_padded_prompt(tmp_path, monkeypatch):
+    monkeypatch.delenv("GENOMAS_PROMPT_PREFIX_TOKENS", raising=False)
+    monkeypatch.delenv("GENOMAS_NOCACHE", raising=False)
+    monkeypatch.delenv("GENOMAS_LLM_CACHE_PATH", raising=False)
+    monkeypatch.delenv("GENOMAS_LLM_REPLAY", raising=False)
+    logger = GenoMASToolLogger(tmp_path)
+    logger._prompt_prefix = "fixed prefix\n"
+    seen = []
+
+    async def original(client, messages):
+        seen.append(messages)
+        return _result()
+
+    wrapped = _make_async_wrapper(original, logger)
+    source = [{"role": "system", "content": "original system"}]
+    asyncio.run(wrapped(_client(), source))
+
+    assert seen[0][0]["content"] == "fixed prefix\noriginal system"
+    assert source[0]["content"] == "original system"
+    prompts = _read_events(tmp_path / "messages.jsonl")
+    assert prompts[0]["messages"][0]["content"] == (
+        "fixed prefix\noriginal system"
+    )
+
+
+def test_genomas_nocache_tag_precedes_entire_prompt_prefix(tmp_path, monkeypatch):
+    monkeypatch.delenv("GENOMAS_PROMPT_PREFIX_TOKENS", raising=False)
+    monkeypatch.setenv("GENOMAS_NOCACHE", "1")
+    monkeypatch.delenv("GENOMAS_LLM_CACHE_PATH", raising=False)
+    monkeypatch.delenv("GENOMAS_LLM_REPLAY", raising=False)
+    logger = GenoMASToolLogger(tmp_path)
+    logger._prompt_prefix = "fixed prefix\n"
+    seen = []
+
+    async def original(client, messages):
+        seen.append(messages)
+        return _result()
+
+    wrapped = _make_async_wrapper(original, logger)
+    asyncio.run(wrapped(
+        _client(),
+        [{"role": "system", "content": "original system"}],
+    ))
+
+    sent = seen[0][0]["content"]
+    assert sent.startswith("[nocache:")
+    assert "\nfixed prefix\noriginal system" in sent
+    recorded = _read_events(tmp_path / "messages.jsonl")[0]
+    assert recorded["messages"][0]["content"] == (
+        "fixed prefix\noriginal system"
+    )
 
 
 def test_genomas_logger_emits_real_stream_timing_events(tmp_path, monkeypatch):
@@ -49,11 +148,14 @@ def test_genomas_logger_emits_real_stream_timing_events(tmp_path, monkeypatch):
     logger.on_llm_call(
         _client(),
         [{"role": "user", "content": "hello"}],
-        _result({
-            "response_headers_ms": start_ms + 100,
-            "first_token_ms": start_ms + 350,
-            "last_token_ms": start_ms + 1900,
-        }),
+        _result(
+            {
+                "response_headers_ms": start_ms + 100,
+                "first_token_ms": start_ms + 350,
+                "last_token_ms": start_ms + 1900,
+            },
+            {"time_to_first_token_ms": 320.0, "queue_time_ms": 12.0},
+        ),
         started,
         ended,
         cache_key="hash",
@@ -75,6 +177,7 @@ def test_genomas_logger_emits_real_stream_timing_events(tmp_path, monkeypatch):
     assert events[-1]["stream_timing_available"] is True
     assert events[-1]["provider_request_id"] == "req_test"
     assert events[-1]["message"]["usage"]["cacheRead"] == 896
+    assert events[-1]["server_metrics"]["queue_time_ms"] == 12.0
     prompts = _read_events(tmp_path / "messages.jsonl")
     assert prompts[0]["request_params"] == {
         "temperature": 0,
@@ -137,6 +240,14 @@ def test_genomas_openai_compatible_stream_produces_real_timing(monkeypatch):
                     id="req-1",
                     model="qwen3.6-35b",
                     choices=[],
+                    model_extra={
+                        "metrics": SimpleNamespace(
+                            model_dump=lambda: {
+                            "time_to_first_token_ms": 11.0,
+                            "mean_itl_ms": 4.0,
+                            },
+                        ),
+                    },
                     usage=SimpleNamespace(
                         prompt_tokens=1200,
                         completion_tokens=1,
@@ -204,3 +315,4 @@ def test_genomas_openai_compatible_stream_produces_real_timing(monkeypatch):
     assert result["usage"] == {"input_tokens": 1200, "output_tokens": 1}
     assert result["raw_response"]["usage"]["prompt_tokens_details"]["cached_tokens"] == 960
     assert result["_trace_timing"]["first_token_ms"] is not None
+    assert result["_trace_server_metrics"]["mean_itl_ms"] == 4.0

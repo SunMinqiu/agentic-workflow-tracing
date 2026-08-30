@@ -28,7 +28,7 @@ import markdown
 from agent_io_tracing.analysis.kvcache.summary import (
     PAGE_CSS, token_table, time_table,
 )
-from agent_io_tracing.replay.sweep import pretty_arm
+from agent_io_tracing.replay.sweep import load_repetition_summary, pretty_arm
 
 INDEX_HTML = "index.html"
 IO_REPORT = "visualizations/index.html"
@@ -78,6 +78,10 @@ def task_row(cell: Path, results_dir: Path) -> dict[str, Any]:
         "latency": logical.get("latency") or {},
         "runtime": logical.get("runtime") or {},
         "serving_config": logical.get("serving_config") or {},
+        "prometheus_window": logical.get("prometheus_window") or {},
+        "server_config_changed_during_cell": logical.get(
+            "server_config_changed_during_cell", False
+        ),
         "segments": {
             "realized_vs_logical": seg.get("realized_vs_logical") or {},
         } if seg else {},
@@ -117,9 +121,12 @@ def discover_sweep_arms(results_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for report in sorted(replay_dir.rglob(SWEEP_REPORT)):
         sweep_dir = report.parent
-        for arm_dir in sorted(path for path in sweep_dir.iterdir() if path.is_dir()):
+        for arm_dir in sorted(
+            path for path in sweep_dir.iterdir()
+            if path.is_dir() and not path.is_symlink()
+        ):
             reps = [
-                _load(path)
+                load_repetition_summary(path)
                 for path in sorted(arm_dir.glob("rep*/summary.json"))
             ]
             reps = [row for row in reps if row]
@@ -152,6 +159,7 @@ def discover_sweep_arms(results_dir: Path) -> list[dict[str, Any]]:
                 "output_tokens": median("output_tokens"),
                 "hit_rate": statistics.median(hit_rates) if hit_rates else None,
                 "median_ttft_ms": median("median_ttft_ms"),
+                "p95_ttft_ms": median("p95_ttft_ms"),
                 "median_tpot_ms": median("median_tpot_ms"),
                 "median_total_ms": median("median_total_ms"),
                 "wall_s": median("wall_s"),
@@ -197,30 +205,40 @@ LEAD_HEADERS = ["task", "reports"]
 
 def _sweep_table(rows: list[dict[str, Any]]) -> list[str]:
     lines = [
-        "| arm | report | calls | total input | total output | realized reuse | median TTFT | median TPOT | median request latency | wall |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| arm | comparison | calls | total input | total output | realized reuse | median TTFT | p95 TTFT | median TPOT | median request latency | wall |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     current_case = None
+    current_sweep = None
     for row in rows:
         if row["case"] != current_case:
             current_case = row["case"]
-            lines.append(f"| **{current_case}** |" + " |" * 9)
+            current_sweep = None
+            lines.append(f"| **{current_case}** |" + " |" * 10)
+        test_name = (
+            row["sweep"].rsplit("/", 1)[-1]
+            .replace("-", " ")
+            .replace("_", " ")
+        )
+        if row["sweep"] != current_sweep:
+            current_sweep = row["sweep"]
+            lines.append(
+                f"| **{test_name}** | [open comparison]({row['report']}) |"
+                + " |" * 9
+            )
         hit = f"{row['hit_rate']:.2%}" if isinstance(row.get("hit_rate"), (int, float)) else "n/a"
         ttft = f"{row['median_ttft_ms'] / 1000:,.2f}s" if isinstance(row.get("median_ttft_ms"), (int, float)) else "n/a"
+        p95_ttft = f"{row['p95_ttft_ms'] / 1000:,.2f}s" if isinstance(row.get("p95_ttft_ms"), (int, float)) else "n/a"
         tpot = f"{row['median_tpot_ms']:,.2f}ms/token" if isinstance(row.get("median_tpot_ms"), (int, float)) else "n/a"
         total = f"{row['median_total_ms'] / 1000:,.2f}s" if isinstance(row.get("median_total_ms"), (int, float)) else "n/a"
         wall = f"{row['wall_s']:,.2f}s" if isinstance(row.get("wall_s"), (int, float)) else "n/a"
         prompt = f"{int(row['prompt_tokens']):,}" if isinstance(row.get("prompt_tokens"), (int, float)) else "n/a"
         output = f"{int(row['output_tokens']):,}" if isinstance(row.get("output_tokens"), (int, float)) else "n/a"
         arm = pretty_arm({"label": row["arm"], "recorded_at": row["recorded_at"]})
-        test_name = (
-            row["sweep"].rsplit("/", 1)[-1]
-            .replace("-", " ")
-            .replace("_", " ")
-        )
         lines.append(
-            f"| {arm} | [{test_name}]({row['report']}) | {row['requests']} | {prompt} | "
-            f"{output} | {hit} | {ttft} | {tpot} | {total} | {wall} |"
+            f"| {arm} |  | {row['requests']} | {prompt} | "
+            f"{output} | {hit} | {ttft} | {p95_ttft} | "
+            f"{tpot} | {total} | {wall} |"
         )
     return lines
 

@@ -439,16 +439,37 @@ B_t1_w2,B_t2_w2,B_t4_w2
 full_c1_w2
 ```
 
+GenoMAS 默认启用 cohort-specific scientific context。`GSE123086` 到 `GSE232310` 根据 `output/genomas_references/corpus_manifest.json` 选择对应论文，使用 vLLM tokenizer 将每个角色的参考块限制为 8,192 tokens。参考材料只加入 `GEOAgent` 和 `DomainExpertAgent`，插在原始 `**Task**` 前；`CodeReviewerAgent` 不变。旧的 32K 合成前缀默认关闭。
+
+设置 `VLLM_URL` 后，trace 脚本会在创建结果 cell 前读取 `/v1/models`，将 `GENOMAS_MODEL` 和 GenoMAS 的 OpenAI-compatible endpoint 自动绑定到该 vLLM 服务。远端 `.env.genomas` 中残留的 OpenAI 或 FreeInference 配置不会覆盖本次 vLLM 运行。服务只暴露一个模型时自动选择；暴露多个模型时必须设置 `VLLM_SERVED_MODEL`。
+
+第一次运行先使用串行 smoke cell：
+
+```zsh
+RUN_WORKLOADS="A_c2_w1"
+```
+
+原始 workflow baseline 使用同一 cell，并只关闭论文上下文：
+
+```zsh
+GENOMAS_REFERENCE_TOKENS=0
+RUN_WORKLOADS="A_c2_w1"
+```
+
+若需要测试 4K、12K 或 16K context，将 `GENOMAS_REFERENCE_TOKENS` 分别设为 `4096`、`12288` 或 `16384`。一个比较矩阵内保持该值不变。
+
 在 Mac 设置并启动：
 
 ```zsh
 : "${VLLM_URL:?先 export VLLM_URL=http://127.0.0.1:18080；使用 OpenAI 或 FreeInference 时跳过此检查}"
 RUN_WORKLOADS="A_c8_w4"
+REFERENCE_TOKENS="${GENOMAS_REFERENCE_TOKENS:-8192}"
 REMOTE_LOG="logs/genomas_${RUN_WORKLOADS}_$(date +%Y%m%d_%H%M%S).log"
 ssh "$SSH_USER@$WORKFLOW_NODE" \
   "cd pi-ebpf-tracing-handoff &&
    sudo -n true &&
    nohup sudo -n -E env RUN_WORKLOADS='$RUN_WORKLOADS' VLLM_URL='$VLLM_URL' \
+     GENOMAS_REFERENCE_TOKENS='$REFERENCE_TOKENS' \
      bash scripts/trace_script_bcc_genomas.sh \
      >\"\$HOME/$REMOTE_LOG\" 2>&1 </dev/null &
    echo PID=\$! LOG=\$HOME/$REMOTE_LOG"

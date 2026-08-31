@@ -5,10 +5,15 @@ from types import SimpleNamespace
 
 from agent_io_tracing.adapters.genomas.logger import (
     GenoMASToolLogger,
+    _build_exact_reference_block,
     _build_exact_prompt_prefix,
+    _cohort_from_messages,
+    _insert_reference_before_task,
     _install_openai_stream_timing,
     _make_async_wrapper,
+    _ordered_reference_text,
     _prepend_prompt_prefix,
+    _strip_cohort_reference,
     _strip_prompt_prefix,
     _to_pi_usage,
 )
@@ -82,6 +87,90 @@ def test_genomas_prompt_prefix_is_copied_before_first_message():
     assert padded[1] is original[1]
     assert original[0]["content"] == "original system"
     assert _strip_prompt_prefix(padded, "fixed prefix\n") == original
+
+
+def test_genomas_cohort_reference_is_role_ordered_and_inserted_before_task():
+    paper = """Paper title and abstract.
+
+INTRODUCTION
+intro evidence
+
+RESULTS
+result evidence
+
+DISCUSSION
+discussion evidence
+
+METHODS
+method evidence
+"""
+    geo = _ordered_reference_text(paper, "GEOAgent")
+    expert = _ordered_reference_text(paper, "DomainExpertAgent")
+
+    assert geo.index("METHODS") < geo.index("RESULTS")
+    assert expert.index("RESULTS") < expert.index("METHODS")
+
+    source = [{
+        "role": "user",
+        "content": 'cohort: "GSE131528"\n\n**Task**:\nDo the original work.',
+    }]
+    block, metadata = _build_exact_reference_block(
+        source_text=geo * 100,
+        title="Study paper",
+        cohort="GSE131528",
+        role="GEOAgent",
+        target_tokens=2048,
+        endpoint=_CharacterTokenizerEndpoint(),
+        model="test-model",
+    )
+    injected = _insert_reference_before_task(source, block)
+
+    assert metadata["actual_tokens"] == 2048
+    assert _cohort_from_messages(source) == "GSE131528"
+    assert injected is not source
+    assert source[0]["content"].count("GENOMAS COHORT REFERENCE") == 0
+    content = injected[0]["content"]
+    assert content.index("[GENOMAS COHORT REFERENCE]") < content.index("**Task**")
+    assert content.rstrip().endswith("Do the original work.")
+    assert _strip_cohort_reference(injected) == source
+
+
+def test_genomas_reference_skips_reviewer_and_preserves_upstream_messages(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.delenv("GENOMAS_PROMPT_PREFIX_TOKENS", raising=False)
+    monkeypatch.delenv("GENOMAS_REFERENCE_TOKENS", raising=False)
+    monkeypatch.delenv("GENOMAS_LLM_CACHE_PATH", raising=False)
+    monkeypatch.delenv("GENOMAS_LLM_REPLAY", raising=False)
+    logger = GenoMASToolLogger(tmp_path)
+    logger._reference_roles = {"GEOAgent", "DomainExpertAgent"}
+    metadata = {
+        "cohort": "GSE123086",
+        "role": "GEOAgent",
+        "actual_tokens": 8000,
+        "sha256": "abc",
+    }
+    logger._cohort_references[("GSE123086", "GEOAgent")] = (
+        "\n\n[GENOMAS COHORT REFERENCE]\npaper\n"
+        "[END GENOMAS COHORT REFERENCE]\n"
+        "Follow the original GenoMAS task below.\n\n",
+        metadata,
+    )
+    source = [{
+        "role": "user",
+        "content": 'cohort: "GSE123086"\n\n**Task**:\nRun preprocessing.',
+    }]
+
+    geo_messages, geo_metadata = logger.add_cohort_reference(source, "GEOAgent")
+    reviewer_messages, reviewer_metadata = logger.add_cohort_reference(
+        source, "CodeReviewerAgent"
+    )
+
+    assert geo_messages is not source
+    assert geo_metadata == metadata
+    assert reviewer_messages is source
+    assert reviewer_metadata is None
+    assert "GENOMAS COHORT REFERENCE" not in source[0]["content"]
 
 
 def test_genomas_wrapper_sends_and_records_padded_prompt(tmp_path, monkeypatch):

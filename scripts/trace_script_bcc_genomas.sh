@@ -91,6 +91,75 @@ if ! "$AGENT_PYTHON" -c "import sys; sys.path.insert(0,'$GENOMAS_REPO'); import 
     exit 1
 fi
 
+# VLLM_URL explicitly selects the live vLLM backend. A deployed .env.genomas
+# may still contain settings from an earlier OpenAI or FreeInference run, so
+# resolve the served model and bind GenoMAS's OpenAI-compatible client here.
+# Do this before creating a cell or starting BCC so stale configuration cannot
+# leave behind an empty failed result.
+if [ -n "${VLLM_URL:-}" ] && [ "${GENOMAS_LLM_REPLAY:-0}" != "1" ]; then
+    mapfile -t VLLM_MODELS < <(
+        "$AGENT_PYTHON" - "$VLLM_URL" <<'PY'
+import os
+import sys
+
+from agent_io_tracing.serving.vllm_endpoint import VLLMEndpoint
+
+endpoint = VLLMEndpoint(
+    sys.argv[1],
+    os.environ.get("VLLM_API_KEY") or "",
+    timeout_s=10.0,
+)
+for model in endpoint.models():
+    print(model)
+PY
+    )
+    if [ "${#VLLM_MODELS[@]}" -eq 0 ]; then
+        echo "Error: $VLLM_URL/v1/models returned no served models." >&2
+        exit 1
+    fi
+
+    if [ -n "${VLLM_SERVED_MODEL:-}" ]; then
+        MODEL_FOUND=0
+        for SERVED_MODEL in "${VLLM_MODELS[@]}"; do
+            if [ "$SERVED_MODEL" = "$VLLM_SERVED_MODEL" ]; then
+                MODEL_FOUND=1
+                break
+            fi
+        done
+        if [ "$MODEL_FOUND" -ne 1 ]; then
+            echo "Error: VLLM_SERVED_MODEL=$VLLM_SERVED_MODEL is not served by $VLLM_URL." >&2
+            echo "Served models: ${VLLM_MODELS[*]}" >&2
+            exit 1
+        fi
+        GENOMAS_MODEL="$VLLM_SERVED_MODEL"
+    elif [ "${#VLLM_MODELS[@]}" -eq 1 ]; then
+        GENOMAS_MODEL="${VLLM_MODELS[0]}"
+    else
+        echo "Error: $VLLM_URL serves multiple models; set VLLM_SERVED_MODEL explicitly." >&2
+        echo "Served models: ${VLLM_MODELS[*]}" >&2
+        exit 1
+    fi
+
+    VLLM_OPENAI_BASE="${VLLM_URL%/}"
+    case "$VLLM_OPENAI_BASE" in
+        */v1) ;;
+        *) VLLM_OPENAI_BASE="$VLLM_OPENAI_BASE/v1" ;;
+    esac
+    export GENOMAS_MODEL
+    export GENOMAS_VENDOR="vLLM"
+    export OPENAI_BASE_URL="$VLLM_OPENAI_BASE"
+    export OPENAI_API_BASE="$VLLM_OPENAI_BASE"
+    export OPENAI_API_KEY_1="${VLLM_API_KEY:-local-vllm}"
+    export OPENAI_ORGANIZATION_1="local-vllm"
+    echo "Resolved vLLM backend: model=$GENOMAS_MODEL base=$OPENAI_BASE_URL"
+fi
+
+if [ "${GENOMAS_REFERENCE_TOKENS:-0}" -gt 0 ] && [ ! -f "${GENOMAS_REFERENCE_MANIFEST:-}" ]; then
+    echo "Error: GenoMAS cohort reference manifest not found: ${GENOMAS_REFERENCE_MANIFEST:-<unset>}" >&2
+    echo "Re-run scripts/deploy_genomas_to_client.sh to sync the reference TXT corpus." >&2
+    exit 1
+fi
+
 # GenoMAS validates --model against a closed registry in utils/llm.py and aborts
 # with "Could not detect a provider" for anything missing from it.  The served
 # vLLM model name is only known now (VLLM_SERVED_MODEL), and any re-clone of the
@@ -173,6 +242,9 @@ echo "Model:      $GENOMAS_MODEL"
 echo "Vendor:     ${GENOMAS_VENDOR:-unrecorded}"
 echo "Stream timing: ${GENOMAS_CAPTURE_STREAM_TIMING:-1}"
 echo "Prompt prefix: ${GENOMAS_PROMPT_PREFIX_TOKENS:-0} tokens"
+echo "Cohort reference: ${GENOMAS_REFERENCE_TOKENS:-0} tokens"
+echo "Reference roles: ${GENOMAS_REFERENCE_ROLES:-none}"
+echo "Reference manifest: ${GENOMAS_REFERENCE_MANIFEST:-none}"
 echo "Cells:      ${#WORKLOADS[@]} (= max-workers values × reps)"
 echo "Inter-run sleep: ${INTER_RUN_SLEEP_SEC}s"
 [ -n "${RUN_WORKLOADS:-}" ] && echo "RUN_WORKLOADS filter: $RUN_WORKLOADS"
@@ -283,6 +355,7 @@ for entry in "${WORKLOADS[@]}"; do
         --work-dir "$WORK" \
         --output-dir "$OUT" \
         --instrumentation "$INSTRUMENTATION_LEVEL" \
+        --extra-json "{\"reference_tokens\": ${GENOMAS_REFERENCE_TOKENS:-0}, \"reference_roles\": \"${GENOMAS_REFERENCE_ROLES:-}\", \"reference_manifest\": \"${GENOMAS_REFERENCE_MANIFEST:-}\"}" \
         > "$OUT/manifest.log" 2>&1 || true
 
     LUSTRE_SAMPLER_PID=""

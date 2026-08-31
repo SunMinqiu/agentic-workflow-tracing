@@ -1,0 +1,124 @@
+{
+  "documents": [
+    {
+      "title": "Probiotic normalization of systemic inflammation in siblings of type 1 diabetes patients: an open-label pilot study",
+      "cohorts": [
+        "GSE162622"
+      ],
+      "url": "https://www.nature.com/articles/s41598-022-07203-6.pdf",
+      "pdf": "pdf/cabrera_2022_GSE162622.pdf",
+      "text": "txt/cabrera_2022_GSE162622.txt",
+      "pages": 15,
+      "nonempty_pages": 15,
+      "pdf_bytes": 6764204,
+      "text_characters": 46703,
+      "text_words_approx": 6802,
+      "running_lines_removed": 35,
+      "references_removed": true,
+      "pdf_sha256": "d8635e8892ae51d4ba82cd28c07f09c3eb2aee8b1440a3885917cd5bac1e5eba",
+      "text_sha256": "bdab95f9d6478eb92b71d0588d11cd5ffc158684861b58832c379e1284bd05f1"
+    },
+    {
+      "title": "A validated single-cell-based strategy to identify diagnostic and therapeutic targets in complex diseases",
+      "cohorts": [
+        "GSE123086",
+        "GSE123088"
+      ],
+      "url": "https://shaleklab.com/wp-content/uploads/2024/03/Gawel_etal_GenomeMed_2019.pdf",
+      "pdf": "pdf/gawel_2019_GSE123086_GSE123088.pdf",
+      "text": "txt/gawel_2019_GSE123086_GSE123088.txt",
+      "pages": 25,
+      "nonempty_pages": 25,
+      "pdf_bytes": 8258428,
+      "text_characters": 108688,
+      "text_words_approx": 16713,
+      "running_lines_removed": 23,
+      "references_removed": true,
+      "pdf_sha256": "1457f61b6b1817dc74fd699e2214c3e7c66d20b2c02c1a19235293780ef29777",
+      "text_sha256": "8c4f191a86dbebc462d433ebafb827110ce9ff3087586819de75ffe161bbd3fd"
+    },
+    {
+      "title": "Germline-like TCR-alpha chains shared between autoreactive T cells in blood and pancreas",
+      "cohorts": [
+        "GSE182870"
+      ],
+      "url": "https://www.nature.com/articles/s41467-024-48833-w.pdf",
+      "pdf": "pdf/linsley_2024_GSE182870.pdf",
+      "text": "txt/linsley_2024_GSE182870.txt",
+      "pages": 16,
+      "nonempty_pages": 16,
+      "pdf_bytes": 2226554,
+      "text_characters": 73412,
+      "text_words_approx": 11718,
+      "running_lines_removed": 26,
+      "references_removed": true,
+      "pdf_sha256": "964b9ad379d1dfd35efda3c84bc58188e0f181f5e60b9b81b409bf0d10169da4",
+      "text_sha256": "d2104cb7c620aa61e202791cf5e604c60dc1539d278585366e9e950bce1e0410"
+    },
+    {
+      "title": "Monocytes in type 1 diabetes families exhibit high cytolytic activity and subset abundances that correlate with clinical progression",
+      "cohorts": [
+        "GSE232310"
+      ],
+      "url": "https://pdfs.semanticscholar.org/5caa/d6e9efc53406f2dd164fff848eba8bc93d1f.pdf",
+      "pdf": "pdf/pant_2024_GSE232310.pdf",
+      "text": "txt/pant_2024_GSE232310.txt",
+      "pages": 18,
+      "nonempty_pages": 18,
+      "pdf_bytes": 8545392,
+      "text_characters": 76612,
+      "text_words_approx": 12417,
+      "running_lines_removed": 388,
+      "references_removed": true,
+      "pdf_sha256": "ac74b5464232d392c4b7bf1ca4a374ce7b7f85f5c82848efa3252d022b850e57",
+      "text_sha256": "38be242bdf15f6a8ef6127b659db3058f7f63d29e0996a5504bd4dfbf9b8c3a9"
+    },
+    {
+      "title": "Prevalence of Inflammatory Pathways Over Immuno-Tolerance in Peripheral Blood Mononuclear Cells of Recent-Onset Type 1 Diabetes",
+      "cohorts": [
+        "GSE156035",
+        "GSE193273"
+      ],
+      "url": "https://www.frontiersin.org/journals/immunology/articles/10.3389/fimmu.2021.765264/pdf",
+      "pdf": "pdf/santos_2022_GSE156035_GSE193273.pdf",
+      "text": "txt/santos_2022_GSE156035_GSE193273.txt",
+      "pages": 13,
+      "nonempty_pages": 13,
+      "pdf_bytes": 2888547,
+      "text_characters": 42773,
+      "text_words_approx": 6349,
+      "running_lines_removed": 21,
+      "references_removed": true,
+      "pdf_sha256": "950f34406e1ba9deaa487565d665e39329b57cf9b2aadbcba5993cbba227f05b",
+      "text_sha256": "1318611ac42da3820de3d8cce04aca3f3e25d9c2c4d7ef940ab8585fdcffafa7"
+    },
+    {
+      "title": "A composite immune signature parallels disease progression across T1D subjects",
+      "cohorts": [
+        "GSE131528"
+      ],
+      "url": "https://discovery.ucl.ac.uk/id/eprint/10085671/7/Pesenacker_A%20composite%20immune%20signature%20parallels%20disease%20progression%20across%20T1D%20subjects_AAM.pdf",
+      "pdf": "pdf/speake_2019_GSE131528.pdf",
+      "text": "txt/speake_2019_GSE131528.txt",
+      "pages": 37,
+      "nonempty_pages": 37,
+      "pdf_bytes": 1246089,
+      "text_characters": 46366,
+      "text_words_approx": 6926,
+      "running_lines_removed": 25,
+      "references_removed": true,
+      "pdf_sha256": "6f64eef86076dfcf7ac59839bd1c549389e4ac82ea2a421fed2517c3c5948706",
+      "text_sha256": "d9545481f6b2f6e39d36965a6cf4bf91dbecd70c57624435524e969f1d60d10f"
+    }
+  ],
+  "cohort_to_text": {
+    "GSE162622": "txt/cabrera_2022_GSE162622.txt",
+    "GSE123086": "txt/gawel_2019_GSE123086_GSE123088.txt",
+    "GSE123088": "txt/gawel_2019_GSE123086_GSE123088.txt",
+    "GSE182870": "txt/linsley_2024_GSE182870.txt",
+    "GSE232310": "txt/pant_2024_GSE232310.txt",
+    "GSE156035": "txt/santos_2022_GSE156035_GSE193273.txt",
+    "GSE193273": "txt/santos_2022_GSE156035_GSE193273.txt",
+    "GSE131528": "txt/speake_2019_GSE131528.txt"
+  }
+}

@@ -1,0 +1,537 @@
+A composite immune signature parallels
+disease progression across T1D subjects
+Cate Speake, ... , Raphael Gottardo, S. Alice Long
+JCI Insight.
+2019.
+https://doi.org/10.1172/jci.insight.126917
+.
+
+In-Press Preview
+At diagnosis, most people with type 1 diabetes (T1D) produce measurable levels of
+endogenous insulin, but the rate at which insulin secretion declines is heterogeneous. To
+explain this heterogeneity, we sought to identify a composite signature predictive of insulin
+secretion, using a collaborative assay evaluation and analysis pipeline that incorporated
+multiple cellular and serum measures reflecting beta cell health and immune system
+activity. The ability to predict decline in insulin secretion would be useful for patient
+stratification for clinical trial enrollment or therapeutic selection. Analytes from 12 qualified
+assays were measured in shared samples from subjects newly diagnosed with T1D. We
+developed a computational tool to identify a composite panel associated with decline in
+insulin secretion over 2 years after diagnosis. The tool employs multiple filtering steps to
+reduce data dimensionality, incorporates error-estimation techniques including crossvalidation and sensitivity analysis, and is flexible to assay type, clinical outcome and
+disease setting. Using this novel analytical tool, we identified a panel of immune markers
+that, in combination, are highly associated with loss of insulin secretion. The methods used
+here represent a novel process for identifying combined immune signatures that predict
+outcomes relevant for complex and heterogeneous diseases like T1D.
+Research
+Find the latest version:
+https://jci.me/126917/pdf
+
+A composite immune signature parallels disease progression across T1D subjects
+Cate Speake1, Samuel O. Skinner1, Dror Berel2, Elizabeth Whalen1@, Matthew J. Dufort1, William Chad
+Young2, Jared M. Odegard1*, Anne M. Pesenacker3†, Frans K. Gorus4, Eddie A. James1, Megan K. Levings3,
+Peter S. Linsley1, Eitan M. Akirav5,6, Alberto Pugliese7, Martin J. Hessner8, Gerald T. Nepom1,9, Raphael
+Gottardo2, S. Alice Long1
+1 Benaroya Research Institute at Virginia Mason, Seattle, WA
+2 Vaccines and Infectious Disease Division, Fred Hutchinson Cancer Research Center, Seattle, WA
+3 University of British Columbia BC Children’s Hospital Research Institute, Vancouver, BC, Canada
+4 Diabetes Research Center, Medical School and University Hospital (UZ Brussel), Brussels Free University
+Vrije Universiteit Brussel, Brussels, Belgium
+5 Research Institute, Islet Biology, New York University Winthrop Hospital, Mineola, New York
+6 Stony Brook University School of Medicine, Stony Brook, New York.
+7 Diabetes Research Institute, Department of Medicine, Division of Diabetes Endocrinology and
+Metabolism, and Department of Microbiology and Immunology, Miller School of Medicine, University of
+Miami, Miami, FL
+8 Medical College of Wisconsin, Milwaukee, WI
+9 Immune Tolerance Network, Bethesda, MD
+
+@ Present affiliation: Celgene, Inc., Seattle, WA
+* Present affiliation: Gilead Sciences, Inc., Seattle, WA
+† Present affiliation: University College London, London, UK
+
+Corresponding Author:
+Cate Speake, PhD
+Diabetes Clinical Research Program
+Benaroya Research Institute at Virginia Mason
+1201 9th Ave
+Seattle, WA 98101
+Ph: (206) 287-1078
+cspeake@benaroyaresearch.org
+
+COI: EW receives a salary from Celgene, Inc. JMO receives a salary from Gilead Sciences, Inc. MKL has
+received research support from TxCell, Pfizer, and Bristol Myers Squibb and has patents pending related
+to alloantigen specific chimeric antigen receptors. PSL receives research support from Bristol Myers
+Squibb and is an inventor on patent US5844095A, “CTLA4Ig fusion proteins.” RG has received consulting
+income from Juno Therapeutics, Takeda, Infotech Soft, Celgene, and has received research support from
+Janssen Pharmaceuticals and Juno Therapeutics.
+
+ABSTRACT
+At diagnosis, most people with type 1 diabetes (T1D) produce measurable levels of endogenous insulin,
+but the rate at which insulin secretion declines is heterogeneous. To explain this heterogeneity, we
+sought to identify a composite signature predictive of insulin secretion, using a collaborative assay
+evaluation and analysis pipeline that incorporated multiple cellular and serum measures reflecting beta
+cell health and immune system activity. The ability to predict decline in insulin secretion would be useful
+for patient stratification for clinical trial enrollment or therapeutic selection. Analytes from 12 qualified
+assays were measured in shared samples from subjects newly diagnosed with T1D. We developed a
+computational tool (DIFAcTO) to identify a composite panel associated with decline in insulin secretion
+over 2 years after diagnosis. DIFAcTO employs multiple filtering steps to reduce data dimensionality,
+incorporates error-estimation techniques including cross-validation and sensitivity analysis, and is
+flexible to assay type, clinical outcome and disease setting. Using this novel analytical tool, we identified
+a panel of immune markers that, in combination, are highly associated with loss of insulin secretion.
+The methods used here represent a novel process for identifying combined immune signatures that
+predict outcomes relevant for complex and heterogeneous diseases like T1D.
+
+INTRODUCTION
+Type 1 diabetes (T1D) is caused by immune destruction of pancreatic beta cells, leading to an inability to
+produce sufficient insulin. At diagnosis, most people with T1D still produce some endogenous insulin,
+but both the level and rate of continued decline varies markedly between individuals. Age represents
+one component of this heterogeneity, as subjects diagnosed at a younger age tend to have lower levels
+of insulin secretion at diagnosis and to lose insulin secretion more rapidly after onset (1-3). The other
+sources of heterogeneity in insulin secretion after diagnosis are not well understood. Addressing this
+gap could help enable patient selection for clinical trial enrollment, where enriching for subjects with a
+faster rate of decline could reduce the size and/or duration of efficacy trials (4, 5). Clinically,
+maintenance of insulin secretion after diagnosis can contribute to a reduction in the rate of disease
+complications (6). The rate of loss of insulin secretion is therefore considered a metric of post-diagnosis
+disease progression.
+Immune system parameters are also hypothesized to contribute to varied rates of disease progression.
+Individuals with T1D are heterogeneous in regard to their immunobiology at and after diagnosis as
+supported by the breadth and inter-subject range of individual immunological features within this
+population (7-11). In recent studies of individual assays, this heterogeneity has been suggested to
+predict the rate of progression after diagnosis for some subjects (12-15). Better fundamental
+knowledge of the array of immune drivers of disease could help explain the differing rates of loss of beta
+cells observed across subjects, and potentially indicate immunotherapeutic targets.
+Determining whether a combination of immune and beta cell features can together define rate of
+disease progression across a range of subjects requires 1) sufficient sample(s) from shared, wellannotated subjects, and 2) appropriately qualified assays that broadly describe response in a given
+subject. Sample availability can be overcome by working collaboratively to obtain retrospective samples
+
+from clinical trials or similarly annotated longitudinal collections. As samples from such collections are
+necessarily limited, ensuring their best use requires fit-for-purpose qualification of any biomarker assays
+employed. Here, we planned to run each assay in a single batch. Thus, the key performance parameters
+for assay qualification were detectability (frequency present) and intra-assay precision of each analyte,
+when tested in the target patient population, with the sample type, and with available sample volume.
+Notably, sample volumes may disproportionately impact low-frequency analytes, such as low
+abundance cell populations, as stochastic sampling error can result in false positive associations,
+especially when many measurements are made.
+In this study, we aimed to determine whether multiple unique measures in aggregate correlate with rate
+of loss of insulin secretion. To this end, we established a stringent, well-defined, and collaborative assay
+evaluation and data analysis method. The assays selected for study included measures that were
+hypothesized to directly relate to T1D pathogenesis; these included antigen-specific CD8 T cell
+frequencies (16), a Treg transcriptional signature previously associated with T1D (17), the ratio of
+proinsulin to C-peptide (18), and a measure of demethylated insulin DNA in serum (19). Other selected
+assays showed prior utility in understanding T1D pathogenesis. These included genome-scale
+technologies, included here for broad screening and hypothesis generation: whole blood and cell subset
+RNA sequencing (15, 20) and an assay measuring the transcriptional response to T1D serum (13, 21, 22)
+were employed. Assays also included screening assessments that were smaller scale, including
+immunophenotyping by flow cytometry (23) and measurements of serum miRNA (24). Using these
+assays, we conducted a proof-of-concept study in a cohort of recent onset T1D subjects with variable
+rates of C-peptide decline, who were followed meticulously for both metabolic outcomes and ancillary
+sample collection over a 2 year period within the context of clinical trial monitoring. After filtering
+based on individual assay validity and consistency, data from all assays was integrated, its dimensionality
+was reduced to facilitate combined modeling, and features associated with C-peptide decline were
+
+identified. Model estimation error was assessed by cross-validation. Selected analytes were then
+subjected to sensitivity analysis. We found 12 analytes that, in combination, were prognostic for decline
+in C-peptide; these originated from 3 immune assays (signature of serum exposure, cell-type specific
+RNA-seq and flow cytometry) implicating at least three immune cell types. Attributes of immune
+activation, suggestive of an attempt to control the immune response, were positively associated with
+maintenance of insulin secretion. Immune trafficking and B-cell activation, the latter of which was
+recently associated with poor response to therapy (20), were both associated with increased rate of
+disease progression.
+
+RESULTS
+STUDY APPROACH AND HETEROGENEITY IN C-PEPTIDE DECLINE
+We collaboratively defined an approach to identify a robust composite signature of decline in insulin
+secretion. This method involved two key steps. First, we conducted blinded replicate testing to
+measure the detectability and intra-assay precision of a panel of selected assays, listed in Table 1. Next,
+we deployed each qualified assay on samples collected at T1D diagnosis to identify analytes that were
+prognostic for decline in insulin secretion over the following 2 years. PBMC, serum, and whole blood
+RNA samples for this step were collected from control-arm subjects (n=50) enrolled in one of three new
+onset T1D trials conducted by the Immune Tolerance Network (25-27). Subjects were meticulously
+followed after diagnosis, with insulin secretion assessed by mixed meal tolerance testing at least 5 times
+between diagnosis and 2 years. Clinical and demographic data for included subjects are listed in Table 2.
+As previously described (28, 29), decline in insulin secretion (as measured by circulating C-peptide) in
+the years after diagnosis is highly heterogeneous. Figure 1 shows this data for all subjects whose
+samples were used in this study. Here, we used a log rate of decline calculated using a mixed model
+approximating all timepoints available for each subject (15, 30). Change in insulin secretion in this
+cohort most strongly approximated exponential decay (15, 30). In our dataset, as in previous work (1-3),
+age is partially predictive of rate of decline. However, it is an imperfect predictor, particularly in subjects
+of younger ages where variability in decline rates is highest (15). This variation is also present in subjects
+diagnosed at older ages. For example, the subjects highlighted in magenta and green (Figure 1) are aged
+19 and 17 respectively, and show substantively different rates of decline.
+REPLICATE TESTING IDENTIFIES SUFFICIENTLY PRECISE ASSAYS
+We selected a broad range of assays to test (Table 1). This included low-dimension assays selected to
+assess expected features of disease progression, including: proinsulin:C-peptide ratio (18, 31), a marker
+
+of pancreatic islet beta cell dysfunction; a demethylated insulin DNA assay measuring beta cell death
+(19); antigen-specific CD8 T cell frequency and phenotype as measured by qDot multimer assay (16); and
+a transcriptional signature of regulatory T cells that had previously been identified to discriminate
+between subjects with and without T1D (17). Higher-dimension (genome-scale) assays were also
+included to identify data-driven features of disease progression. These included: RNA sequencing of
+whole blood (30) and sorted B cell, CD4 and CD8 T cell, and monocyte subsets (32); immunophenotyping
+by flow cytometry (33); transcriptional response to T1D serum (22) assessed using Affymetrix
+microarrays; and serum miRNAs measured by qPCR (24).
+Assays with poor precision were excluded in order to limit the effect of technical variation on eroding
+statistical power in the planned composite model. To assess assay precision in a blinded fashion,
+triplicate aliquot samples from 3-5 subjects with T1D were tested by each assay (per design in
+Supplementary Figure 1.) Over 160,000 individual analytes were measured across all assays (Table 1).
+Of these, 49% (80,852) met initial quality control or detection limits specific to each assay. Downselection at this step was primarily driven by the higher-dimension assays; for example, much of the
+genome is not expected to be transcribed in CD4 T cells, and thus these unexpressed genes are filtered
+out from the RNAseq assays. Next, the coefficient of variation (CV, here expressed as a percentage) for
+each analyte was calculated per subject; any analyte with a mean CV <30% was eligible to be included in
+downstream analyses. The majority of analytes that met detection limits (91%) met the CV cut-off.
+Replicate testing data are available in Supplementary Figures 2-7. All analytes that did not meet this CV
+threshold were removed from further analysis.
+The demethylated insulin assay was removed entirely from our pipeline at this phase, as the CV in
+samples from subjects with T1D (regardless of duration) was consistently above our cutoff
+(Supplementary Figure 4). This may have been driven by sample quality, as the serum samples for both
+replicate testing and the recent onset cohort had been stored for many years, and were not collected
+
+according to protocols optimized for this assay. The CD8 antigen-specific T cell assay (qDot multimer,
+Supplementary Figure 5) was also removed at this phase. This assay had an acceptable CV, but could
+only be applied to assay HLA-A2 positive subjects and the number of subjects in the recent-onset cohort
+bearing the HLA of interest was too low for the assay to have utility. The miRNA assay (Supplementary
+Figure 6) was attempted in the recent onset cohort samples; however, it was removed prior to data
+analysis. Laboratory processing failures that occurred during miRNA extraction resulted in too few
+samples with sufficient available data for analysis. This stringent culling of assays and analytes reduced
+our total analyte count substantially, likely improving our statistical power based on reduced
+measurement error in the retained analytes. The process resulted in the removal of 3 assays
+(demethylated insulin, CD8 antigen-specific T cells, and serum miRNA). While there were a considerable
+number of analytes removed, we found that the vast majority of analytes tested in the 9 assays that
+were included in the rest of the study (95%), met our predefined precision cut-offs.
+DEVELOPMENT AND TUNING OF AN ANALYSIS PIPELINE INCORPORATING MULTIPLE DATA TYPES
+There are many tools optimized for single types of assay data, but few that integrate multiple data
+types. Thus, we developed an analytical tool that was capable of incorporating the multiple data types
+tested here (Figure 2). The tool brings together established analytical methods (such as LASSO (34))
+with newly developed code to integrate varied data types. It was developed in the R programming
+language and is freely available. The tool is flexible to data types and to outcomes and thus is named
+DIFAcTO: Data Integration Flexible to Account for different Types of data and Outcomes; here, DIFAcTO
+was tested with 5 different data types and a continuous clinical outcome. An optional dimension
+reduction step can be applied to whole genome assays. In our study, each whole genome assay was
+subjected to modular analysis by WGCNA (35), and modules identified were treated as independent
+analytes which were scaled and clustered as described below.
+
+We used a machine learning approach that combines the following multi-step analyte filtering. Step 1 is
+preprocessing by scaling and preliminary feature selection. Step 2 then identifies a multivariate model
+(using LASSO), that also implements internal feature selection. The goal of the first preprocessing step is
+to remove analytes (features) that are poorly associated with the dependent variable (rate of C-peptide
+loss), so that an acceptable number of features are included in the later LASSO step. The first step of
+preprocessing is itself done in two parts. The first is univariate filtering: within each assay, all individual
+associations between each analyte and the dependent variable are estimated. Only the top analytes are
+kept for further analysis, based on rank or significance thresholds (with correction for multiple
+comparisons). The second is clustering of associated analytes across multiple assays. Many of the
+selected analytes may strongly correlate with each other, even across different assays. For the final
+multivariate model, this may cause multicollinearity, which would complicate interpretation of
+associations. To avoid this, analytes are clustered by Pearson correlation using hierarchical clustering.
+The number of clusters is determined by a tuning parameter (described in detail below). A single
+representative analyte is then selected to represent the cluster; this analyte is the most strongly
+associated with the dependent variable in each cluster. Lastly, a multivariate model (LASSO (34, 36))
+with predefined covariates (clinical, demographic) and the remaining analytes is performed. The LASSO
+also implements a regularized step that removes additional non-significant analytes. For this study, we
+incorporated baseline C-peptide, age, HLA, and BMI as known potential predictive covariates; these
+analytes were included in the LASSO analysis to ensure they were considered as potential components
+of the model.
+To allow a wide range of analytes and outcomes, DIFAcTO includes multiple user-adaptable parameters.
+The user can specify the number of analytes from each assay that enter the clustering step. The
+minimum within-cluster correlation used at the clustering step can also be tuned. Increasing this value
+results in a larger number of highly correlated clusters and thus a larger number of analytes entering the
+
+feature selection step; decreasing this value results in poorly correlated analytes within a cluster but
+fewer analytes entering the feature selection step. Both of these parameters (number of analytes per
+assay and minimum correlation per cluster) should be tested with each dataset to identify optimal
+parameter settings. For this study, we evaluated a range of minimum correlation values and analyte
+counts per assay, and assessed the cross-validation error rates after feature selection (Figure 3). Error
+rates reached a near minimum for this dataset with 30 analytes per assay included in the feature
+selection and within-cluster correlation r=0.7. In total, 201 clusters were identified, and a single analyte
+from each was used for LASSO feature selection.
+IDENTIFICATION AND SENSITIVITY ANALYSIS OF A COMPOSITE ANALYTE PANEL ASSOCIATED WITH
+INSULIN SECRETION
+We next applied DiFAcTO to our primary question: which immune markers measured at baseline
+(diagnosis) would, in a multivariate model, be prognostic for rate of C-peptide decline over the ensuing 2
+years of disease? Using these optimized parameter settings, we identified a model composed of 17
+immune analytes that, measured at diagnosis, were prognostic for rate of decline in insulin secretion.
+This rate was determined by using a standard clinical measure of C-peptide during mixed meal tolerance
+testing (AUC C-peptide) at a total of 5 timepoints over 2 years as described previously (15, 30). Table 2
+lists each individual analyte and the assay from which it was measured. C-peptide level at diagnosis is a
+known correlate of future C-peptide decline, and was selected by the tool. We note that age, HLA, and
+BMI were not selected as independent predictors in analysis of this cohort.
+While we did considerable filtering of this dataset and performed cross-validation in feature selection,
+we recognized the continuing risk of identifying false positive associations given the number of analytes
+assessed. We therefore performed a preliminary sensitivity analysis on the remaining 17 analytes. We
+reasoned that an analyte should, at minimum, be robust to minor changes in settings of our own
+
+analytical tool; slight modifications to numbers of analytes per cluster or to clustering correlations
+should still result in a similar set of analytes. As expected, C-peptide at diagnosis (baseline) was
+consistently selected by DIFAcTO using all parameters tested (Figure 4). We identified 12 analytes that
+were robust to analytical tool settings (Table 3). Five analytes, however, were specific to only a few
+settings in DIFAcTO (annotated as “dropped” in Table 3); we predict that these analytes would likely not
+be associated with C-peptide decline in a separate validation dataset as they are not robustly selected in
+this one. Individual correlations between C-peptide decline rate and each remaining analyte, as well as
+baseline C-peptide, are shown infigure 5, ranked by correlation to C-peptide decline. Of the 12 analytes
+selected by the tool, 11 were more highly correlated with C-peptide decline than was baseline Cpeptide. Because age was not selected by the tool, we also inspected the relationship between age and
+each individual analyte (Supplementary Figure 8). The analyte most highly correlated with age was the
+MFI of TIGIT on naïve CD8 T cells; this was also the analyte with the lowest individual correlation with Cpeptide decline. The remaining analytes and baseline C-peptide had limited correlations with age in this
+dataset.
+Finally, we assessed the performance of our tool in predicting C-peptide decline in this dataset, and
+tested its ability to identify previously published analytes from an independent dataset in a different
+disease context. C-peptide decline prediction was tested by fitting a linear model to the data using
+three different sets of predictors: a baseline model using C-peptide at diagnosis as a known predictor; a
+‘full’ model using all 17 identified analytes; and a ‘maintained’ model using only the 12 analytes that
+were found to be robust to tool settings. From these fits we calculated an adjusted R2 value that reflects
+how well the model fits the data. Additionally, we calculated a robust, cross-validated root mean square
+error (RMSE) by separating the data into five folds and, for each fold, training on the other four-fifths of
+the data and predicting the held-out fold. We did this 1000 times to get a robust estimate of the RMSE
+along with a 90% interval. The results are shown in Supplementary Table 1. Using our selected analytes
+
+improved prediction over baseline C-peptide in this dataset, as reflected both in adjusted R2 and RMSE.
+Additionally, the improvement in performance of the ‘maintained’ model over the ‘full’ model confirms
+our decision to remove those analytes that were not found to be robust to initial parameter settings. In
+an initial step toward comparison of this tool to elastic net, we tested an independent dataset from a
+clinical trial of an HIV vaccine, RV144 (37). DIFAcTO successfully identified previously known
+immunological predictors in this high dimensional dataset (Supplemental Methods).
+
+DISCUSSION
+Here, we describe a collaborative, generalizable method to identify robust, inclusive correlates of clinical
+outcomes, and a proof-of-concept utilization of that method to identify a panel of markers associated
+with decline in insulin secretion after diagnosis. In developing this method, we had three key goals:
+first, inclusion of data from as many assay types as possible and incorporating the expertise and
+perspective of as many investigators as was feasible; second, blind assessment of reproducibility for all
+analytes included in any analyses to increase likelihood of future success; and third, transferability to
+other studies and datasets.
+One important component of our method was the collaborative identification of assays that might yield
+results of interest (38). We focused on choosing assays that were thought to be independent and
+mechanistically related to T1D pathogenesis, such as the proinsulin: C-peptide ratio, as well as assays
+that could generate more broad-based, hypothesis-generating results such as RNAseq of multiple
+immune cell subsets. 9 investigators chose to participate in, and provide data for, this collaborative
+project; this resulted in a rich dataset, generated from the same sets of subjects, which is now being
+mined for other clinical outcomes and associations between immune markers. We partnered in this
+effort with a major autoimmunity clinical trial network (the ITN), which furthered the visibility of this
+work in the T1D research community and may improve the possibilities for future clinical translation of
+our findings.
+Our second focus was on assay quality. The technical precision of each individual analyte is essential to
+the reproducibility of the composite panel, and thus to our ability to identify meaningful correlates of
+clinical outcomes. An early step in our process, therefore, was a preliminary assessment of immune
+marker reproducibility. Should these markers be of interest for future translation, many other
+assessments, including broader reproducibility measurements and multi-center validation, as recently
+
+described (39), would clearly be needed. Here, we applied a moderate level of rigor - requiring a mean
+CV <30% across a limited number of T1D subjects for each assay. Still, this was sufficient to remove over
+4000 analytes even after initial QC was applied. For the genome scale assays, CV cut-offs were applied
+after detection thresholding processes; while a much larger number of analytes were removed due to
+lack of detection, technical imprecision resulted in the removal of hundreds to thousands of additional
+analytes for each RNAseq assay. This method of dimension reduction could be applied with relative
+ease and should reduce type 1 error resulting from detection of random associations between variables
+that can occur with imprecise measurements. One caveat to this substantial data reduction is that
+analytes associated with C-peptide decay may have been excluded because they did not fit our criteria;
+for example, there may be measurements that are more highly expressed and thus more reproducible in
+specific subjects or at specific disease stages. Future studies may reassess reproducibility in larger
+populations of T1D and other subjects. However, we accepted the trade-off between known
+reproducibility characteristics and the theoretical loss of important analytes. Separately, gene
+expression data tends to cluster into strongly correlated groups of genes (35), and groups of immune
+cell populations also show strongly correlated clusters (40). In some cases, the relationship to C-peptide
+that may be present for an analyte with low reproducibility will be represented by a more reproducible
+analyte in that or another assay.
+Our third focus was on building a broadly useful analytical process. This method, from reproducibility
+testing through the use of our new analytical tool, is generalizable. DIFAcTO has been used to find
+analytes associated with both categorical and continuous outcomes. It has user-modifiable parameters
+that allow it to accommodate datasets of different sizes and data with different variability profiles.
+Indeed, in this study we used parameters that enabled us to prioritize selection of variables from
+multiple assays that may help understand T1D biology, rather than focusing solely on predictive
+performance. The tool can incorporate multiple data types, including genome-scale datasets. It has
+
+been developed in R / MLR (41), which is an advanced, generic, robust analytical framework for
+multivariate analysis modeling and feature-selection methods. As mentioned, we are now mining this
+dataset to identify robust predictors of other clinical outcomes in these subjects. However, DIFAcTO
+could easily be applied by those investigators and consortia with very large clinical and mechanistic
+datasets.
+We have used this method to identify a diverse multivariate model that predicts C peptide decline. Of
+course, to move toward clinical utility this panel would need to be confirmed in an independent
+replication cohort. In addition, the panel would likely need to be transitioned to more focused assays,
+as opposed to the genome-scale data analyzed here, and therefore would need full, independent
+qualification using the focused assay methods as has been considered in other studies (reviewed in (5,
+42)). One might speculate that this panel could be informative at earlier stages of T1D, including the
+antibody-positive at-risk setting, or that it may be predictive of future disease-associated complications.
+This remains to be tested in other datasets.
+Interestingly, this composite panel incorporates markers of multiple cell types and pathways. The
+expression level of each component immune feature in our signature differs across subjects. However,
+we can see common immunological themes. We found that markers associated with immune activation
+(TOP3B, LRTOMT), ER processing (ZNF596, EIF4G2) and regulation of activation (SORBS2, TIGIT on naïve
+CD8 T cells) were positively correlated with slower loss of insulin secretion. Additional markers were
+associated with viral or interferon responses (PLA2G4B, KIAA0319L). These positive correlations may
+initially be counter-intuitive since islet beta cell destruction is thought to be immune-mediated.
+However, a similar association of immune activation and increased regulation has been observed in
+regulatory T cell studies in autoimmunity where there is an ultimately failed attempt to control the
+immune response (43). Thus, in part, our data suggests that immune activation positively associated
+with slower disease progression, representing immune processes directed towards controlling
+
+autoimmunity. In contrast, in the same T1D population we also found negative correlations with
+maintenance of cell trafficking and insulin secretion, respectively (SVEP1, GRP75) as well as functional
+markers of B cells (JAGN1). This is consistent with two previous findings: increased B-cells in pancreatic
+sections (7), and a B cell transciptional signature found to correlate with poor response to therapy and
+more rapid C-peptide decline (15, 20). Together, these data suggest that there may be common
+immune processes that associate with slower disease progression, but they likely differ in composition
+and predominance across subjects highlighting the universal value of a composite signature.
+Immune, beta cell and demographic data were all included as potential predictors in the LASSO analysis;
+we note that 12 immune features and baseline C-peptide were selected. Importantly, nearly all of the
+selected markers (11 of 12) when analyzed independently were more highly associated with decline in
+insulin secretion than was baseline C-peptide, highlighting the potential relevance of these novel
+immune markers. As would be expected from previous studies (1, 44, 45), the tool identified baseline Cpeptide as an important predictor of insulin secretion. HLA, BMI, and age, however, were not selected
+to contribute to the composite model. Age and HLA have each been established to play a role in
+predicting risk of T1D development (46-48); a role for BMI has been investigated but the relationship
+with disease risk varies by study (49-53). In agreement with our findings, HLA and BMI have not been
+consistently identified as predictors of insulin secretion after diagnosis (15, 44, 54). Our expectation was
+that age, however, would be selected by the analytical tool. One immune marker showed a moderate
+correlation with age (MFI of TIGIT on naïve CD8 T cells); we speculate that some of the role age plays in
+disease progression may be reflected in part by this marker. Intriguingly, baseline C-peptide was itself
+not strongly correlated with age at onset in this dataset. Another potential reason that age was not
+selected is an enrichment in this dataset of relatively older-onset T1D subjects (median age 19.25 years
+for subjects included in LASSO analysis), which is not unexpected based on the demographics of T1D
+
+development in many nations (55-57). While this cohort may under-represent early onset cases, it is
+representative of subjects who qualify for immune intervention at disease onset.
+In summary, we have developed a method to generate high quality data across multiple assays, and an
+analytical pipeline to combine and analyze disparate data types. This method identified a composite
+model associated with decline in insulin secretion that includes both expected and novel biological
+insights which could move toward replication in other cohorts and potentially assessment in other
+stages of T1D.
+
+METHODS
+SUBJECTS AND CLINICAL OUTCOME DATA
+All recent onset samples (serum, PBMC, purified RNA, and Tempus tubes) were provided by the ITN, and
+were obtained from T1D subjects randomized to the control arms of 3 new onset T1D trials (25-27).
+PBMC and serum samples were processed at a central location as described in the original trials; RNA
+samples were processed as described here (15). Clinical and demographic data were obtained from ITN
+Trialshare (58), a freely available source of results from ITN trials. Samples from the AbATE study were
+not received for the cell subset RNA sequencing assays, and thus could not be included in the LASSO
+selection, leaving n=30 subjects.
+Rate of C-peptide decline was calculated as previously described (15, 30). In brief, C-peptide 2-hour AUC
+measurements from the baseline, 6, 12, 18, and 24-month visits were log transformed and fit to a linear
+model with participant as a random effect. Repeated C-peptide measurements at the lower limits of
+detection were removed from fitting. The C-peptide decay rate was extracted from the fit as the slope of
+the linear model. The fits were performed using the lme4 package.
+ASSAY METHODS
+Each of these assays has been previously published individually. Whole blood RNAseq data were
+generated from Tempus tubes (Applied Biosystems, CA) using the process described here (20, 30). Cell
+subsets were sorted and RNAseq data generated using the process described here (59). All RNAseq data
+were pre-filtered to remove all non-protein-coding genes. RNAseq sample identity was verified using
+kinship comparisons based on genomic variants called from the RNAseq reads (20), and clustering of
+sample data by source cell type; all samples matched their annotated subject and cell type. Flow
+immunophenotyping panels were those routinely implemented for ITN clinical trials, as described (26,
+33). The transcriptional response to T1D serum assay was conducted as described here (13). The
+miRNA assay was conducted using the Exiqon qPCR platform as described in (24). The Treg transcript
+
+assay was performed using the Nanostring platform as described (14, 17), with samples for the Treg
+assay sorted concomitantly with the cell subset RNAseq sample set. The proinsulin:C-peptide assay was
+conducted using a trefoil time-resolved fluorescence immunoassay (31) , adapted to an AutoDelfia
+automatic system (Perkin-Elmer) (18). The demethylated insulin assay was conducted using the
+Raindance droplet-digital PCR platform. The antigen specific CD8 T cell assay was conducted using a
+multicolor quantum dot multimer assay described here (16). For additional information on data
+processing for each genome scale assay, please see the Supplemental Materials.
+ANALYTICAL METHODS AND STATISTICS
+Replicate testing data
+The replicate testing cohort was used to determine the technical precision of each analyte by calculating
+the intra-subject coefficient of variation (CV) for three biological replicate aliquots from the same blood
+draw from five subjects. Briefly, after data processing, the intra-subject CV was calculated from the
+three replicates. For each analyte, the mean CV across subjects was calculated. Analytes were retained
+for the analyte selection pipeline if the mean CV was below 30%. Replicate testing data for all RNAseq
+assays and the transcriptional response to serum assay are available on GEO at GSE131528.
+Analyte selection tool
+All analyses were conducted using the R programming language and software environment (60).
+Analytes were sequentially processed in the following steps: analyte scaling, univariate filtering, assay
+merging, hierarchical clustering, and multivariate modeling. Analyte scaling was performed for each
+assay separately by subtracting the mean and dividing by the standard deviation, such that the mean of
+all analytes values was equal to zero and the standard deviation of all analyte values was equal to one.
+Univariate filtering was performed by first applying a linear model to each analyte using the analytes as
+the predictor, C-peptide decay rate as the outcome, and sex, study, BMI, age and baseline C-peptide as
+covariates. The p-value of the analyte term was extracted from each generalized model and adjusted for
+
+multiple testing using the Benjamini-Hochberg algorithm. A number of the most significant analytes
+from each assay were retained for the subsequent steps. The number of analytes selected per assay is
+an adjustable parameter and is used for error estimation and sensitivity analysis. Next, the top
+significant analytes from each assay were merged into a single array by subject. After merging, all
+missing values were imputed with the k-nearest neighbors method (k=20). The array containing
+analytes from all assays was then hierarchically clustered on analytes with distance metric = 1 - cor,
+where cor is the Pearson correlation. The distance metric value that defines which analytes are clustered
+together is 1-cor*, where cor* is analogous to the minimum correlation within cluster. The minimum
+correlation within cluster is an adjustable parameter and is used for error estimation and sensitivity
+analysis. After clustering, the analytes with the lowest adjusted p-value from each cluster were selected
+as the representative analytes and retained for the subsequent steps. The remaining analytes were
+included as covariates in a linear regression model with C-peptide decay rate as the outcome. Sex, study,
+age, BMI, and baseline C-peptide were included as additional covariates. The analytes and covariates
+were additionally included in a LASSO regression model for an optional last feature selection method.
+Linear models were run with the glmnet package. The value of the regularization parameter used in the
+LASSO models were calculated by glmnet.cv as lambda.min. The optimal values for the two adjustable
+pipeline parameters were selected as the parameter set that minimizes the resulting cross-validation
+RMSE, while maintaining a conservative number of analytes which are input into the linear model.
+Cross validation was performed by randomly subsetting the dataset into a training set (75% of subjects)
+and a test set (25% of subjects), using the training set as input into the feature selection pipeline, and
+calculating the prediction error (RMSE) on the test set. This process was performed 1000 times for sets
+of parameters: number of analytes per assay and minimum correlation within cluster. The mean RMSE
+of the 1000 iterations was calculated for each parameter set.
+Sensitivity analysis
+
+Analytes that were selected when using the optimal pipeline parameters were then analyzed for
+parameter sensitivity. Results of the pipeline from all parameter sets were inspected for presence of the
+analytes of the optimal parameter set either: selected explicitly, or clustered (i.e. highly correlated) with
+a selected analyte. Analytes from the optimal parameter that were sensitive to parameter choice
+(present in < 50% of the parameter sets tested) were removed from the final list of analytes.
+DATA AND CODE AVAILABILITY
+All data from this study are available from the authors upon reasonable request. Code for the analytical
+tool is available on GitHub (link available upon publication), along with data necessary to recreate the
+analyses presented here. Whole genome data (cell subset RNAseq and transcriptional response to
+serum assays, as well as all replicate testing data) are available at NCBI GEO under accession number
+GSE131528. Whole blood RNAseq data are available at NCBI GEO under accession number GSE124400.
+STUDY APPROVAL
+All human studies were approved by appropriate institutional review boards. ITN studies were
+approved by independent IRBs at each participating clinical site, as described in the original clinical trial
+reports (25-27). Use of human samples for assay replicate testing was approved by the Benaroya
+Research Institute IRB. Written informed consent was received from all participants in all cohorts prior
+to inclusion in the study.
+
+LIST OF SUPPLEMENTARY MATERIALS
+Supplemental Methods: RV144 Validation Process
+Figure S1: Replicate testing process for this study.
+Figure S2: Blinded replicate testing data: proinsulin/C-peptide ratio assay.
+Figure S3: Blinded replicate testing data for Treg transcriptional signature assay.
+Figure S4: Blinded replicate testing data for demethylated insulin assay.
+Figure S5: Blinded replicate testing data for antigen specific CD8 T cell qDot assay.
+Figure S6: Blinded replicate testing data for miRNA assay (Exiqon).
+Figure S7: Blinded replicate testing data for transcriptional signature of serum exposure assay.
+Figure S8: Relationship between age and selected immune analytes.
+Table S1: Prediction of C-peptide decline using selected analytes.
+
+AUTHOR CONTRIBUTIONS
+CS designed the study, conducted experiments, acquired data, analyzed data, wrote the first draft of and
+edited the manuscript. SOS analyzed data, developed the analytical tool, designed analyses, wrote
+sections of the manuscript, and reviewed the manuscript. DB analyzed data, developed the analytical
+tool, and edited the manuscript. EW analyzed data, developed the analytical tool, and reviewed the
+manuscript. MJD analyzed data, calculated the clinical outcomes, and edited the manuscript. WCY
+analyzed data and edited the manuscript. AMP acquired and analyzed data, provided reagents and
+protocols, and edited the manuscript. JMO conceived and designed the study, and edited the
+manuscript. FKG analyzed data, provided protocols, and edited the manuscript. EAJ analyzed data,
+provided reagents and protocols, and edited the manuscript. MKL analyzed data, provided reagents and
+protocols, and reviewed the manuscript. PSL analyzed and provided data, and reviewed the manuscript.
+EMA analyzed and provided data, and reviewed the manuscript. AP analyzed and provided data, and
+reviewed the manuscript. MJH analyzed and provided data, provided reagents and protocols, and
+reviewed the manuscript. RG oversaw analytical tool development, conceived and designed the study,
+and reviewed the manuscript. GTN conceived and designed the study, reviewed data, and reviewed the
+manuscript. SAL was involved in study design, interpreted data, and assisted in writing of the
+manuscript.
+
+ACKNOWLEDGMENTS
+We wish to acknowledge the clinical staff who diligently conducted each of the ITN trials here
+mentioned, as well as all participants in those trials. We also thank the many technical staff in each of
+the laboratories that contributed data, who are too numerous to name individually here. We appreciate
+fruitful discussions with the JDRF Biomarker Working Group and its individual members. Dr. Simi Ahmed
+of JDRF was a strong supporter of this work; we thank her for many helpful discussions. We thank Dr.
+Carla Greenbaum for useful manuscript comments; she and many BRI Diabetes Clinical Research
+Program members played critical roles in collecting samples distributed through the BRI sample registry
+and repository. Colin O’Rourke and Jordan Klaiman played key roles in data clean-up and figure editing
+for the final version of this text. This work was funded by JDRF under grant numbers 17-2013-316 to
+GTN, 3-SRA-2016-209-Q-R to SAL, 2-PAR-2015-123-Q-R to GTN, 2-SRA-2015-107-Q-R to EAJ, 2-SRA-2015-
+122-Q-R to AP, and 1-PNF-2015-113-Q-R to MKL. PSL received funding from the NIH for this work under
+grant number DP3 DK104465-01. AMP was supported by fellowships from JDRF and the JDRF CCTN.
+MKL receives a Scientist Salary Award from the BCCHRI. Portions of the research reported in this
+publication were performed as projects of the ITN and supported by the National Institute of Diabetes
+and Digestive and Kidney Diseases (NIDDK) and the National Institute of Allergy and Infectious Diseases
+(NIAID) of the National Institutes of Health under Award Number UM1AI109565. The content is solely
+the responsibility of the authors and does not necessarily represent the official views of the National
+Institutes of Health.

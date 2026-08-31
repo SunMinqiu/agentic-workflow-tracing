@@ -1,0 +1,1775 @@
+IMMUNOLOGY
+Monocytes in type 1 diabetes families exhibit high
+cytolytic activity and subset abundances that correlate
+with clinical progression
+Tarun Pant1,2, Chien- Wei Lin3, Amina Bedrat1,2, Shuang Jia1,2, Mark F. Roethle1,2,
+Nathan A. Truchan1,2, Ashley E. Ciecko1,2, Yi- Guang Chen1,2, Martin J. Hessner1,2*
+Monocytes are immune regulators implicated in the pathogenesis of type 1 diabetes (T1D), an autoimmune disease
+that targets insulin- producing pancreatic β cells. We determined that monocytes of recent onset (RO) T1D patients and
+their healthy siblings express proinflammatory/cytolytic transcriptomes and hypersecrete cytokines in response
+to lipopolysaccharide exposure compared to unrelated healthy controls (uHCs). Flow cytometry measured elevated
+circulating abundances of intermediate monocytes and >2- fold more CD14+CD16+HLADR+KLRD1+PRF1+ NK- like
+monocytes among patients with ROT1D compared to uHC. The intermediate to nonclassical monocyte ratio among
+ROT1D patients correlated with the decline in functional β cell mass during the first 24 months after onset. Among
+sibling nonprogressors, temporal decreases were measured in the intermediate to nonclassical monocyte ratio
+and NK- like monocyte abundances; these changes coincided with increases in activated regulatory T cells. In contrast, these monocyte populations exhibited stability among T1D progressors. This study associates heightened
+monocyte proinflammatory/cytolytic activity with T1D susceptibility and progression and offers insight to the
+age- dependent decline in T1D susceptibility.
+INTRODUCTION
+Type 1 diabetes (T1D) is a heterogeneous autoimmune disease that
+results in the loss of pancreatic β cell functional mass and lifelong
+dependence on exogenous insulin replacement therapy. As evidenced by the partial successes of immunotherapies targeting T cells
+(1, 2), T1D pathogenesis involves adaptive immune responses. However, a growing body of evidence supports a role for altered innate
+immune responses and inflammation in T1D pathogenesis (3-6).
+Monocytes are innate immune cells that comprise ~ 10% of the
+nucleated blood cell count. They are often classified into three phenotypically and functionally distinct subgroups based on the relative expression of CD14 [lipopolysaccharide (LPS) receptor] and
+CD16 [Fc gamma receptor III (Fcγ RIII)] (7). Classical monocytes
+(CD14+CD16−), which comprise 80 to 85% of the peripheral pool
+in heathy individuals, are efficient phagocytes and can secrete
+inflammation- stimulating factors (8). A portion of classical monocytes differentiate into the intermediate subtype (CD14 +CD16+),
+which comprise 2 to 8% of the circulating pool. They are characterized by higher major histocompatibility complex (MHC) class II
+expression and function in antigen presentation, T cell stimulation,
+and the production of reactive oxygen species. Intermediate monocytes
+can further differentiate into the nonclassical subset (CD14dimCD16+),
+which comprise 2 to 11% of circulating monocytes. While nonclassical monocytes can function in a proinflammatory capacity and
+liberate interleukin- 1 (IL- 1), tumor necrosis factor (TNF), and
+IL- 12 in response to infection, they also function in the resolution
+of inflammation (9 , 10), maintenance of vascular homeostasis,
+and the clearance of dying cells, viruses, and tumor cells from the
+circulation (11).
+Monocytes have been implicated in the pathology of numerous
+inflammatory and autoimmune diseases (12). Expansions of inter mediate monocytes have been reported in Graves’ disease (13),
+rheumatoid arthritis (14), and anti- neutrophil cytoplasmic antibody-associated vasculitis (15), while nonclassical monocytes have
+been implicated in relapsing- remitting multiple sclerosis, coronary
+artery disease, and systemic lupus erythematosus (11). Compared to
+unrelated healthy controls (uHCs), Ren et al. (16) reported that patients with recent onset T1D (ROT1D) had a greater abundance of
+circulating intermediate monocytes that was positively associated
+with hemoglobin A1c (HbA1c) and negatively associated with serum insulin and C- peptide levels. Further, Bradshaw et al. (17) re ported that monocytes of patients with T1D spontaneously secrete
+IL- 1β and IL- 6, inflammatory cytokines known to induce and expand T helper 17 (TH17) cells, suggesting that abnormal innate immune activity may drive adaptive responses in T1D by expanding
+the TH17 population of effector T cells.
+The advancement of single- cell RNA sequencing (scRNA- seq)
+has provided insight into the cellular heterogeneity of the immune
+system. Using this approach, Villani et al. (18) described four monocyte subsets in healthy human participants, where the intermediate
+monocyte subset was separated into two groups, designated mono3
+and mono4 ( 18). Notably, the mono4 subset expressed a cytolytic
+transcriptome, which included high expression of perforin, granzymes, and granulysin. Using scRNA- seq, a similar monocyte subset
+has also been identified by Hu et al. (19).
+On the basis of the work summarized above, as well as our own
+studies (3, 20, 21), we hypothesized that altered monocyte abundances
+and activity may be associated with T1D progression. We therefore
+examined monocytes isolated from patients with ROT1D, healthy
+autoantibody- negative siblings of probands, and uHC. Monocytes
+of T1D family members were found to hypersecrete cytokines upon
+1the Max McGee Research center for Juvenile diabetes, children’s Research institute
+of children’s hospital of Wisconsin, Milwaukee, Wi, USA. 2department of Pediatrics,
+the Medical college of Wisconsin, Milwaukee, Wi, USA. 3division of Biostatistics,
+the Medical college of Wisconsin, Milwaukee, Wi, USA.
+*corresponding author. email: mhessner@ mcw. edu
+copyright © 2024 the
+Authors, some rights
+reserved; exclusive
+licensee American
+Association for the
+Advancement of
+Science. no claim to
+original U.S.
+Government Works.
+distributed under a
+creative commons
+Attribution
+noncommercial
+license 4.0 (cc BY- nc).
+
+stimulation, and among patients with ROT1D, most monocyte subsets expressed a proinflammatory/cytolytic transcriptional signature
+that shared identity with the mono4 subpopulation (18). Flow cytometry revealed elevated mono4 and intermediate monocyte abundances
+among patients with ROT1D, and the intermediate- to- nonclassical
+monocyte ratio was found to negatively correlate with residual β cell
+functional mass during the post- onset period. In contrast to individuals that progressed to stage 1 T1D (≥2 autoantibodies/normoglycemia), stage 2 T1D (≥2 autoantibodies/dysglycemia), or stage 3 T1D
+(clinical onset), the abundance of mono4 monocytes longitudinally
+decreased among nonprogressors and their abundances negatively
+correlated with temporal increases in peripheral activated Treg cells.
+These analyses identify heightened monocyte inflammatory activity
+associated with T1D susceptibility and progression that is temporally
+counter- regulated among nonprogressors, offering insight to the agedependent decline in T1D susceptibility.
+RESUL TS
+Monocytes of T1D family members hypersecrete cytokines
+in response to TLR4 ligation
+Hussain et al. (22) reported that peripheral blood mononuclear cell
+(PBMC) isolated from patients with T1D and their healthy firstdegree relatives hypersecrete IL- 1α and TNF- α after mitogen stimulation. To further characterize innate immune function in T1D
+families, we isolated monocytes from cryopreserved PBMCs drawn
+from ROT1D, autoantibody- negative siblings of probands with highrisk (DR3 and/or DR4) human leukocyte antigen (HLA) genotypes
+(HRS) or with lower risk (non- DR3/DR4) HLA genotypes (LRS), and
+uHC. The characteristics of the study participants are provided in
+table S1. Monocytes were cultured in the presence of LPS, and the
+secretion of IL- 1β, IL- 6, and TNF- α was measured in the conditioned
+medium after 24 hours. Levels of cytokine secretion were not different among the patients with ROT1D and the autoantibody- negative
+healthy sibling cohorts. By contrast, LPS- stimulated IL- 1β, IL- 6, and
+TNF- α secretion was elevated in ROT1D monocytes, as well as
+the normoglycemic HRS and LRS cohorts when compared to uHC
+(P < 0.05; Fig. 1, A to C).
+Transcriptional analysis of negatively selected monocytes
+using Affymetrix arrays
+The transcriptomes of monocytes negatively selected from cryopreserved PBMCs of uHC, LRS, HRS, and patients with ROT1D were
+analyzed. We identified 826 probe sets that met a threshold of |log2
+ratio| > 0.5 and an false discovery rate (FDR) < 20% among the six
+possible pairwise comparisons (table S2). Overall, volcano plots
+showed symmetry in each of the pairwise comparisons (fig. S1). Hierarchical clustering of this dataset determined that the monocytes
+of the autoantibody- negative, normoglycemic HRS and LRS groups
+exhibited intermediate relatedness to those of uHC and ROT1D,
+which were highly distinct from one another (Fig. 2A).
+Elevated abundances of intermediate monocytes have previously been reported among patients with T1D (16). We hypothesized
+that the 826 probe sets differentially regulated among the four cohorts would reflect increasing differentiation towards the intermediate and nonclassical subsets. Therefore, the 826 probe set signature
+of ROT1D, HRS, LRS, and uHC monocytes were compared to the
+dataset of Schmidl et al. ( 23), which examined the transcriptomes
+of sorted CD14 ++CD16− (classical), CD14 +CD16+ (intermediate),
+10,000
+IL -1 β (pg /ml)
+uHC
+n = 22
+LRS
+n = 31
+HRS
+n = 33
+ROT1D
+n = 22
+P = 1.6 × 10 −3
+P = 1.8 × 10 −3
+P = 2.6 × 10 −3
+10,000
+IL -6 (pg /ml)
+P = 4.7 × 10 −5
+P = 9.1 × 10 −5
+P = 1.3 × 10 −4
+TNF -α (pg /ml)
+10,000
+P = 9.5 × 10 −4
+P = 1.3 × 10 −2
+P = 1.1 × 10 −2
+uHC
+n = 23
+LRS
+n = 31
+HRS
+n = 35
+ROT1D
+n = 23
+uHC
+n = 23
+LRS
+n = 31
+HRS
+n = 35
+ROT1D
+n = 23
+Fig. 1. Monocytes of patients with ROT1D and their healthy autoantibody negative
+siblings are hyper- responsive to TLR4 ligation compared to uHC. t he analysis
+included uhc [(A) n = 22; age, 15.9 ± 2.7 years; (B and c) n = 23; age 15.7 ± 2.9 years],
+stage 0 lRS [(A) n = 31; age, 10.9 ± 3.3 years; (B and c) n = 31; age, 10.8 ± 3.4 years; all
+autoantibody negative], stage 0 hRS [(A) n = 33; age, 11.4 ± 3.6 years; (B and c )
+n = 35; age, 11.3 ± 3.6 years; all autoantibody negative], and patients with ROt1d [(A)
+n = 22; age, 11.2 ± 3.7 years; hbA1c, 7.3 ± 1.0%; (B and c) n = 23; age, 11.0 ± 3.8 years;
+hbA1c, 7.3 ± 1.0%]. Monocytes were negatively selected from PBMcs. A total of 106
+monocytes per well were incubated in RPMi complete medium for 24 hours with lPS
+(10 ng/ml). the conditioned medium was recovered, and cytokines (il- 1β, il- 6, and
+tnF- α) were measured in duplicate by eliSA [(A to C), respectively]. each dot represents a single participant. horizontal bars indicate the mean ± Se. Significance was
+assessed with a two- tailed t test. c ytokine secretion levels between patients with
+ROt1d and the healthy normoglycemic sibling cohorts were not different (P > 0.05).
+
+and CD14 dimCD16+ (nonclassical) monocytes. Among the transcripts that exhibited differential expression among the monocyte
+subgroups in the Schmidl dataset, we identified 2359 unique transcripts (based on the Human Genome Organization gene symbol)
+that were also present on the Affymetrix U133 plus 2 array. Among
+this subset, a relatively small but significantly overlapping set of 126
+unique transcripts (χ2, P < 1.0 ×10−5, 177 probe sets) were differentially expressed among ROT1D, HRS, LRS, and uHC monocytes. As
+reflected by the heatmaps (Fig. 2B) and Pearson’s correlation coefficients (Fig. 2C), for these commonly regulated transcripts, uHC
+monocytes were most correlated with the classical subset and exhibited high expression of transcripts previously associated with
+classical monocytes (Fig. 2E). The HRS monocytes were most cor related with the intermediate subset, and the ROT1D monocytes
+were most correlated with the nonclassical subset.
+To further characterize the 826 probe sets differently regulated
+among ROT1D, HRS, LRS, and uHC monocytes, Gene Ontology
+(GO) analyses were conducted (Fig. 2D). Consistent with prior reports that have associated increased abundances of intermediate
+monocytes with T1D (16), the ROT1D monocytes expressed a transcriptional signature consistent with antigen presentation/T cell costimulation (CD160, GZMA, ITK, LCK, NFATC2, NLRC3, RORA,
+SLAMF6, SLAMF7, and ZAP70). The ROT1D monocyte signature
+was also enriched in transcripts related to natural killer (NK) cell
+activation (GATA3, IL2RB, IL18R1, IL21R, KIR2DS2, KIR3DS1,
+NCR1, NCR3, and SH2D1A) and NK cytotoxicity (CD7, CD247,
+CTSW, FASLG, GNLY, GZMB, IL18RAP, KIR3DL2, KLRB1, KLRD1,
+NKG7, PRF1, and SH2D1B). A similar, albeit less robust signature
+was observed in the healthy sibling cohorts. The cytolytic ROT1D
+signature overlapped with that described for the mono4 intermediate subset defined by Villani et al. (18), which also exhibited high
+expression of PRF1, GZMB, GNLY, CTSW, and KLRD1. Specifically,
+Villani et al. (18) identified 149 transcripts associated with mono4;
+132 of these were represented on the Affymetrix U133 plus 2 array,
+and 69 of 132 (52.3%; χ2, P < 1.0 ×10−5) were among the 826 transcripts differentially expressed among monocytes of the uHC, LRS,
+HRS, and ROT1D cohorts.
+scRNA- seq analysis of ROT1D, HRS, LRS, and uHC monocytes
+Because scRNA- seq has fostered the identification of monocyte
+populations extending beyond the traditional tripartite classification
+scheme (18, 19), we applied it to monocyte- enriched PBMC populations of uHC, LRS, HRS, and ROT1D study participants. For these
+eight participants (two per cohort), 40,000 cells were sequenced at a
+depth of 500 to 5000 transcripts per cell. The 2000 genes exhibiting
+the highest expression variability among these cells were subjected to
+principal components analysis (PCA). For visualization, the top 50
+significant PCs were reduced to two dimensions using t- distributed
+stochastic neighbor embedding (t- SNE); this unsupervised analysis
+identified 13 clusters (Fig. 3A). Differential expression analysis was
+performed for each cluster (table S3), and the identity of each cluster
+was defined by comparing significantly associated marker gene
+expression (adjusted P < 0.001) to that of established reference clusters in blood samples. The following putative populations were
+identified: CD14 + monocytes, NK cells, naïve CD4 + T cells,
+memory CD4 + T cells, naïve CD8+ T cells, NKT cells, B cells, CD16+
+monocytes, memory CD8 + T cells, γδ T cells, CD4 + regulatory
+T (Treg) cells, CD1c dendritic cells, and plasmacytoid dendritic cells
+(Fig. 3, A to C).
+The CD14high monocyte cluster exhibited high expression of numerous transcripts previously associated with the classical and intermediate subsets (CD14, CSTA, CTSS, CXCL8, MNDA, MS4A6A,
+S100A8, S100A9, S100A12, VCAN, LGALS1, LGALS2, and LYZ)
+(19). The CD16 high monocyte cluster exhibited high expression of
+transcripts previously associated with the nonclassical subset
+(FCGR3A, FCGR3B, TCF7L2, MS4A7, RHOC, IFITM3, CD79B,
+CSF1R, CDKN1C, HES4, SMIM25, MTSS1, BCL2A1, and RRAS )
+(19). We examined the transcriptional profiles across the clusters
+and detected gene expression consistent with antigen presentation
+(HLA- DPA1, HLA- DPB1, HLA- DQB1, HLA- DRB1, and HLA- DMA)
+by monocytes as well as B cells and dendritic cells. Expected gene
+expression patterns were also observed for NK cells [KLRD1,
+KLRF1, NKG7, and NCAM1(CD56)], naïve CD4 + T cells (CCR7,
+FHIT, and CD4), memory CD4 + T cells (TNFRSF4, IL7R, and
+CD40LG), naïve CD8+ T cells (CD8b and LEF1), NKT cells (NCR3
+and KLRB1/CD161), B cells (CD79A and CD79B), memory CD8 +
+T cells (CD8A, CCL5, and IL32), γδ T cells (TRGC2 and NUCB2),
+CD4+ Treg cells (FOXP3, CTLA4, and IL2RA), CD1c dendritic cells
+(CD1C, CLEC10A, and PDL4 ), and plasmacytoid dendritic cells
+(CLSPN, RAD51AP1, and STMN1) (18, 19, 24).
+The CD14high and CD16 high monocyte clusters illustrated in
+Fig. 3 totaled 13,915 cells; these were subjected to further analysis.
+The top 10 significant PCs were used to reduce the data to two dimensions and visualized by Uniform Manifold Approximation and
+Projection (UMAP). High heterogeneity was observed as evidenced
+by the identification of 10 clusters (Fig. 4A), all of which expressed
+CD14 and/or CD16 as well as HLA- DRB1 (Fig. 4, A to C). Azimuth
+analysis predicted that 99.11% (13,791 of 13,915) of these cells were
+monocytes (25). The clusters were characterized by their top marker
+genes (table S4) and through ontological analysis to identify their
+associated GO biological processes and molecular functions
+(table S5). Cluster 3 exhibited the highest CD14 expression, low
+CD16 expression, and consistent with studies of sorted classical
+monocytes (23) and expressed the highest levels of EIF2AK2, IFI44,
+IFI44L, MX1, and other transcripts related to antiviral and innate
+immune responses. Cluster 5 exhibited the highest CD16 and
+lowest CD14 abundance transcript levels, as well as the highest levels
+of previously reported marker genes for nonclassical monocytes
+(FCGR3A, CDKN1C, HES4, TCF7L2, RHOC, and MTSS1) (23, 26).
+In line with this observation, in silico pseudotime trajectory analysis of the 10 clusters (fig. S2) found cluster 5 the most differentiated.
+The remaining clusters expressed varying levels of CD14 and CD16,
+suggesting differing transition states from classical to nonclassical
+monocytes. Paralleling the S100A12 subset described by Hu et al.
+(19), cluster 0 expressed high levels of the proinflammatory calgranulin genes S100A8, S100A9, and S100A12. In line with the high
+S100 and HMGB2 transcript expression, RAGE receptor binding
+was a top molecular function associated with cluster 0. Ribosomal
+proteins are essential for ribosome synthesis, which in turn are
+required for cell growth, differentiation, and proliferation. While
+other clusters also expressed numerous transcripts encoding ribosomal proteins and transcripts related to cytoplasmic translation
+(EEF1A1, RPS2, RPL18A, RPS3A, RPL15, and RPS18), this was the
+most distinguishing feature of cluster 1 and was consistent with the
+identification of cytoplasmic translation being identified as the top
+GO Term. The top marker genes for cluster 2 included CLEC4E,
+VCAN, VIM, JUN, and FPR1, which were co- annotated under the
+GO term protein binding. Clusters 4 and 8 expressed the highest
+
+NonclassicalIntermediateClassical
+ROT1D
+LRS
+HRS
+uHC
+n = 177
+With
+intermediate
+With nonc
+lassical
+With
+uHC
+With
+HR
+S
+With LR
+S
+Classical
+Intermediate
+Nonclassical
+uHC
+HRS
+LRS
+−0.21 −0.95
+−0.10
+0.36
+−0.11
+-0.34
+0.04
+0.12
+−0.07
+−0.50
+0.10
+0.07
+−0.12
+−0.45
+−0.12
+-0.48
+−0.05
+0.50
+−0.20
+−0.40
+−0.54
+With RO
+T1D
+Correlation
+Gene Ontology biological process term P value
+D
+immune response 7.6 × 10−13
+NK cell activation 1.15 × 10−9
+T cell receptor signaling pathway 1.2 × 10−6
+2.0 × 10−6
+3.2 × 10−6
+Positive regulation of T helper 2 cell cytokine production
+Positive regulation of NK cell-mediated cytotoxicity
+NK cell-mediated cytotoxicity 5.7 × 10−6
+T cell activation 8.4 × 10−5
+Cytolysis 2.5 × 10−4
+4.6 × 10−3
+7.5 × 10−3
+Positive regulation of T helper 17 cell differentiation
+Positive regulation of NK cell chemotaxis
+Fold change
+−2 20
+ROT1D
+LRS
+HRS
+uHC ROT1DCHuS RHSRL
+n = 826
+E ROT1DCHuS RHSRL
+ZAP70
+GZMM
+S1PR5
+TGFBR3
+NKG7
+KLRD1
+GZMA
+CD247
+IL2RB
+HOPX
+KLRF1
+SPON2
+PRF1
+GZMB
+SH2D1A
+KLRK1
+KLRB1
+CD96
+RASGRP1
+LCK
+ITK
+ETS1
+RORA
+CTSW
+IKZF3
+CCL5
+GZMH
+XCL2
+XCL1
+CD160
+GNLY
+SLAMF7
+SH2D1B
+RUNX3
+NCR3
+CARD11
+PRR5
+CHST2
+P2RY10
+IL21R
+KIR3DS1
+KIR2DL2
+KIR2DS2
+RHOH
+KLRG1
+GATA3
+NFE2
+ARHGAP24
+MS4A6A
+IL1R2
+CD163
+RNASE2
+F13A1
+CCR2
+ARHGAP6
+Fig. 2. Monocytes of patients with ROT1D and their healthy autoantibody negative siblings exhibit proinflammatory transcriptomes compared to uHCs. t he
+analysis included uhc (n = 14; age, 15.3 ± 2.8 years), stage 0 lRS (n = 19, age, 11.7 ± 2.8 years, all autoantibody negative), stage 0 hRS (n = 15; age, 12.9 ± 3.4 years, all
+autoantibody negative), and patients with RO t1d (n = 14; age,12.4 ± 2.8 years; hbA1c, 7.5 ± 1.4%). RnA extracted from monocytes negatively selected from cryopre served PBMcs was analyzed with the Affymetrix U133plus 2.0 array. this array interrogates 54,613 transcripts/variants. Because low intensity data are often unreliable, only
+probe sets where ≥75% of the samples had a log 2 intensity > 4.5 relative fluorescence units (RFU) (n = 31,571) were retained for analysis. Among the six pairwise comparisons, 826 probe sets met thresholds: |log 2 ratio| > 0.5, FdR < 20%. the number of transcripts meeting thresholds for each pairwise comparison: RO t1d versus
+hRS = 215, ROt1d versus lRS = 9, ROt1d versus uhc = 309, lRS versus uhc = 206, lRS versus hRS = 122, and hRS versus uhc = 356. (A) hierarchical clustering of the 826
+probe set union. (B) heatmap illustrating the mean expression levels of 177 commonly regulated unique probe sets (|log2 ratio| > 0.5; FdR < 0.2; χ2 P < 1.0 ×10−5) among
+sorted monocyte subsets described by Schmidl et al. (23), and the 826 differentially expressed transcripts by ROt1d, hRS, lRS, and uhc monocytes. (C) Pearson correlation
+coefficients for the 177 commonly regulated unique probe sets. (D) GO biological processes associated with the 826 probe set union. (E) expression levels of wellannotated transcripts that met thresholds among the six- pairwise comparisons.
+
+−20
+−40
+−40 −20 20 40
+0 CD14+ monocytes
+1 NK cells
+2 Naïve CD4+ T cells
+3 Memory CD4+ T cells
+4 Naïve CD8+ T cells
+5 NKT cells
+6 B cells
+7 CD16+ monocytes
+8 Memory CD8+ T cells
+9 Gamma Delta T cells
+10 CD4+ Treg
+11 CD1c DC
+12 Plasmacytoid DC
+tSNE_1
+tSNE_2
+Expression
+02−2
+CD14
+FCGR3A
+KLRF1
+NCAM1
+CCR7
+FHIT
+CD4
+TNFRSF4
+CD40LG
+CD8B
+NCR3
+CD79A
+CD79B
+CD8A
+TRGC2
+FOXP3
+IL2RA
+CD1C
+STMN1
+Cluster: 012 34 56 78 91 01 11 2
+Cluster: 012 34 56 78 91 01 11 2
+CD14
+CSTA
+FCN1
+MNDA
+MS4A6AS100A12
+S100A8
+S100A9VCAN
+CD247GNLY
+GZMA
+GZMBKLRD1
+KLRF1
+NCAM1NKG7
+PRF1
+CAMK4CCR7
+CD3E
+CHI3L2FHIT
+MALTCF7
+TRABD2A
+TRACAP3M2
+CDC14A
+GATA3IL7R
+INPP4B
+ITGB1LDHB
+TNFRSF25
+TNFRSF4TRAC
+TRAT1
+CD8BCRTAM
+LEF1LRRN3
+NELL2
+OXNAD1PDE3B
+S100B
+THEMISDUSP2
+GPR171
+GZMKKLRB1
+KLRG1
+NCR3SPOCK2
+TRDCTRGC1
+ARHGAP24
+BANK1CD22
+CD79A
+CD79BHLA-DPA1
+HLA-DQA1HLA-DQA2
+HLA-DQB1
+IGHDIGHM
+LINC00926
+MS4A1TNFRSF13C
+VPREB3
+CDKN1CCSF1R
+CTSL
+FCGR3AHES4
+MS4A7
+MTSS1RHOC
+SMIM25TCF7L2
+CCL5
+CD3D
+CD3G
+CD8A
+CST7CTSW
+PYHIN1ARID5B
+CXCR3
+IKZF2KLRC2
+LYARNUCB2
+SPRY2
+TRGC2ZNF683
+CD27
+CTLA4FANK1
+FOXP3
+IL2RA
+RGS1
+RTKN2SESN3
+TBC1D4
+CD1CCLEC10A
+CLIC2CRIP3ENHO
+FCER1AFLT3
+HLA-DQA2
+NDRG2
+P2RY6CLSPN
+HELLS
+IGFBP7
+PLAC8RAD51AP1
+SPON2
+STMN1TUBA1B
+TUBB
+IL32
+LYZ1
+ID3
+Fig. 3. scRNA- seq analysis of monocyte- enriched PBMCs of uHC, LRS, HRS, and patients with ROT1D. the analysis included uhc (n = 2; age, 15.9 ± 2.6 years), stage
+0 lRS (n = 2; age, 10.7 ± 0.2 years, all autoantibody negative), stage 0 hRS (n = 2; age, 13.6 ± 3.8 years, all autoantibody negative), and patients with RO t1d (n = 2; age,
+9.4 ± 1.5 years; hbA1c, 7.6 ± 0.8%). (A) t- Sne plot shows 38,594 sequenced cells distributed into 13 clusters. colors denote cluster identity as determined by the unsupervised clustering algorithm, and each dot represents an individual cell. the putative cluster identities, based on expression of established cell lineage markers, are indicted.
+the number of successfully profiled single cells per cluster were: cd14 + monocytes (n = 12,542), nK cells (n = 5154), naïve cd4+ t cells (n = 4973), memory cd4+ t cells
+(n = 3782), naïve cd8+ t cells (n = 3168), nKt cells (n = 2262), B cells (n = 2013), cd16+ monocytes (n = 1373), memory cd8+ t cells (n = 1324), γδ t cells (n = 894), cd4+
+treg cells (n = 522), cd1c dendritic cells (n = 481), and plasmacytoid dendritic cells (n = 106). (B) violin plots illustrate expression distribution of lineage- defining marker
+genes across the 13 clusters. (C) A heatmap illustrating the scaled expression of up to 15 discriminative gene sets (adjusted P value < 3.5 ×10−12) for each of the 13 clusters.
+the color bar illustrates the z- score distribution from −2.5 (purple) to 2.5 (yellow). dc, dendritic cell.
+
+−5
+−10− 50 5
+UMAP_1
+UMAP_2
+−5
+−10− 50 5
+UMAP_1
+UMAP_2
+−5
+−10− 50 5
+UMAP_1
+UMAP_2
+−5
+−10− 50 5
+UMAP_1
+UMAP_2
+−5
+−10− 50 5
+UMAP_1
+UMAP_2
+−5
+−10− 50 5
+UMAP_1
+UMAP_2
+−5
+−10− 50 5
+UMAP_1
+UMAP_2
+CD14 CD16
+GNLY PRF1
+HLA DRB1K LRB1
+KLRD1
+−0.5
+0.0
+0.5
+1.0
+1.5
+2.0
+Percent
+expressed
+Average
+expression
+2.0
+1.5
+1.0
+0.5
+0.0
+UMAP_1
+UMAP_2
+−5
+−10 50−5
+uHC vs. ROT1D
+uHC vs. LRS
+uHC vs. HRS
+LRS vs. HRS
+LRS vs. ROT1D
+HRS vs. ROT1D
+Cluster 0
+3.2 × 10−10
+n.s.
+n.s.
+1.2 × 10−2
+3.7 × 10−12
+8.9 × 10−11
+Cluster 1
+3.9 × 10−7
+n.s.
+n.s.
+3.5 × 10−4
+7.0 × 10−14
+2.1 × 10−12
+Cluster 2
+1.3 × 10−15
+n.s.
+n.s.
+3.4 × 10−2
+2.9 × 10−13
+3.7 × 10−11
+Cluster 3
+1.6 × 10−11
+n.s.
+1.2 × 10−5
+1.2 × 10−6
+4.2 × 10−12
+2.2 × 10−5
+Cluster 4
+1.6 × 10−7
+n.s.
+n.s.
+9.8 × 10−4
+1.6 × 10−9
+5.4 × 10−7
+Cluster 5
+1.2 × 10−8
+n.s.
+n.s.
+1.2 × 10−3
+5.2 × 10−12
+4.1 × 10−9
+Cluster 6
+1.8 × 10−5
+n.s.
+4.1 × 10−2
+1.8 × 10−2
+3.1 × 10−5
+4.4 × 10−4
+Cluster 7
+n.s.
+n.s.
+n.s.
+3.5 × 10−2
+1.7 × 10−2
+n.s.
+Cluster 8
+n.s.
+n.s.
+n.s.
+n.s.
+2.2 × 10−3
+3.7 × 10−2
+Cluster 9
+2.5 × 10−5
+n.s.
+2.7 × 10−7
+8.8 × 10−5
+2.4 × 10−4
+n.s.
+D
+Mono4 enrichment score
+0.0
+0.25
+0.50
+0.75
+uHC
+LRS
+HRS
+ROT1D
+01 23 45 67 8 9
+Cluster
+S100A12S100A9S100A8HMGB2EEF1A
+RPS18RPS3ARPL18ARPL15RPS2VCAN
+VIM
+CLEC4E
+JUNFPR1MX
+IFI
+44LIFI4
+EIF2AK2HLA
+-DR
+HLA
+-DRB1CD74
+HLA
+-DPB1
+HLA
+-DQB1
+HLA
+-DP
+A1
+FCGR3ACDKN1C
+HES4
+TCF7L2RHOCMTSS
+NAMPT
+IE
+R2
+FO
+SB
+KLF
+IL7RCD3DCD3ETRACCCR7NK
+G7
+GZMAPRF1KLRD
+GNLY
+GZMBKLR
+B1
+MKI67
+Fig. 4. scRNA- seq profiling of circulating monocytes. (A) UMAP plot shows 13,915 monocytes were clustered into ten subsets. colors denote cluster identity as determined by unsupervised clustering algorithm, and each dot represents an individual cell. numbers of successfully profiled single cells per subset are as follows: cluster 0
+(n = 2798), cluster 1 (n = 2451), cluster 2 (n = 2302), cluster 3 (n = 1872), cluster 4 (n = 1480), cluster 5 (n = 1300), cluster 6 (n = 702), cluster 7 (n = 440), cluster 8 (n = 397),
+and cluster 9 (n = 173). (B) expression pattern of marker genes (CD14, CD16/FCGR3A, GNL Y, PRF1, KLRD1, and KLRB1) are indicated by color intensity. (C) d ot plot shows
+relative expression of selected marker genes belonging to each cluster. (D) Gene module scores for clusters 0 to 9, calculated using the AddModuleScore function in
+Seurat, were used to quantify the average expression level of the 97 mono4/nK- like transcripts at the single- cell level for each cohort. tabulated are the P values for module score differences between cohorts that reached significance. n.s., not significant.
+
+and most diverse levels of HLA- related transcripts (HLA- DRA,
+HLA- DRB1, CD74, HLA- DPB1, HLA- DQB1, and HLA- DPA1), and
+the top GO terms associated with these clusters included “ Antigen
+processing and presentation of exogenous peptide antigen via MHC
+class II” consistent with a robust antigen processing/presenting capacity for these intermediate subsets. Cluster 6 was characterized by
+transcripts related to positive regulation of transcription from RNA
+polymerase II promoter (KLF4, FOSB, IER2, and NAMPT). Both
+Villani et al. (18) and Hu et al. (19) previously identified a monocyte
+subset that exhibited highly distinct clustering from the other
+monocyte subsets and expressed a cytolytic gene expression profile.
+Similarly, we identified corresponding cells distributed primarily
+within two clusters. Consistent with studies showing T cell receptor
+expression by neutrophils, monocytes and macrophages (27, 28),
+cluster 7 expressed numerous transcripts related to the T cell receptor complex and immune activation (CD3D, TRAC, CD3E, IL7R,
+and CCR7). Further, 21 of the top 100 upregulated cluster 7 marker
+genes were shared with the 149 transcripts expressed by the mono4
+subset defined by Villani et al. ( 18). Cluster 9 expressed a cytolytic
+transcriptional gene signature (GZMA, GZMB, GNLY, and PRF1)
+that shared numerous expressed transcripts with NK cells (KLRB1,
+KLRD1, and NKG7), indicating overlapping functions between this
+population and NK cells. Further, 50 of the top 100 upregulated
+cluster 9 marker genes were shared with the 149 transcripts expressed by the mono4 subset defined by Villani et al. (18). In silico
+pseudotime analysis indicated a distinct differentiation trajectory
+for clusters 7 and 9 relative to the other clusters (fig. S2).
+To quantify the average expression levels of the mono4/NK- like
+transcripts at the single- cell level, we calculated gene module scores
+for monocyte clusters 0 to 9 (Fig. 4D). This used the intersection of
+transcripts differentially expressed in the array analysis between patients with ROT1D and uHC and those significantly expressed by
+the mono4 cluster defined by Villani et al. ( 18) and/or the NK- like
+cluster defined by Hu et al. (19). For each cluster, this set of 97 overlapping transcripts was used to determine a module enrichment
+score for monocytes of the uHC, LRS, HRS, and ROT1D cohorts.
+Consistent with their shared transcript content with mono4, clusters 7 and 9 exhibited higher enrichment scores, indicating higher
+expression of these proinflammatory and cytolytic transcripts. Notably, compared to uHC and LRS monocytes, a significantly higher
+enrichment score was observed among patients with ROT1D for
+cluster 9. Compared to uHC, LRS, and HRS monocytes, a significantly higher enrichment score was also observed among patients
+with ROT1D for clusters 0 to 6. This observation suggests that
+monocytes of patients with ROT1D in general express a cytolytic
+transcriptome that shares identity with that of NK cells.
+To further investigate the expression of cytolytic transcripts
+among the uHC, LRS, HRS, and ROT1D cohorts, differential expression analysis was conducted for the top 100 transcripts in cluster 9. As shown infig. 5A, GNLY, PRF1, NKG7, and other NK- like
+transcripts are generally expressed at the highest levels among patients with ROT1D, at intermediate levels among the sibling cohorts, and at the lowest levels among uHC monocytes. We also
+examined differential transcript expression of chemokines and cytokines known to be produced by monocytes; 14 mediators were
+identified that exhibited significant differences when comparing
+total monocytes of the four cross- sectional cohorts (Fig. 5, B and
+C). Cytokine/chemokine expression was highest among patients
+with ROT1D. Consistent with our prior reports describing a state of
+regulated susceptibility among healthy siblings of patients with
+T1D (29), circulating monocytes of the LRS and HRS cohorts expressed lower levels of these mediators.
+Flow cytometric analysis of monocyte populations
+To confirm and extend the transcriptomic data, we began by examining the abundances of classical, intermediate, and nonclassical
+monocytes in the cross- sectional cohorts by flow cytometry after
+surface staining for CD14 and CD16 (Fig. 6A). Because hyperglycemia is known to affect many immune and inflammatory markers,
+these analyses included long- standing (LS) T1D patient controls
+(age, 12.7 ± 5.4 years after onset) that exhibited glycemic control
+similar to the ROT1D cohort (HbA1c, 8.5 ± 1.0% versus 7.8 ± 1.3%,
+respectively; P > 0.05, two- tailed t test). We measured a higher
+abundance of classical CD14+CD16− monocytes among total monocytes when comparing patients with ROT1D to uHC (85.3% versus
+76.4%, P = 0.01) and patients with ROT1D to LST1D patients
+(85.3% versus 74.1%, P = 0.0001); classical CD14+CD16− monocytes
+were also more abundant when comparing HRS to uHC (84.7%
+versus 76.4%, P = 0.04; Fig. 6B). Consistent with Ren et al. (16), we
+measured a higher abundance of intermediate CD14+CD16+ monocytes among total monocytes when comparing patients with ROT1D
+to uHC (10.5% versus 6.4%, P = 0.01). The abundance of intermediate CD14+CD16+ monocytes among total monocytes in the LST1D
+cohort was similar to the ROT1D group (12.4% versus 10.5%,
+P > 0.05); however, this population was more abundant among
+patients with LST1D compared to HRS, LRS, and uHC (Fig. 6B).
+The abundances of classical and intermediate monocytes in the LRS
+and HRS groups were between the levels measured for the ROT1D
+and uHC groups. The percentages of nonclassical CD14 dimCD16+
+monocytes among total monocytes were lower among patients with
+ROT1D compared to uHC (4.1% versus 17.2%, P = 0.0001); they
+were also lower when comparing the healthy siblings to uHC (LRS
+versus uHC: 9.1% versus 17.2%, P = 0.025; HRS versus uHC: 6.8%
+versus 17.2%, P = 0.001) (Fig. 6B). The patients with LST1D exhibited percentages of nonclassical CD14dimCD16+ monocytes among
+total monocytes that were similar to the uHC patients and notably
+higher than HRS and patients with ROT1D (LST1D versus HRS: 13.3%
+versus 6.8%, P = 0.043; LST1D versus ROT1D: 13.3% versus 4.1%,
+P = 0.0003). NK cells were defined as being CD3−CD19−CD56+CD14−,
+and their abundances among total lymphocytes across the five cohorts did not significantly differ (Fig. 6C).
+To identify and enumerate mono4 monocytes, we developed an
+antibody panel to target surface and intracellular proteins that were
+among the top cluster 9 marker genes (Fig. 4C), as well as among the
+highly expressed transcripts of (i) the negatively selected ROT1D
+monocytes (Fig. 2E), (ii) the mono4 population described by Villani
+et al. (18), and (iii) the NK- like monocyte population described by
+Hu et al. (19). We selected as cell- surface targets the lectin- like receptors KLRD1 (CD94) and KLRB1 (CD161). KLRD1 expression by
+NK cells is associated with effector function and cell survival and is
+linked to innate and adaptive immune responses to pathogens (30).
+Notably, KLRB1 expression identifies a proinflammatory NK cell population that exhibits high cytokine responsiveness and may contribute
+to inflammatory disease pathogenesis (31). We selected the cytolytic
+protein perforin (PRF1) as an intracellular target. Monocytes of
+uHC, LRS, HRS, and ROT1D study participants were analyzed by
+flow cytometry using an antibody panel that targeted CD14, CD16,
+CD3, CD19, CD56, HLA- DR, KLRB1, KLRD1, and PRF1 (Fig. 7A).
+
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+All
+Clusters
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+uHC
+LRS
+HRS
+ROT1D
+All
+clusters
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+Cluster
+IFITM1
+CD247
+SPON2
+GZMH
+KLRF1
+GZMM
+NKG7
+KLRD1
+PRF1
+GZMA
+GZMB
+CTSW
+NCAM1
+GNLY
+IL1B
+CXCL8
+CCL3
+TNF
+CCL4L2
+CCL4
+IL10
+CXCL3
+CCL2
+IL6
+IL18
+CXCL10
+CXCL16
+CCL3L1
+Cytokine / Chemokine Enrichment Score
+0.0
+0.3
+0.9
+uHC
+LRS
+HRS
+ROT1D
+01 23 45 67 89
+0.6
+−0.3
+uHC vs. LRS
+uHC vs. HRS
+uHC vs. ROT1D
+LRS vs. HRS
+LRS vs. ROT1D
+HRS vs. ROT1D
+Cluster 0
+n.s.
+n.s.
+1.0 × 10−38
+6.7 × 10−10
+3.6 × 10−74
+3.7 × 10−100
+Cluster 1
+n.s.
+n.s.
+3.9 × 10−19
+4.1 × 10−12
+1.6 × 10−45
+1.0 × 10−68
+Cluster 2
+n.s.
+n.s.
+4.6 × 10−31
+1.6 × 10−11
+1.4 × 10−92
+1.1 × 10−106
+Cluster 3
+n.s.
+n.s.
+6.9 × 10−18
+5.8 × 10−6
+7.3 × 10−44
+3.9 × 10−65
+Cluster 4
+n.s.
+n.s.
+1.9 × 10−12
+8.4 × 10−8
+2.1 × 10−37
+7.0 × 10−44
+Cluster 5
+n.s.
+n.s.
+3.7 × 10−2
+9.9 × 10−10
+4.6 × 10−21
+2.1 × 10−12
+Cluster 6
+n.s.
+n.s.
+1.8 × 10−7
+3.9 × 10−2
+5.6 × 10−15
+3.1 × 10−16
+Cluster 7
+n.s.
+n.s.
+6.0 × 10−3
+4.2 × 10−2
+2.8 × 10−10
+4.7 × 10−10
+Cluster 8
+n.s.
+n.s.
+1.6 × 10−7
+1.6 × 10−2
+1.7 × 10−16
+1.4 × 10−20
+Cluster 9
+n.s.
+n.s.
+n.s.
+1.8 × 10−2
+3.2 × 10−4
+9.8 × 10−4
+All clusters
+n.s.
+n.s.
+6.3 × 10−123
+5.8 × 10−45
+0.0 × 10+00
+0.0 × 10+00
+Expression level
+−0.3 0.0 0.3
+Fig. 5. All scRNA- seq clusters of ROT1D monocytes express elevated levels of cytolyic and cytokine/chemokine transcripts. (A) expression levels of cytolytic transcripts differentially expressed between monocytes of uhc, lRS, hRS, and patients with ROt1d. differential expression analysis was conducted for the top 100 transcripts
+in cluster 9. Shown are transcripts that meet a threshold of P < 0.05 in any one of the six possible pairwise comparisons. (B) expression levels of selected cytokines and
+chemokines differentially expressed between monocytes of uhc, lRS, hRS, and patients with RO t1d. the cytokines and chemokines shown met an adjusted P value of
+<0.05 in one or more of the six possible comparisons between cohorts. Shown are monocytes of all clusters merged and each individual monocyte cluster (0 to 9).
+(C) chemokine/cytokine gene enrichment scores for clusters 0 to 9, calculated using the AddModuleScore function in Seurat, were used to quantify the average expression level of the 14 cytokine/chemokine transcripts at the single- cell level for each cohort.
+
+Compared to uHC, the classical CD14+CD16− and intermediate
+CD14+CD16+ monocytes of LRS, HRS, and ROT1D participants
+had an increasing abundance of KLRD1 highKLRB1high monocytes;
+this difference reached statistical significance when comparing the
+uHC and ROT1D cohorts. When considering the total monocyte
+population (classical + intermediate + nonclassical), the overall
+abundance of KLRD1highKLRB1high monocytes among patients with
+ROT1D was significantly higher than uHC (3.1% versus 1.4%,
+P = 0.04; Fig. 7B). Similar relationships were identified when
+analyzing KLRD1 highPRF1high monocytes (1.5% versus 0.3%, P =
+0.03; Fig. 7D) and KLRD1 highGZMBhigh monocytes (3.3% versus
+0.5%, P = 0.04). The abundances of the mono4 populations among
+patients with LST1D (Fig. 7, B to E)-as defined by KLRD1 high-
+KLRB1 high , KLRD1 high PRF1 high , or KLRD1 high GZMB high -were
+similar to the abundances observed in uHC and the healthy sibling cohorts, supporting the notion that the elevated abundances
+of this population in the ROT1D cohort was not related to glycemic control.
+A Lymphocytes Singlets Viable cells
+CD3
+CD56- HLA-DR+ Monocytes
+FSC-H
+SSC-A
+FSC-A FSC-A
+LIVE/DEAD
+FSC-A
+CD3-CD19-
+CD19
+CD56
+FSC-A
+HLA-DR
+FSC-A
+CD14
+CD16
+ROT1DuHC LRS HRS LST1D
+% CD14+ CD16-monocytes of
+total monocytes
+% CD14+CD16+monocytes of
+total monocytes
+% CD14dim CD16+monocytes of
+total monocytes
+% CD3-CD56+cells of
+total lymphocytes
+P = 0.04
+P = 0.01
+P = 0.001
+n.s.
+n.s.
+n.s.
+n.s.
+P = 0.01
+n.s.
+P = 0.0028
+P = 0.025
+P = 0.001
+P = 0.0001
+P = 0.0003
+n.s.
+n.s.
+n.s.
+n.s.
+n.s.
+n.s.
+ROT1DuHC LRS HRS LST1D
+ROT1DuHC LRS HRS
+LST1D
+ROT1DuHC LRS HRS
+LST1D
+Fig. 6. Cross- sectional flow cytometry analyses show patients with ROT1D have higher circulating percentages of intermediate monocytes. the analysis included
+uhc (n = 11; age, 14.0 ± 2.8 years), stage 0 lRS (n = 14; age, 12.1 ± 3.8 years; all autoantibody negative), stage 0 hRS (n = 14; age, 12.4 ± 3.2 years; all autoantibody negative), patients with ROt1d (n = 25; age, 12.3 ± 3.0 years; hbA1c, 7.8 ± 1.3%), and patients with lSt1d (n = 15; age, 18.7 ± 8.0 years; hbA1c, 8.5 ± 1.0%). (A) Representative
+flow cytometry profiles for identification of classical, intermediate, and nonclassical monocytes. cryopreserved PBMcs were thawed and stained. A negative gating strategy was used to identify cd3 −, cd19−, and cd56− lymphocytes. Monocytes were differentiated from nK cells by gating on hlA- dRhi and segregated into cd14+cd16−
+(classical), cd14+cd16+ (intermediate), and cd14dimcd16+ (nonclassical) populations. (B) Percentages of classical, intermediate, and nonclassical monocytes in the uhc,
+lRS, hRS, ROt1d, and lSt1d cohorts (left to right). (C) Percentages of nK cells in the uhc, lRS, hRS, ROt1d, and lSt1d cohorts. the differences between groups were assessed by analysis of variance (AnOvA).
+
+% KLRD1hiKLRB1hi of
+total monocytes
+%K LRD1hi KLRB1hi of
+CD14+CD16− monocytes
+%K LRD1hiKLRB1hi of
+CD14+CD16+monocytes
+%K LRD1hiKLRB1hi of
+CD14dim CD16+monocytes
+%K LRD1hi PRF1hi of
+total monocytes
+%K LRD1hi PRF1hi of
+CD14+CD16− monocytes
+%K LRD1hi PRF1hi of
+CD14+ CD16+monocytes
+%K LRD1hi PRF1hi of
+CD14dim CD16+monocytes
+ROT1
+DuHC LRSHRS LST1D ROT1
+DuHC LRS HRS LST
+1D
+D
+E
+n.s.
+n.s.
+n.s.
+n.s.
+n.s.
+n.s.
+n.s.
+n.s.
+P = 0.04
+P = 0.03
+n.s.
+n.s.
+P = 0.03
+n.s.
+n.s.
+n.s.
+P = 0.03
+P = 0.04
+n.s.
+n.s.
+P = 0.03
+n.s.
+n.s.
+n.s.
+P = 0.0002
+P = 0.0016
+P = 0.0022
+n.s.
+P = 0.0006
+P = 0.03 P = 0.0001
+P = 0.02
+n.s.
+n.s. n.s. n.s.
+n.s.
+n.s. n.s.
+n.s.
+ROT1DuHCLRS HRS LST1
+D
+ROT1DuHC LRSHRS LST1D
+ROT1DuHC LRSHRS LST1D ROT1DuHC LRS HRS LST1D ROT1
+DuHC LRS HRS
+LST1D
+ROT1DuHC LRSHRS LST1D
+KLRB1
+CD14
+KLRB1
+KLRB1
+KLRB1
+PRF1
+PRF1
+PRF1
+PRF1
+CD14++CD16−Q1
+CD14++CD16+Q2
+CD14dimCD16+Q3
+Q1 + Q2 + Q3 Total Monocytes
+.
+CD16 KLRD1K LRD1 KLRD1K LRD1 KLRD1 KLRD1 KLRD1 KLRD1
+Fig. 7. Cross- sectional flow cytometry analyses show patients with ROT1D have higher circulating percentages of mono4 monocytes. the analysis included uhc
+(n = 11; age, 14.0 ± 2.8 years), stage 0 lRS (n = 14; age, 12.1 ± 3.8 years, all autoantibody negative), stage 0 hRS (n = 14; age, 12.4 ± 3.2 years; all autoantibody negative),
+patients with ROt1d (n = 25; age, 12.3 ± 3.0 years; hbA1c, 7.8 ± 1.3%), and patients with lSt1d (n = 15; age, 18.7 ± 8.0 years; hbA1c, 8.5 ± 1.0%). (A) Representative flow
+cytometry profiles for identification of KRld1highKlRB1high and KlRd1highPRF1high monocytes. (B) Percentages of KlRd1highKlRB1high monocytes among total monocytes
+among the uhc, lRS, hRS, ROt1d, and lSt1d cohorts. (C) Percentages of KlRd1highKlRB1high monocytes among classical, intermediate, and nonclassical monocytes (left
+to right) among the uhc, lRS, hRS, RO t1d, and lSt1d cohorts. (D) Percentages of KlRd1 highPRF1high monocytes among total monocytes among the uhc, lRS, hRS,
+ROt1d, and lSt1d cohorts. (E) Percentages of KlRd1 highPRF1high monocytes among classical, intermediate, and nonclassical monocytes (left to right) among the uhc,
+lRS, hRS, ROt1d, and lSt1d cohorts. each dot represents a different individual. horizontal bars indicate the mean ± Se . the differences between groups were assessed
+by AnOvA.
+
+We found that the transcriptomes of uHC monocytes positively
+correlated with the gene expression profiles of sorted classical
+monocytes, while transcriptomes of ROT1D monocytes positively
+correlated with the gene expression profiles of sorted nonclassical
+monocytes (Fig. 2C). Consistent with this observation, the lowest
+percentage of KLRD1, KLRB1, and PRF1 expressing classical and
+intermediate monocytes was observed in the uHC cohort. Overall,
+these data were consistent with transcriptomic analyses in that they
+showed significantly higher mono4 abundances in patients with
+ROT1D and detected the mono4/NK- like population distributed
+across the classical, intermediate, and nonclassical subsets.
+Relationships between monocyte populations and β cell
+function among patients with ROT1D
+Mixed meal tolerance tests (MMTTs) permit calculation of stimulated C- peptide AUC (area under the curve), the most widely
+accepted measure of endogenous insulin production (32). Relationships between abundances of classical and mono4 monocytes
+and stimulated C- peptide AUC were not detected among patients
+with ROT1D. However, we did identify a negative relationship between the baseline percentage of intermediate monocytes and the
+rate (slope) of C- peptide decline over the 24- month study period
+[(r (correlation coefficient) = −0.45, P = 0.03] (Fig. 8A). We also
+identified a positive relationship between the baseline percentage
+of nonclassical monocytes and the rate (slope) of C- peptide decline
+over the 24- month study period (r = 0.46, P = 0.03) (Fig. 8B). Over
+the study period, robust relationships between HbA1c or insulin
+dose and the abundances of classical, intermediate, nonclassical, or
+mono4 monocytes were not detected. However, positive relationships were measured between (i) the baseline HbA1c and baseline KLRD1 high/PRF1high mono4 monocyte abundances as well as
+(ii) the 6- month insulin dose and baseline KLRD1 high/KLRB1high
+mono4 monocyte abundances. A negative relationship was observed
+between the 24- month insulin dose and baseline nonclassical
+monocytes abundances (table S6).
+Next, we examined the ratio between the percentage of intermediate monocytes versus the percentage of nonclassical monocytes.
+There was a large ratio range for the ROT1D group (Fig. 8C) that
+was, on average, higher than uHC (P = 0.02) and LST1D (P = 0.02).
+Notably among the ROT1D group, an inverse relationship was observed between the intermediate- to- nonclassical monocyte ratio at
+baseline and the percent change from baseline C- peptide AUC at 6,
+12, and 24 months (P < 0.02; Fig. 8D). Similarly, the intermediateto- nonclassical monocyte ratio at baseline was inversely related to
+the rate (slope) of C- peptide decline over the 24- month study period (r = −0.62, P < 0.002) (Fig. 8E). Together, these data support
+the hypothesis that (i) individuals with a higher intermediate- tononclassical monocyte ratio at onset will experience accelerated
+decline in β cell function; (ii) that intermediate monocytes promote
+more rapid post- onset progression; and (iii) nonclassical monocytes may be functioning in an immunoregulatory capacity to slow
+post- onset progression.
+Longitudinal analysis of monocyte and Treg populations in
+nonprogressors and T1D progressors
+We previously reported that the circulating percentage of activated
+CD4+CD45RA −FoxP3high T reg increased in an age- dependent
+manner among HRS nonprogressors, suggesting an immunoregulatory mechanism underlying the decline in T1D susceptibility
+with age (29). However, among T1D progressors, the abundance of
+this highly suppressive subset remained stable. Using flow cytometry, we longitudinally examined PBMCs of nonprogressors and
+progressors for changes in circulating activated T reg and monocyte
+abundances to better understand the temporal dynamics of these
+two populations.
+Twenty- two HRS nonprogressors (mean age of 8.2 ± 3.5 years
+at the first sampling) were examined at two time points (mean
+duration of 5.4 ± 1.3 years between samplings). These stage 0
+participants were either antibody negative at both time points
+(n = 19) or positive for a single antibody at one time point
+(n = 3). Between time points 1 and 2, there were changes in the
+abundances of classical (65.8 to 77.2%; P = 0.001), intermediate
+(20.9 to 13.8%; P = 0.015), and nonclassical monocytes (12.9
+to 9.2%; P = 0.061) as well as changes in the intermediate: nonclassical ratio (3.5 to 2.0; P = 0.045) (Fig. 9A). Mono4 monocytes
+were defined as CD14 + and/or CD16 +, HLA- DR+, KLRD1 high ,
+KLRB1high, and PRF1high. For these longitudinal analyses, the antibody panel was expanded to include intracellular staining for the
+cytolytic protein granzyme B (GZMB). Among classical, intermediate, and nonclassical monocytes of nonprogressors, significant temporal decreases in the percentage of KLRD1highKLRB1high (−41.5%,
+P = 0.006; −38.5%, P = 0.009; and −17.3%, P = 0.031, respectively;
+Fig. 9B), KLRD1 high PRF1 high ( −15.8%, P = 0.014; −59.2%,
+P = 0.049; and −0.42%, P = 0.019, respectively; Fig. 9C), and
+KLRD1 high GZMB high ( −29.1%, P = 0.045; −32.8%, P = 0.004;
+and −13.5%, P = 0.031, respectively; Fig. 9D) cells were observed.
+When considering the total monocyte population (classical +
+intermediate + nonclassical), a significant temporal decline in
+the percentage of KLRD1 high KLRB1 high ( −46.3%, P = 0.001),
+KLRD1highPRF1high (−37.8%, P = 0.001), and KLRD1highGZMBhigh
+(−54.1%, P = 0.0001) monocytes was also measured (Fig. 9, B to D).
+This contrasted with temporal increases in the ratio of peripheral activated CD4 +CD45RA −FoxP3 high T reg among total T reg
+in these HRS (61.7%, P = 0.0001; Fig. 9E). Further, there was a
+significant temporal decrease in the ratio of mono4 monocytes
+(KLRD1highKLRB1high, KLRD1highPRF1high, and KLRD1highGZMBhigh)
+relative to activated T reg among progressors (Fig. 9E). A significant negative relationship between activated T regs (among total
+Tregs) and mono4 (among total monocytes) for these participants
+was observed when using any of these marker combinations
+(KLRD1 highKLRB1high: r = −0.69, P = 0.002; KLRD1 highPRF1high:
+r = −0.77, P = 0.003; and KLRD1 high GZMB high : r = −0.49,
+P = 0.002).
+We also conducted longitudinal analyses on 17 participants
+that advanced from stage 0 to stage 1 T1D or stage 2 T1D (as
+evidenced by presence of ≥2 islet autoantibodies, n = 15) or
+from stage 0 to stage 3 T1D (clinical onset, n = 2). The mean age
+of these participants was 9.0 ± 4.3 years, with a mean duration
+of 4.2 ± 2.3 years between samplings. In these progressors, we
+did not measure significant temporal changes in classical, inter mediate, nonclassical, and mono4 monocyte abundances; or the
+ratio between the percentages of intermediate and nonclassical
+monocytes; or activated T reg abundances (fig. S3, A to E). Over all, in contrast to T1D progression, these results indicate that
+nonprogression is associated with temporal decreases in mono4
+monocytes, increased percentages of activated T reg in the
+periphery, and decreases in the intermediate- to- nonclassical
+monocyte ratio.
+
+Ratio of % CD14+CD16+/
+% CD14dim CD16+ monocytes (log2)
+Rate of C-peptide AUC decline
+over 24 months (nmol l−1 month−1)
+% CD14+ CD16+ monocytes/
+Total monocytes (log2)
+Rate of C-peptide AUC decline
+over 24 months (nmol l−1 month−1)
+% CD14 dim CD16+monocytes/
+Total monocytes (log2)
+Ratio of % CD14+ CD16+/
+% CD14dim CD16+ monocytes (log2)
+D
+Rate of C-peptide AUC decline
+over 24 months (nmol l−1 month−1)
+E
+−0.3 −0.2 −0.1 0
+−5
+−2.5
+2.5
+−0.3 −0.2 −0.1 0
+−2
+−0.3 −0.2 −0.1 0
+−2
+−2
+−2
+Ratio of % CD14+CD16+/
+% CD14dim CD16+monocytes (log2)
+Ratio of % CD14+CD16+/
+% CD14dim CD16+ monocytes (log2)
+% Change from baseline
+C-peptide AUC at 6 months
+−1 −0.5 0 0.5
+% Change from baseline
+C-peptide AUC at 12 months
+−1 −0.5 00 .5
+% Change from baseline
+C-peptide AUC at 24 months
+−1 −0.5 00 .5
+r = −0.45
+P = 0.03
+r = 0.46
+P = 0.03
+r = −0.65
+P < 0.001
+r = −0.51
+P < 0.02
+r = −0.63
+P < 0.01
+r = −0.62
+P = 0.002
+ROT1D
+uHC LRS HRS LST1D
+Ratio of % CD14+CD16+/
+% CD14dim CD16+monocytes
+P = 0.02
+P = 0.02
+n.s.
+n.s.
+n.s.
+Fig. 8. The relationship between the percentages of intermediate and nonclassical monocytes at baseline and future β cell function among patients with
+ROT1D. (A) Significant inverse relationship exists between baseline percentages of cd14+cd16+ (intermediate) monocytes and the rate (slope) of c- peptide decline over
+the 24- month study period (r = −0.45, P = 0.03). the cohort consisted of 22 patients with ROt1d (age, 11.5 ± 3.3 years; hbA1c, 7.9 ± 1.5% at baseline). (B) Significant direct
+relationship exists between baseline percentages of cd14dim cd16+ (nonclassical) monocytes and the rate (slope) of c- peptide decline over the 24- month study period
+(r = 0.46, P = 0.03). A truncated linear regression was used to estimate the slope of decrease for each individual. larger negative slope values imply a faster decline of
+stimulated c- peptide. (C) Ratio of intermediate monocytes to nonclassical monocytes among the uhc, lRS, hRS, RO t1d, and lSt1d cohorts illustrated infig. 6. (D) Significant inverse relationship exists between the intermediate- to- nonclassical monocyte ratio at baseline and 2- hour c- peptide AUc percent change from baseline at 6, 12,
+and 24 months after onset among patients with ROt1d. (E) Significant negative relationship exists between the intermediate- to- nonclassical monocyte ratio at baseline
+and the rate (slope) of c- peptide decline over the 24- month study period (r = −0.62, P = 0.002).
+
+T1 T2
+Time points
+%K LRD1hiKLRB1hi of
+total monocytes
+P = 0.001
+%K LRD1 hi KLRB1hi of
+CD14+CD16- monocytes
+T1 T2
+P = 0.006
+Time points
+T1 T2
+%K LRD1hiKLRB1hi of
+CD14+CD16+monocytes
+P = 0.009
+Time points
+T1 T2
+%K LRD1hi KLRB1hi of
+CD14dim CD16+monocytes
+P = 0.031
+Time points
+Time pointsT ime pointsT ime points Time points
+Time pointsT ime pointsT ime points Time points
+Time points Time points
+D
+%K LRD1hiGZMBhi of
+total monocytes
+T1 T2
+%K LRD1hiGZMBhi of
+CD14+CD16− monocytes
+T1 T2
+%K LRD1hi GZMBhi of
+CD14+CD16+monocytes
+%K LRD1hi GZMBhi of
+CD14dimCD16+monocytes
+P = 0.0001
+P = 0.045 P = 0.004
+P = 0.031
+T1 T2
+T1 T2
+T1 T2
+P = 0.0142 P = 0.0487
+0.0190
+P = 0.001
+T1 T2
+%K LRD1hi PRF1hi of
+total monocytes
+%K LRD1hi PRF1hi of
+CD14+CD16− monocytes
+T1 T2
+%K LRD1hi PRF1hi of
+CD14+CD16+monocytes
+%K LRD1hi PRF1hi of
+CD14dimCD16+monocytes
+T1 T2
+Ratio of % CD14+CD16+/
+% CD14dim CD16+monocytes
+T1 T2
+T1 T2
+Time points
+% CD14 +CD16+monocytes/
+total monocytes
+Time points
+Time points
+% CD14dim CD16+monocytes/
+total monocytes
+% CD14+ CD16- monocytes/
+total monocytes
+T1 T2
+T1 T2
+100P = 0.001
+P = 0.015 P = 0.061
+P = 0.045
+Time points
+Active/totalT reg
+Ratio of KLRD1hi KLRB1hi of
+total monocytes/activated Treg
+Ratio of KLRD1hiGZMBhi of
+total monocytes/activated Treg
+Ratio of KLRD1hiPRF1hi of
+total monocytes/activated Treg25
+P = 0.003
+P = 0.002
+T1 T2
+0.0
+0.5
+1.0
+1.5
+2.0
+P = 0.0001
+Time points
+T1 T2
+P = 0.002
+Time points
+T1 T2
+T1 T2
+E
+Fig. 9. Temporal analysis of monocyte and Treg populations in stage 0 HRS nonprogressors. twenty- two stage 0 hRS were analyzed at two time points. the mean age at
+the first sampling was 8.2 ± 3.5 years; the second sampling was conducted 5.4 ± 1.3 years later. (A) Percentages of KlRd1highKlRB1high monocytes among total, classical, intermediate, and nonclassical monocytes (left to right) at time points 1 and 2. (B) Percentages of KlRd1highPRF1high monocytes among total, classical, intermediate, and nonclassical monocytes (left to right) at time points 1 and 2. (C) Percentages of KlRd1highGZMBhigh monocytes among total, classical, intermediate, and nonclassical monocytes
+(left to right) at time points 1 and 2. (D) Representative flow cytometry profiles showing the gating strategy for resting and activated treg cells. Resting and activated cd4+
+tregs were defined as cd45RA+FoxP3low and cd45RA−FoxP3high, respectively. (E) left to right: Abundance of activated treg among total treg at time points 1 and 2, ratio of
+KlRd1highKlRB1high monocytes among total monocytes: percentage activated treg among total treg, ratio of KlRd1highPRF1high monocytes among total monocytes: percentage activated treg among total treg at time points 1 and 2, and ratio of KlRd1highGZMBhigh monocytes among total monocytes:percentage activated treg among total treg at
+time points 1 and 2. each dot represents a different individual. horizontal bars indicate the mean ± Se. the differences between time points were assessed with a paired t test.
+
+DISCUSSION
+Monocytes comprise a substantial component of human peripheral
+blood, having essential functions in pathogen surveillance, phagocytosis, inflammation, and antigen presentation. While an under standing of monocyte heterogeneity and function in both health
+and disease has progressively increased, the number of studies that
+have examined monocytes in patients with T1D and their at- risk
+relatives remain limited.
+Here, we determined that monocytes of T1D family members
+are hyperresponsive to TLR4 ligation, as evidenced by significantly
+higher IL- 1β , TNF- α, and IL- 6 secretion after exposure to LPS
+compared to uHC. This observation is consistent with prior reports
+describing hypersecretion of IL- 1β and IL- 6 by monocytes of patients with T1D regardless of whether they were stimulated with
+LPS or in an unperturbed resting state (17, 33). These findings are
+relevant, as several clinical trials targeting proinflammatory cytokines have now provided proof of principle for these molecules as
+effectors in T1D by improving measures of β cell function. These
+trials include the targeting of TNF- α with etanercept (a TNF- α receptor fusion protein that fosters clearing of TNF- α from the circulation) and golimumab (an anti-TNF- α antibody) (34, 35). Overall,
+trials of IL- 1β blockade with anakinra (IL1- RA) or canakinumab
+(anti- IL1B antibody) did not slow β cell decline in ROT1D (36).
+However, subgroup analysis of the anakinra study detected significantly higher stimulated C- peptide levels among IL1- RA-treated
+participants having intermediate levels of β cell function at enrollment (36), and application of quantitative response analysis to the
+treatment arm of the canakinumab trial suggested a positive effect
+on retention of stimulated C- peptide (37). Further, our laboratory
+reported an inverse relationship between measured inflammation
+at onset and future stimulated C- peptide response in both anakinraand canakinumab- treated patients when using a GO- based inflammatory index (38). A case for proinflammatory cytokines playing
+an effector role in T1D has grown through decades of study (39),
+and the hypersecretion of cytokines by monocytes in T1D families
+highlights the importance of innate immunity in T1D and its potential as a therapeutic target.
+We also conducted gene expression studies of unstimulated
+monocytes that included scRNA- seq, where in addition to elevated
+LPS- stimulated cytokine expression, we associated this proinflammatory phenotype in T1D families with the expression of a cytolytic
+transcriptome that is consistent with expansion of the previously
+described mono4/NK- like subpopulation (18, 19). Compared to
+uHC, cross- sectional flow cytometry analyses found that the mono4
+population trended upward in healthy siblings of patients with T1D
+and was significantly elevated in patients with ROT1D. Longitudinal
+flow cytometry analyses of nonprogressors measured temporal decreases in the mono4 population that negatively correlated with increases in activated Treg. This immunoregulatory pattern contrasted
+with T1D progressors, where neither temporal decrease in mono4
+nor an age- dependent increase in active Treg was observed.
+Among patients with ROT1D, the abundances of classical, intermediate, nonclassical, or mono4 monocytes were not found to
+consistently correlate with HbA1c levels or insulin dose (table S6).
+Further, classical and mono4 monocyte abundances did not correlate with measures of stimulated C- peptide AUC. However, we determined that higher abundances of intermediate monocytes near
+clinical onset were associated with a more rapid decline in stimulated C- peptide over the subsequent 24- month study period
+(Fig. 8A). Ren et al. (16) reported a significant increase in nonclassical monocytes when comparing uHC to ROT1D (19.5 ± −9.1 days
+after onset). In contrast, we observed a significant decrease in
+the nonclassical monocyte percentage when comparing the
+ROT1D cohort (67.2 ± −34.2 days after onset) to the uHC cohort
+(Fig. 6B). This difference may stem from our sampling of participants later in the immediate post- onset period, when patients
+with ROT1D have generally achieved greater overall metabolic
+stabilization (40). However, our analyses of LST1D controls exhibiting similar levels of glycemic control suggest that the altered
+monocyte populations we observed in patients with ROT1D is not
+related to elevated glucose levels. We also identified a direct relationship between the baseline percentage of nonclassical monocytes and the rate (slope) of C- peptide decline over the 24- month
+study period (Fig. 8B). A more robust negative relationship was
+observed with rate (slope) of C- peptide decline when monocyte
+abundances were considered as a ratio between the percentages
+of intermediate versus nonclassical subsets. The ability to predict
+the persistence of C- peptide, particularly MMTT- stimulated
+values ≥ 0.2 nM, is relevant as patients that retain β cell function
+experience a reduced risk of severe hypoglycemia and microvascular
+complications (41-45). This observation may offer a biomarker of
+progression of immune- mediated β cell destruction and means to
+stratify patients. It further suggests an anti- inflammatory role for
+nonclassical monocytes in ROT1D, where their phagocytic removal
+of damaged cells and debris from the vasculature may function to
+promote wound healing and the resolution of inflammation (9 ).
+Similar to Hamers et al. ( 46), our scRNA- seq analysis identified a
+single CD16 + subset; however, their mass cytometry studies revealed multiple nonclassical monocyte subsets that exhibited
+changes in frequency in the setting of severe coronary artery disease ( 46). Specifically, these authors identified a subset of Slan +
+nonclassical monocytes that they postulated to be antiinflammatory and involved in the clearance of apoptotic cells (efferocytosis) and maintenance of vascular homeostasis (46).
+Whether subset differences among nonclassical monocytes exist in
+the context of T1D or T1D susceptibility is a limitation of this analysis that remains to be explored.
+Similar to other studies that have used scRNA- seq to study monocyte populations, we observed heterogeneity extending beyond the
+traditional tripartite classification scheme. Villani et al. ( 18) sequenced 372 monocytes of two healthy participants to define four
+monocyte clusters, and Hu et al. (19) sequenced 11,259 monocytes
+of three healthy participants to define six clusters. In this study, we
+sequenced 13,915 monocytes of two uHC, two LRS, two, HRS and
+two patients with ROT1D to define 10 monocyte clusters. We were
+able to align 5 of 10 clusters with clusters identified by these prior
+studies (cluster 3 aligned with classical monocytes, cluster 5 aligned
+with nonclassical monocytes, cluster 0 aligned with S100A12 monocytes, cluster 4 aligned with HLA monocytes, and cluster 9 aligned
+with mono4/NK- like monocytes). The presence of additional
+unaligned clusters identified in this study may have stemmed from
+(i) the sequencing of a greater number of monocytes and (ii) analyzing primarily participants with T1D susceptibility (patients with
+T1D and unaffected siblings of patients with T1D). However, only
+the mono4/NK- like signature expressed by cluster 9, which was evident in the microarray studies, showed enrichment among monocytes drawn from the sibling cohorts with inherited T1D risk and
+even greater enrichment in the ROT1D cohort. Notably, not all
+
+scRNA- seq studies of human monocytes have identified a mono4/
+NK- like monocyte subpopulation (47, 48); authors of these studies
+have suggested that this transcriptomic signature is derived from
+physical doublets with NK cells. Here, steps were taken during
+scRNA- seq to minimize the inclusion of doublets, and we validated
+the presence of the mono4/NK- like monocyte population through a
+flow cytometric analysis that excluded CD56+ NK cells and retained
+HLA- DR+, CD14 +, CD16 +, KLRD1 high, KLRB1 high, and PRF1 high
+monocytes. Villani et al. ( 18) observed that many monocytes defined as intermediate by surface markers coclustered in scRNA- seq
+analysis with the classical or nonclassical subsets. In line with this
+observation, we found the mono4 population distributed over the
+classical, intermediate, and nonclassical populations when applying
+a conventional rectangular gating strategy (Figs. 6 to 9).
+While our studies find elevated abundances of mono4 monocytes in patients with ROT1D and find that their abundances decrease among nonprogressors, it is possible that the differentiation
+of monocyte subpopulations is altered in patients with T1D, and the
+expression of mono4 markers is a surrogate of this altered differentiation versus a driver of disease. We also recognize that the lack of
+longitudinal transcriptional analyses is a limitation of this study.
+However, in an elegant study, Xhonneux et al. (49) longitudinally
+analyzed whole blood transcriptomes of >400 T1D progressors and
+controls. The approach entailed RNA extraction from unfractionated
+whole blood, gene expression measurements by microarray, and a
+deconvolution approach, where the expression levels of immune
+cell-specific transcripts were used to estimate cell- type frequencies.
+The authors identified a signature consistent with NK cell enrichment that was significantly associated with both the development of
+islet antibodies and progression to clinical T1D (49). Here, we did
+not detect differences in the abundances of CD56+ NK cell populations in our cross- sectional flow cytometric analysis of the uHC,
+LRS, HRS, LST1D, and ROT1D cohorts, nor in our longitudinal
+analyses of T1D progressors and nonprogressors. The NK signature
+defined by Xhonneux et al. ( 49) included 87 transcripts, notably
+56 (64.4%; χ2, P < 1.0 × 10−5) of these transcripts were included in
+the 826 transcript signature defined by our cross- sectional microarray analysis of negatively selected monocytes, and 30 (34.5%;
+χ2, P < 1.0 × 10 −5) of these transcripts were included in the top
+100 transcripts of cluster 9. We analyzed the scRNA- seq data for differential expression of this 87 transcript signatures between uHC,
+LRS, HRS, and ROT1D participants for cells belonging to the NK
+cluster (fig. S4). Our findings support the conclusion that the mono4
+(cluster 9) population defined here, as well as the expression of
+mono4 markers by monocyte populations defined by clusters 0 to
+6 and 8 in patients with ROT1D (Fig. 4D), contributed to this prior
+observation.
+Overall, we find that circulating monocytes in T1D families
+exhibit transcriptomes having elevated expression of cytolytic
+and proinflammatory mediators, hyper- responsiveness to LPS
+stimulation, and altered monocyte subset frequencies during progression and nonprogression. We observed increased mono4
+abundances among patients with ROT1D and associated higher
+intermediate- to- nonclassical monocyte ratios with a more rapid
+decline in β cell functional mass during the post- onset period. We
+also found that nonprogression is associated with temporal decreases in mono4 monocytes over 5 to 6 years coincident with
+increases in the percentages of activated T regs in the periphery and
+decreases in the intermediate- to- nonclassical monocyte ratio.
+These findings align with prior observations that associate T1D
+susceptibility and progression with a heightened immune response,
+a propensity for T H1 responses toward insulin, and inflammation
+before the onset of autoimmunity [reviewed in (50)]. Further
+studies of monocyte subsets in the context of T1D progression/
+nonprogression may lead to new therapeutic strategies and improved biomarkers of pre- or post- onset disease progression.
+MATERIALS AND METHODS
+Experimental design
+The objective of this study was to improve the understanding of
+monocyte function and heterogeneity among subjects with and at
+risk of developing T1D compared to uHC. Cross- sectional experimental assessments included measurement of cytokine release
+after LPS stimulation, transcriptomic studies, and confirmation by
+flow cytometry. The abundances of monocyte populations were
+correlated with measures of functional β cell mass in newly diagnosed patients and examined among at risk progressors and nonprogressors.
+Study participants
+Participants were recruited through Children’s Wisconsin (CW) and
+diagnosis of T1D was defined per World Health Organization criteria (51). ROT1D samples were collected from participants collected
+2 to 7 months after diagnosis from participants with histories of
+good glycemic control and had ≥ 1 autoantibody. Healthy control
+participants were free of known infection at sample collection and
+belonged to one of the following groups: (i) stage 0 siblings of probands with high- risk (DR3 and/or DR4) HLA genotypes (HRS), (ii)
+stage 0 siblings of probands with lower risk (non- DR3/DR4) HLA
+genotypes (LRS); and (iii) uHCs having no family history of T1D. The
+sibling controls were unrelated to each other and the patients with
+ROT1D studied. The LST1D cohort consisted of established patients
+with T1D where samples were collected 6.1 to 29.7 years after diagnosis. The study participants are described in table S1. The study
+procedures were approved by the CW Institutional Review Board
+(#01-15 and #1171017- 6), and written informed consent was obtained from participants or their parents/legal guardians. Peripheral
+blood samples were drawn into acid citrate dextrose solution A or
+K+EDTA anticoagulant. Ficoll- Histopaque (Sigma- Aldrich, St. Louis,
+MO, USA) density gradient centrifugation was used to separate
+blood components immediately after draw, and plasma was stored at
+−80°C until use. Autoantibody titers (GAD, IA2, insulin, and zinc
+transporter 8) and class II HLA genotypes were determined as described (52, 53). MMTTs were conducted within in 100 days of diagnosis (baseline) and then at 6, 12, and 24 months after onset to
+determine the rate of decline in stimulated C- peptide among patients with ROT1D as described (32, 54).
+LPS- induced secretion of cytokines
+Monocytes were negatively selected from cryopreserved PBMCs
+using the EasySep Human Monocyte Enrichment Kit without CD16
+depletion (STEMCELL Technologies Inc., Cambridge, MA, USA).
+The recovered population was devoid of NK cells, as measured by
+the absence of CD56 + cells by flow cytometry. A total of 100,000
+monocytes per well were cultured for 24 hours at 37°C with LPS
+(10 ng/ml) as described (55). The conditioned medium was recovered after centrifugation and stored at −80°C until IL- 1β, IL- 6, and
+
+TNF- α levels were measured by enzyme- linked immunosorbent assay (R&D Systems, Minneapolis, MN, USA).
+Affymetrix GeneChip analyses of negatively
+selected monocytes
+RNA was extracted from monocytes negatively selected from PBMCs
+as described above. Transcriptomes were measured using Affymetrix
+GeneChip Human Genome U133 plus 2.0 arrays (Affymetrix, Santa
+Clara, CA, USA) as described (29). Array data were subjected to
+global median normalization with Bioconductor Robust Multi- array
+Analysis (56). The significance of gene expression measurements was
+determined by analysis of variance (ANOV A), and the rate of type I
+errors in multiple testing was assessed by calculating FDR with
+Partek Genomics Suite 7.2 (Partek, Saint Louis, MO, USA). Ontological analyses were conducted with the Ingenuity Pathway Analysis
+package (Ingenuity Systems, Redwood City, CA, USA) and the Database for Annotation, Visualization, and Integrated Discovery
+version 6.7 (57).
+scRNA- seq of sorted PBMCs
+Cryopreserved PBMC samples of eight age- matched participants
+(two well- controlled patients with ROT1D, two HRS, two LRS, and
+two uHC) were thawed and incubated with the fixable LIVE/
+DEAD Violet dye (Life Technologies, Grand Island, NY , USA) for
+30 min on ice. The cells were subsequently stained with antibodies
+targeting CD14 (clone M5E2, BD Biosciences, Franklin Lakes, NJ,
+USA), CD16 (clone 3G8, BD Biosciences), HLA- DR (clone G46- 6, BD
+Biosciences) for 30 min on ice and then washed and passed through a
+30 μM filter. PBMCs were sorted with a FACSAria III cell sorter (BD
+Biosciences), with specific forward and side scatter settings to exclude doublets. Using a hemocytometer and trypan blue staining, the
+recovered HLA- DRhigh, CD14 +, CD16 +, and HLA- DRlow, CD14 −,
+and CD16− cells were determined to have >40,000 cells per sample
+and viability exceeding 90%. These two populations were mixed in a
+1:1 ratio to generate a monocyte- enriched, single- cell, PBMC population. Single- cell Gel Beads- in- emulsions were prepared with the
+Chromium Single Cell 3’v3 Reagent Kit (10X Genomics, Pleasanton,
+CA) and a Chromium instrument. Single- cell capture, barcoded
+reverse transcription, cell lysis, and library preparation were per formed as per the manufacturer’s protocol. Library sequencing used
+a NovaSeq 6000 S2 Reagent kit (100 cycles; Illumina, San Diego,
+CA, USA) and a NovaSeq Sequencing System (Illumina).
+scRNA- seq data analysis
+Raw sequencing data were processed using the 10X Genomics Cell
+Ranger software (version 3.0.0) for sample demultiplexing, alignment to the human GRCh38.p14 reference, generating cell barcode,
+and gene unique molecular index (UMI) count matrices. Preprocessing of the scRNA- seq data and downstream analysis was per formed using the Seurat package (version 4.3.0) (58) in R. To filter
+low- quality cells or potential doublets, cells expressing fewer than
+200 or more than 5000 genes or cells with more than 20% of UMI
+counts coming from mitochondrial genes were removed from the
+analysis. Centered log ratio transformation was used as the normalization method, and the 99% quantile was set as the threshold to
+declare if a cell was considered positive. After quality control, a total
+of 38,594 cells were retained for downstream analysis.
+To integrate samples belonging to the four cohorts, we first lognormalized the count data and identified the top 2000 most variable
+transcripts (using method vst) for each cohort. We used a canonical
+correlation analysis-based algorithm to remove batch effect across
+four cohorts (by using function IntegrateData). Integrated data were
+further scaled with removal of variation from total UMI counts and
+percentage of mitochondrial genes. To reduce dimensionality and
+denoise the data, PCA was performed on the top 2000 variable genes.
+Shared nearest neighbor of each cell was constructed using first 30 PCs,
+and different cell clusters were identified using the Louvain- Jaccard
+graph- based algorithm. We used t- SNE with 30 PCs as input to visualize the data in two- dimensional space along with cluster results from
+the clustering algorithm. Identification of differentially expressed
+genes between groups of cells was performed by Wilcoxon rank sum
+tests. Cluster marker genes were declared with adjusted P value less
+than 0.05 (with Bonferroni correction for multiple testing) and were
+used to define well- known PBMC populations.
+A recluster analysis focusing on monocytes was performed by
+first retrieving the cells from clusters 0 and 7 (Fig. 3), the aforementioned normalization was reperformed, and the batch correction
+method was used to integrate data from the four cohorts. This was
+followed by dimension reduction through PCA using the first 10 PCs
+as input for UMAP to visualize the data in two- dimensional space.
+Annotations were confirmed with R package Azimuth (25) using
+the human PBMC reference. Pseudotime trajectory analysis was
+performed with R package Monocle3 (59).
+Dimension reduction plots (t- SNE and UMAP), heatmaps, violin plots, dot plots, and feature plots were generated using functions
+DimPlot, DoHeatmap, VlnPlot, DotPlot, and FeaturePlot in Seurat,
+respectively. Bar plots were generated using the R package ggplot2
+(version 3.4.2). The AddModuleScore function in Seurat was used to
+calculate gene module scores.
+Analysis of monocyte subsets by flow cytometry
+Cryopreserved PBMCs (~ 3 × 106 PBMCs per participant) were
+thawed, then incubated with the fixable LIVE/DEAD Violet dye (Life
+Technologies, Grand Island, NY , USA) for 30 min on ice, and then
+stained with fluorochrome- conjugated monoclonal antibodies tar geting CD3 (clone UCHT1, BD Biosciences), CD19 (clone HIB19,
+BD Biosciences), CD14 (clone M5E2, BD Biosciences), CD16 (clone
+3G8; BD Biosciences), HLA- DR (clone G46- 6, BD Biosciences),
+CD56 (clone B159, BD Biosciences), KLRB1/CD161(clone HP-
+3G10, BD Biosciences), and KLRD1/CD94 (clone HP- 3D9, BD Biosciences) on ice for 30 min. Next, cells were washed, fixed, and
+permeabilized for intracellular staining using the FIX & PERM Cell
+Permeabilization Kit (GAS004, Thermo Fisher Scientific) in accor dance with the manufacturer’s protocol. Then, PBMCs were stained
+with anti- PRF1 (clone B- D48, BioLegend), and anti- GZMB (clone
+GB11, BD Biosciences) for 45 min. Treg populations were stained as
+previously described (29) using anti- CD4 (clone RPA- T4), anti- CD25
+(clone M- A251), anti- CD45RO (clone UCHL1), anti- CD45RA
+(clone HI100), anti- CD127 (clone HIR- 7R- M21) (BD Bioscience,
+San Jose, CA), and anti- FOXP3 (clone PCH101) (eBioscience, San
+Diego, CA). Representative flow cytometry gating plots for the T cell
+staining protocol are shown infig. S5.
+The stained PBMCs were analyzed on a Cytek Aurora flow cytometer (Cytek Biosciences) using five laser line configurations, blue
+(488 nm), red (640 nm), yellow green (561 nm), violet (405 nm) and
+ultraviolet (355 nm) with Spectro Flo software v2.2.0.2, which automatically calculated compensation by unmixing the cells and cor recting spectral spillover using the single stained reference controls
+
+for each fluorescent tag, and unstained control with autofluorescence
+extraction option was enabled. Further, to minimize the unmixing error, the spectrum profiles for all single stained reference controls
+were reconciled against the expected spectrum profiles provided by
+the Cytek Full Spectrum Viewer (https://spectrum.cytekbio.com/).
+Supplementary Materials
+This PDF file includes:
+Figs. S1 to S5
+legends for tables S1 to S6
+Other Supplementary Material for this manuscript includes the following:
+tables S1 to S6

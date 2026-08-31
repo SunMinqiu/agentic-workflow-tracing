@@ -129,6 +129,7 @@ rsync -av \
     --exclude '*.pyc' \
     --exclude 'traces/' \
     --exclude 'results/' \
+    --exclude 'output/genomas_references/pdf/' \
     --exclude '.venv/' \
     --exclude '.env' \
     --exclude '.env.sragent' \

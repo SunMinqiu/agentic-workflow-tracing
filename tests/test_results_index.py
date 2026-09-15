@@ -19,6 +19,7 @@ from agent_io_tracing.analysis.results_index import (
 )
 
 ROW = {
+    "available_reports": [IO_REPORT, KV_REPORT],
     "cell": "A_c2_w1",
     "run": "GenoMAS_A_c2_w1_20260805_152115",
     "workflow": "GenoMAS",
@@ -144,9 +145,10 @@ def test_write_results_index_writes_one_page(tmp_path):
     (cell / "kvcache_demand.json").write_text(json.dumps({"n_token_calls": 3}))
     out = write_results_index(tmp_path)
     page = out.read_text(encoding="utf-8")
-    assert out.name == "index.html"
+    assert out.name == "all-experiments.html"
     assert "Summary — tokens" in page and "Summary — time" in page
-    assert "visualizations/index.html" in page and "kvcache_report.html" in page
+    assert "visualizations/index.html" not in page and "kvcache_report.html" not in page
+    assert "Reports not generated" in page
 
 
 def test_no_run_level_report_is_written(tmp_path):
@@ -176,7 +178,7 @@ def test_sweep_arms_are_included_in_the_results_index(tmp_path):
         "requests": 14,
         "prompt_tokens": 122460,
         "output_tokens": 448,
-        "prefix_cache": {"hit_rate": 0.3073},
+        "per_request_cache": {"coverage": 1, "hit_rate": 0.3073},
         "median_ttft_ms": 1118.3,
         "p95_ttft_ms": 2118.3,
         "median_tpot_ms": 14.4,
@@ -185,6 +187,9 @@ def test_sweep_arms_are_included_in_the_results_index(tmp_path):
         "started_at_epoch_s": 1,
     }), encoding="utf-8")
 
+    source = results / 'GenoMAS_A_c2_w1_20260811_111925/A_c2_w1'
+    source.mkdir(parents=True, exist_ok=True)
+    (source/'messages.jsonl').write_text('')
     rows = discover_sweep_arms(results)
     assert len(rows) == 1
     assert rows[0]["sweep"] == "sweeps/blocksize"
@@ -195,7 +200,7 @@ def test_sweep_arms_are_included_in_the_results_index(tmp_path):
     assert "Fixed-input tests" in page
     assert "block784" in page
     assert "A_c2_w1 · 08-11 11:19" in page
-    assert "sweeps/blocksize" in page
+    assert "blocksize" in page
     assert "30.73%" in page
     assert "1.12s" in page
     assert "2.12s" in page
@@ -205,8 +210,8 @@ def test_sweep_arms_are_included_in_the_results_index(tmp_path):
     assert ">mode</th>" not in page
     assert ">cache</th>" not in page
     assert "1118.3ms" not in page
-    assert "../replay/sweeps/blocksize/kvcache_report.html" in page
-    assert page.count("open comparison") == 1
+    assert "GenoMAS_A_c2_w1_20260811_111925/A_c2_w1/kvcache_report.html" in page
+    assert page.count("Task KVCache experiments") == 1
 
 
 def test_sweep_index_ignores_symlinked_duplicate_arm(tmp_path):

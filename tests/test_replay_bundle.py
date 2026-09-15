@@ -131,3 +131,26 @@ def test_serial_replay_uses_one_worker_and_unique_salts(monkeypatch, capsys) -> 
 
     assert observed == [(0, 7, "test:0:a"), (1, 7, "test:1:b")]
     assert "mode=serial, workers=1" in capsys.readouterr().err
+
+
+def test_stream_error_cannot_be_counted_as_completed_request(monkeypatch):
+    from io import BytesIO
+    from types import SimpleNamespace
+    import pytest
+    payloads=[]
+    def respond(request, timeout):
+        payloads.append(json.loads(request.data))
+        return BytesIO(b'data: {"choices":[{"text":"partial","token_ids":[1]}]}\n\ndata: {"error":{"message":"engine failed"}}\n\n')
+    monkeypatch.setattr(runner,'urlopen',respond)
+    with pytest.raises(RuntimeError,match='stream failed'):
+        runner._completion(SimpleNamespace(base_url='http://example.test',api_key=None,timeout_s=1),'m',{'request_id':'a','index':0,'prompt_token_ids':[1]})
+    assert payloads[0]['vllm_xargs']['kv_trace_request_id']==payloads[0]['request_id']
+
+
+def test_incomplete_sse_stream_is_rejected(monkeypatch):
+    from io import BytesIO
+    from types import SimpleNamespace
+    import pytest
+    monkeypatch.setattr(runner,'urlopen',lambda *a,**kw:BytesIO(b'data: {"choices":[{"text":"partial","token_ids":[1]}]}\n\n'))
+    with pytest.raises(RuntimeError,match='without \\[DONE\\]'):
+        runner._completion(SimpleNamespace(base_url='http://example.test',api_key=None,timeout_s=1),'m',{'request_id':'a','index':0,'prompt_token_ids':[1]})

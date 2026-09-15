@@ -2249,7 +2249,7 @@ def write_markdown(trace_dir: Path, metrics: dict[str, Any]) -> None:
     for row in metrics["comparison_verdicts"]:
         lines.append(f"- **{row['metric']}** vs {row['target']}: {row['verdict']}")
 
-    lines.extend(["", "## Attribution (Overview.md §5)", ""])
+    lines.extend(["", "## Attribution (Design.md §4)", ""])
 
     iface = metrics.get("interface_mix") or {}
     lines.append(f"- **I/O interface mix**: `{json.dumps(iface, ensure_ascii=False)}`")

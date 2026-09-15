@@ -48,6 +48,15 @@ fi
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
+GENOMAS_TIME_ARGS=()
+if [ -n "${GENOMAS_MAX_TIME:-}" ]; then
+    if ! [[ "$GENOMAS_MAX_TIME" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: GENOMAS_MAX_TIME must be a positive number of seconds." >&2
+        exit 2
+    fi
+    GENOMAS_TIME_ARGS=(-- --max-time "$GENOMAS_MAX_TIME")
+fi
+
 if [ -n "$CALLER_BASE_OUT" ]; then
     BASE_OUT="$CALLER_BASE_OUT"
 fi
@@ -329,6 +338,7 @@ for entry in "${WORKLOADS[@]}"; do
         --max-workers "$MW" \
         "${TRAITS_FLAG[@]}" \
         $EXTRA \
+        "${GENOMAS_TIME_ARGS[@]}" \
         > "$OUT/genomas.log" 2>&1 &
     AGENT_PID=$!
     kill -STOP "$AGENT_PID" >/dev/null 2>&1 || true
@@ -355,7 +365,7 @@ for entry in "${WORKLOADS[@]}"; do
         --work-dir "$WORK" \
         --output-dir "$OUT" \
         --instrumentation "$INSTRUMENTATION_LEVEL" \
-        --extra-json "{\"reference_tokens\": ${GENOMAS_REFERENCE_TOKENS:-0}, \"reference_roles\": \"${GENOMAS_REFERENCE_ROLES:-}\", \"reference_manifest\": \"${GENOMAS_REFERENCE_MANIFEST:-}\"}" \
+        --extra-json "{\"reference_tokens\": ${GENOMAS_REFERENCE_TOKENS:-0}, \"reference_position\": \"${GENOMAS_REFERENCE_POSITION:-front}\", \"reference_output_reserve\": ${GENOMAS_REFERENCE_OUTPUT_RESERVE:-8192}, \"reference_policy\": \"unread_each_call\", \"reference_roles\": \"${GENOMAS_REFERENCE_ROLES:-}\", \"reference_manifest\": \"${GENOMAS_REFERENCE_MANIFEST:-}\"}" \
         > "$OUT/manifest.log" 2>&1 || true
 
     LUSTRE_SAMPLER_PID=""
@@ -539,7 +549,7 @@ return_results_ownership "$BASE_OUT"
 
 echo ""
 echo "=== Phase 4 matrix run complete ==="
-echo "Results in: $BASE_OUT"
 echo "Headline CSV: $SUMMARY_CSV"
 echo "KV report: $BASE_OUT/kvcache_report.html"
 echo "Per-cell: $BASE_OUT/<cell>/{visualizations,parallelism_summary.json,ebpf_events.log,pi_events.jsonl,messages.jsonl}"
+announce_results "$BASE_OUT"

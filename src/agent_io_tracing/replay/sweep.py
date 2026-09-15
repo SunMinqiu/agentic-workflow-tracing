@@ -28,7 +28,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from agent_io_tracing.analysis.kvcache.summary import PAGE_CSS
 from agent_io_tracing.experiments.timezone import (
     EXPERIMENT_TIMEZONE,
     from_epoch,
@@ -248,6 +247,8 @@ def record_arm(
 def load_repetition_summary(path: Path) -> dict[str, Any]:
     """Load one repetition and backfill analyses from its raw artifacts."""
     summary = json.loads(path.read_text(encoding="utf-8"))
+    if summary.get("cache_state") == "cold_by_reset":
+        summary["cache_state"] = "reset_requested"
     requests_path = path.parent / "requests.jsonl"
     request_rows = _read_jsonl(requests_path)
     summary["_request_rows"] = request_rows
@@ -277,9 +278,23 @@ def load_repetition_summary(path: Path) -> dict[str, Any]:
             ) or {}).get("kv_cache_metrics_sample")
         )
 
-    event_rows = _read_jsonl(path.parent / "kv_events.jsonl")
+    from agent_io_tracing.serving.kv_report_data import load_report_data
+
+    report_data = load_report_data(path.parent)
+    event_rows = [] if report_data else _read_jsonl(path.parent / "kv_events.jsonl")
     removal_rows: list[dict[str, Any]] = []
-    if event_rows:
+    if report_data:
+        prior = summary.get("kv_events") or {}
+        summary["kv_events"] = {
+            "buffer_truncated": prior.get("buffer_truncated"),
+            "collection_error": prior.get("collection_error"),
+            "collection_status": report_data["collection_status"],
+            **report_data["events"],
+            "lifecycle": report_data["lifecycle"],
+        }
+        if report_data["logical_events_available"]:
+            removal_rows = _read_jsonl(path.parent / "kv_removals.jsonl")
+    elif event_rows:
         started_at = summary.get("started_at_epoch_s")
         ended_at = summary.get("ended_at_epoch_s")
         event_analysis = summarize_events(
@@ -287,49 +302,35 @@ def load_repetition_summary(path: Path) -> dict[str, Any]:
             started_at=started_at,
             ended_at=ended_at,
         )
-        saved_removals = _read_jsonl(path.parent / "kv_removals.jsonl")
-        removal_rows = [
-            row for row in saved_removals
-            if (
-                started_at is None
-                or float(row.get("removed_batch_ts", 0) or 0) >= started_at
-            ) and (
-                ended_at is None
-                or float(row.get("removed_batch_ts", 0) or 0) <= ended_at
-            )
-        ]
-        if not saved_removals:
-            bundle = {}
-            bundle_path = Path(str(summary.get("bundle") or ""))
-            if bundle_path.is_file():
-                try:
-                    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    bundle = {}
-            removal_rows = derive_removals(
-                event_rows,
-                bundle.get("requests") or [],
-                started_at=started_at,
-                ended_at=ended_at,
-            )
-        for row in removal_rows:
-            if not isinstance(row.get("observed_idle_s"), (int, float)):
-                removed_at = row.get("removed_batch_ts")
-                stored_at = row.get("stored_batch_ts")
-                if isinstance(removed_at, (int, float)) and isinstance(
-                    stored_at, (int, float)
-                ):
-                    row["observed_idle_s"] = round(removed_at - stored_at, 6)
+        bundle = {}
+        bundle_path = Path(str(summary.get("bundle") or ""))
+        if bundle_path.is_file():
+            try:
+                bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                bundle = {}
+        removal_rows = derive_removals(
+            event_rows,
+            bundle.get("requests") or [],
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+        from agent_io_tracing.serving.kv_lifecycle import derive_lifecycle
+
+        _, lifecycle_summary = derive_lifecycle(
+            event_rows, started_at=started_at, ended_at=ended_at,
+        )
         prior = summary.get("kv_events") or {}
         summary["kv_events"] = {
             **prior,
             **event_analysis,
+            "lifecycle": lifecycle_summary,
             "removals": len(removal_rows),
             "removals_matched_to_store": sum(
                 bool(row.get("matched_store")) for row in removal_rows
             ),
             "removals_with_request_candidates": sum(
-                bool(row.get("possible_request_prefixes")) for row in removal_rows
+                bool(row.get("content_match_candidates")) for row in removal_rows
             ),
             "ambiguous_token_mappings": sum(
                 bool(row.get("token_mapping_ambiguous")) for row in removal_rows
@@ -379,35 +380,35 @@ def _eviction_analysis(
         target = groups.setdefault(group, {
             "removed_hashes": 0,
             "matched_stores": 0,
-            "mapped_prefixes": 0,
+            "content_candidate_matches": 0,
             "ambiguous_mappings": 0,
             "kinds": {},
             "block_sizes": {},
-            "observed_idle_s": [],
+            "time_since_last_store_s": [],
         })
         target["removed_hashes"] += 1
         target["matched_stores"] += int(bool(row.get("matched_store")))
-        target["mapped_prefixes"] += int(bool(row.get("possible_request_prefixes")))
+        target["content_candidate_matches"] += int(bool(row.get("content_match_candidates")))
         target["ambiguous_mappings"] += int(bool(row.get("token_mapping_ambiguous")))
         kind = str(row.get("kv_cache_spec_kind") or "unknown")
         target["kinds"][kind] = target["kinds"].get(kind, 0) + 1
         size = str(row.get("block_size") or "unknown")
         target["block_sizes"][size] = target["block_sizes"].get(size, 0) + 1
-        observed_idle = row.get("observed_idle_s")
+        observed_idle = row.get("time_since_last_store_s")
         if isinstance(observed_idle, (int, float)):
-            target["observed_idle_s"].append(observed_idle)
+            target["time_since_last_store_s"].append(observed_idle)
     for target in groups.values():
-        idle_values = target.pop("observed_idle_s")
-        target["median_observed_idle_s"] = (
+        idle_values = target.pop("time_since_last_store_s")
+        target["median_time_since_last_store_s"] = (
             round(statistics.median(idle_values), 3) if idle_values else None
         )
-        target["p95_observed_idle_s"] = percentile(idle_values, 0.95)
+        target["p95_time_since_last_store_s"] = percentile(idle_values, 0.95)
     physical = idle.get("observations")
     prompt_tokens = summary.get("prompt_tokens")
     return {
-        "physical_block_evictions": physical,
+        "eviction_histogram_observations": physical,
         "metrics_sample": summary.get("_kv_cache_metrics_sample"),
-        "physical_evictions_per_million_input": (
+        "eviction_histogram_observations_per_million_input": (
             physical / prompt_tokens * 1_000_000
             if isinstance(physical, (int, float))
             and isinstance(prompt_tokens, (int, float)) and prompt_tokens > 0
@@ -427,13 +428,14 @@ def _eviction_analysis(
         "preemptions": _metric_delta(window, "vllm:num_preemptions_total"),
         "clears_during_measurement": (events.get("event_types") or {}).get(
             "AllBlocksCleared", 0
-        ),
+        ) if "event_types" in events else None,
+        "collection_status": events.get("collection_status", "unconfirmed"),
         "event_buffer_truncated": bool(events.get("buffer_truncated")),
         "event_collection_error": events.get("collection_error"),
         "removals": len(removals),
         "matched_removals": sum(bool(row.get("matched_store")) for row in removals),
         "mapped_removals": sum(
-            bool(row.get("possible_request_prefixes")) for row in removals
+            bool(row.get("content_match_candidates")) for row in removals
         ),
         "ambiguous_removals": sum(
             bool(row.get("token_mapping_ambiguous")) for row in removals
@@ -444,10 +446,14 @@ def _eviction_analysis(
 
 def load_arms(sweep_dir: Path) -> list[dict[str, Any]]:
     """One row per arm, medians taken across its repetitions."""
+    from agent_io_tracing.serving.kv_report_data import read_json
+
     arms: list[dict[str, Any]] = []
     for arm_dir in sorted(p for p in sweep_dir.iterdir() if p.is_dir()):
         reps = []
         for rep_dir in sorted(arm_dir.glob("rep*")):
+            if read_json(rep_dir / "kv_report_metadata.json").get("exclude_from_comparison"):
+                continue
             path = rep_dir / "summary.json"
             if path.is_file():
                 reps.append(load_repetition_summary(path))
@@ -487,12 +493,12 @@ def load_arms(sweep_dir: Path) -> list[dict[str, Any]]:
                 "block_size": max(sizes, key=sizes.get) if sizes else "unknown",
                 "removed_hashes": med("removed_hashes", group_rows),
                 "matched_stores": med("matched_stores", group_rows),
-                "mapped_prefixes": med("mapped_prefixes", group_rows),
+                "content_candidate_matches": med("content_candidate_matches", group_rows),
                 "ambiguous_mappings": med("ambiguous_mappings", group_rows),
-                "median_observed_idle_s": med(
-                    "median_observed_idle_s", group_rows
+                "median_time_since_last_store_s": med(
+                    "median_time_since_last_store_s", group_rows
                 ),
-                "p95_observed_idle_s": med("p95_observed_idle_s", group_rows),
+                "p95_time_since_last_store_s": med("p95_time_since_last_store_s", group_rows),
             }
 
         request_observations: dict[str, list[dict[str, Any]]] = {}
@@ -530,6 +536,24 @@ def load_arms(sweep_dir: Path) -> list[dict[str, Any]]:
             (r.get("prefix_cache") or {}).get("hits") for r in reps
         ]
         hit_counts = [v for v in hit_counts if isinstance(v, (int, float))]
+        # A Prometheus window that counted noticeably more queries than this
+        # arm itself sent means another client shared the server during the
+        # window (e.g. arms replayed concurrently); its delta then measures
+        # the mixed traffic, not this arm.
+        window_shared = any(
+            isinstance((r.get("prefix_cache") or {}).get("queries"), (int, float))
+            and isinstance(r.get("prompt_tokens"), (int, float))
+            and r["prompt_tokens"] > 0
+            and (r.get("prefix_cache") or {}).get("queries")
+            > r["prompt_tokens"] * 1.02
+            for r in reps
+        )
+        per_request_rates = [
+            (r.get("per_request_cache") or {}).get("hit_rate") for r in reps
+        ]
+        per_request_rates = [
+            v for v in per_request_rates if isinstance(v, (int, float))
+        ]
         arms.append({
             "label": arm_dir.name,
             "recorded_at": reps[0].get("started_at_epoch_s") or 0.0,
@@ -553,6 +577,11 @@ def load_arms(sweep_dir: Path) -> list[dict[str, Any]]:
                 round(statistics.median(hit_rates), 4) if hit_rates else None
             ),
             "hit_rates": hit_rates,
+            "window_shared": window_shared,
+            "per_request_hit_rate": (
+                round(statistics.median(per_request_rates), 4)
+                if per_request_rates else None
+            ),
             "cache_queries": round(statistics.median(query_counts)) if query_counts else None,
             "cache_hits": round(statistics.median(hit_counts)) if hit_counts else None,
             "median_ttft_ms": med("median_ttft_ms"),
@@ -577,12 +606,12 @@ def load_arms(sweep_dir: Path) -> list[dict[str, Any]]:
             ),
             "kv_events": [r.get("kv_events") for r in reps],
             "eviction": {
-                "physical_block_evictions": eviction_med(
-                    "physical_block_evictions"
+                "eviction_histogram_observations": eviction_med(
+                    "eviction_histogram_observations"
                 ),
                 "metrics_sample": eviction_med("metrics_sample"),
-                "physical_evictions_per_million_input": eviction_med(
-                    "physical_evictions_per_million_input"
+                "eviction_histogram_observations_per_million_input": eviction_med(
+                    "eviction_histogram_observations_per_million_input"
                 ),
                 "removed_cached_hashes": eviction_med("removed_cached_hashes"),
                 "mean_idle_before_evict_s": eviction_med(
@@ -695,19 +724,6 @@ def _count(value: Any) -> str:
     return "n/a"
 
 
-def _histogram_estimate(
-    value: Any, lower: Any, upper: Any, suffix: str = "s"
-) -> str:
-    if not isinstance(value, (int, float)):
-        return "n/a"
-    estimate = f"≈{value:,.2f}{suffix}"
-    if isinstance(lower, (int, float)) and isinstance(upper, (int, float)):
-        return f"{estimate} ({lower:g}–{upper:g}{suffix} bucket)"
-    if isinstance(lower, (int, float)):
-        return f"{estimate} (≥{lower:g}{suffix} bucket)"
-    return estimate
-
-
 _AUTOMATIC_LABEL = re.compile(
     r"^block(?P<block>[^_]+)_dtype-(?P<dtype>[^_]+)_prefix-(?P<prefix>[^_]+)_"
     r"gpu(?P<gpu>[^_]+)_(?P<stamp>\d{8}T\d{6})(?P<utc>Z?)$"
@@ -799,7 +815,7 @@ def render(arms: list[dict[str, Any]]) -> list[str]:
     lines.append("")
     lines.append(
         f"{arms[0]['requests']} calls, "
-        f"{arms[0]['prompt_tokens']:,} total input tokens, "
+        f"{_count(arms[0].get('prompt_tokens'))} total input tokens, "
         f"{output_description}, "
         f"replayed in `{arms[0]['mode']}` mode from `{arms[0]['bundle']}`."
     )
@@ -814,8 +830,8 @@ def render(arms: list[dict[str, Any]]) -> list[str]:
             f"went {arm['hit_rates'][0]:.2%} → {arm['hit_rates'][-1]:.2%} "
             "across them, so the first pass loaded the prefixes the later ones "
             "read back. Every median on this row mixes a cold pass with a warm "
-            "one and describes neither; take the repetitions apart, or give "
-            "the server VLLM_SERVER_DEV_MODE=1 so each pass starts cold."
+            "one and describes neither. Use a distinct cache salt per repetition "
+            "and verify first-request cached tokens; reset alone does not establish a cold offload cache."
         )
     if any("cold_since_restart" in a["cache_state"] for a in arms):
         lines.append("")
@@ -840,360 +856,69 @@ def render(arms: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def _token_summary(arms: list[dict[str, Any]]) -> list[str]:
-    lines = [
-        "| arm | calls | total input | total output | cache queries | cache hits | realized reuse | repetitions |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for arm in arms:
-        rate = _num(arm.get("hit_rate"), "%", 100)
-        lines.append(
-            f"| {pretty_arm(arm)} | {arm['requests']} | {arm['prompt_tokens']:,} | "
-            f"{_count(arm.get('output_tokens'))} | "
-            f"{_count(arm.get('cache_queries'))} | {_count(arm.get('cache_hits'))} | "
-            f"{rate} | {arm['reps']} |"
-        )
-    return lines
-
-
-def _eviction_summary(arms: list[dict[str, Any]]) -> list[str]:
-    lines = [
-        "| arm | capacity | physical eviction observations | evictions / 1M input | removed cached hashes | mean idle before eviction | p95 idle before eviction | mean block lifetime | p95 block lifetime | preemptions | measurement coverage |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
-    ]
-    for arm in arms:
-        eviction = arm.get("eviction") or {}
-        config = arm.get("serving_config") or {}
-        removed = eviction.get("removed_cached_hashes")
-        matched = eviction.get("matched_removals")
-        mapped = eviction.get("mapped_removals")
-        if eviction.get("collection_errors"):
-            coverage = "collection error"
-        elif eviction.get("buffer_truncated"):
-            coverage = "buffer truncated"
-        elif isinstance(removed, (int, float)) and removed > 0:
-            match_pct = matched / removed if isinstance(matched, (int, float)) else 0
-            map_pct = mapped / removed if isinstance(mapped, (int, float)) else 0
-            coverage = f"{match_pct:.1%} store match; {map_pct:.1%} prefix mapped"
-        elif isinstance(removed, (int, float)):
-            coverage = "complete; no removals"
-        else:
-            coverage = "unmeasured"
-        sample = eviction.get("metrics_sample")
-        if isinstance(sample, (int, float)):
-            coverage = f"eviction sample {sample:.0%}; {coverage}"
-        clears = eviction.get("clears_during_measurement")
-        if isinstance(clears, (int, float)) and clears > 0:
-            coverage += f"; {_count(clears)} cache clear(s) in window"
-        lines.append("| " + " | ".join([
-            pretty_arm(arm),
-            _count(config.get("kv_cache_size_tokens")),
-            _count(eviction.get("physical_block_evictions")),
-            _num(eviction.get("physical_evictions_per_million_input")),
-            _count(removed),
-            _num(eviction.get("mean_idle_before_evict_s"), "s"),
-            _histogram_estimate(
-                eviction.get("p95_idle_before_evict_s"),
-                eviction.get("p95_idle_bucket_lower_s"),
-                eviction.get("p95_idle_bucket_upper_s"),
-            ),
-            _num(eviction.get("mean_block_lifetime_s"), "s"),
-            _histogram_estimate(
-                eviction.get("p95_block_lifetime_s"),
-                eviction.get("p95_lifetime_bucket_lower_s"),
-                eviction.get("p95_lifetime_bucket_upper_s"),
-            ),
-            _count(eviction.get("preemptions")),
-            coverage,
-        ]) + " |")
-    lines.extend([
-        "",
-        "Physical eviction observations come from vLLM's eviction histogram and equal the full count only when the configured sampling rate is 100%. Removed cached hashes come from `BlockRemoved`; the latter also includes hash replacement during partial-block promotion and is not itself a physical-eviction count. Histogram p95 values are interpolated estimates, so the containing bucket is shown beside each value.",
-    ])
-    return lines
-
-
-def _eviction_group_summary(arms: list[dict[str, Any]]) -> list[str]:
-    lines = [
-        "| arm | group | cache kind | block size | removed hashes | store matched | prefix mapped | ambiguous | median observed idle | p95 observed idle |",
-        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    found = False
-    for arm in arms:
-        groups = (arm.get("eviction") or {}).get("by_group") or {}
-        for group, row in sorted(groups.items()):
-            found = True
-            removed = row.get("removed_hashes")
-
-            def group_pct(key: str) -> str:
-                value = row.get(key)
-                if not isinstance(value, (int, float)) or not removed:
-                    return "n/a"
-                return f"{value / removed:.1%}"
-
-            lines.append("| " + " | ".join([
-                pretty_arm(arm),
-                group,
-                str(row.get("kind") or "unknown"),
-                str(row.get("block_size") or "unknown"),
-                _count(removed),
-                group_pct("matched_stores"),
-                group_pct("mapped_prefixes"),
-                group_pct("ambiguous_mappings"),
-                _num(row.get("median_observed_idle_s"), "s"),
-                _num(row.get("p95_observed_idle_s"), "s"),
-            ]) + " |")
-    return lines if found else ["KV removal events were not collected."]
-
-
-def _paired_request_impact(arms: list[dict[str, Any]]) -> list[str]:
-    if len(arms) < 2:
-        return []
-    baseline = arms[0]
-    baseline_requests = baseline.get("per_request") or {}
-    if not baseline_requests:
-        return []
-    lines = [
-        "| comparison | paired requests | gained cache | recovered cached tokens | lost cache | median TTFT delta among gained-cache requests | gained-cache requests faster | median TTFT delta with unchanged cache |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    found = False
-    for arm in arms[1:]:
-        current = arm.get("per_request") or {}
-        common = sorted(baseline_requests.keys() & current.keys())
-        if not common:
-            continue
-        found = True
-        gained = []
-        lost = []
-        unchanged = []
-        recovered_tokens = 0.0
-        for request_id in common:
-            old = baseline_requests[request_id]
-            new = current[request_id]
-            old_cache = old.get("cached_tokens")
-            new_cache = new.get("cached_tokens")
-            old_ttft = old.get("ttft_ms")
-            new_ttft = new.get("ttft_ms")
-            if not all(isinstance(value, (int, float)) for value in (
-                old_cache, new_cache, old_ttft, new_ttft
-            )):
-                continue
-            delta = new_ttft - old_ttft
-            if new_cache > old_cache:
-                gained.append(delta)
-                recovered_tokens += new_cache - old_cache
-            elif new_cache < old_cache:
-                lost.append(delta)
-            else:
-                unchanged.append(delta)
-        lines.append("| " + " | ".join([
-            f"{pretty_arm(baseline)} → {pretty_arm(arm)}",
-            _count(len(common)),
-            _count(len(gained)),
-            _count(recovered_tokens),
-            _count(len(lost)),
-            _num(statistics.median(gained) if gained else None, "ms"),
-            f"{sum(delta < 0 for delta in gained)}/{len(gained)}" if gained else "n/a",
-            _num(statistics.median(unchanged) if unchanged else None, "ms"),
-        ]) + " |")
-    return lines if found else []
-
-
-def _write_comparison_plot(sweep_dir: Path, arms: list[dict[str, Any]]) -> Path | None:
-    if not arms:
-        return None
+def _write_physical_capacity_plot(sweep_dir: Path, arms: list[dict[str, Any]]) -> Path | None:
+    """Show individual measured runs and medians without imputing missing traces."""
+    from agent_io_tracing.serving.kv_report_data import load_report_data, read_json
     import matplotlib.pyplot as plt
 
-    labels = [arm["label"] for arm in arms]
-    positions = list(range(len(labels)))
-    height = max(3.5, 0.7 * len(labels) + 1.5)
-    fig, axes = plt.subplots(1, 2, figsize=(14, height))
-    rates = [
-        arm["hit_rate"] * 100 if isinstance(arm.get("hit_rate"), (int, float)) else 0
-        for arm in arms
-    ]
-    ttft = [
-        arm["median_ttft_ms"] / 1000 if isinstance(arm.get("median_ttft_ms"), (int, float)) else 0
-        for arm in arms
-    ]
-    axes[0].barh(positions, rates, color="#4c78a8")
-    axes[0].set_xlabel("Realized reuse (%)")
-    axes[0].set_yticks(positions, labels=labels)
-    axes[0].invert_yaxis()
-    axes[1].barh(positions, ttft, color="#f58518")
-    axes[1].set_xlabel("Median TTFT (s)")
-    axes[1].set_yticks(positions, labels=[])
-    axes[1].invert_yaxis()
-    fig.suptitle(f"Fixed-input test: {sweep_dir.name}")
-    fig.tight_layout()
-    viz = sweep_dir / "visualizations"
-    viz.mkdir(parents=True, exist_ok=True)
-    path = viz / "sweep_comparison.png"
-    fig.savefig(path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    return path
-
-
-def _write_eviction_timeline(
-    sweep_dir: Path, arms: list[dict[str, Any]]
-) -> Path | None:
-    """Plot cached-hash removals over each measured replay window."""
-    if not any(arm.get("removal_rows") for arm in arms):
-        return None
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(12, 4.8))
-    plotted = False
-    durations = [
-        float(arm["wall_s"]) for arm in arms
-        if isinstance(arm.get("wall_s"), (int, float))
-    ]
-    max_duration = max(durations, default=1.0)
-    bin_width = EVICTION_TIMELINE_BIN_S
-    n_bins = max(1, int(max_duration / bin_width) + 1)
+    points = []
     for arm in arms:
-        removals = arm.get("removal_rows") or []
-        started = arm.get("started_at_epoch_s")
-        if not removals or not isinstance(started, (int, float)):
-            continue
-        counts = [0] * n_bins
-        for row in removals:
-            removed_at = row.get("removed_batch_ts")
-            if not isinstance(removed_at, (int, float)):
+        for summary in sorted((sweep_dir / arm['label']).glob('rep*/summary.json')):
+            rep = summary.parent
+            if read_json(rep / 'kv_report_metadata.json').get('exclude_from_comparison'):
                 continue
-            index = min(max(int((removed_at - started) / bin_width), 0), n_bins - 1)
-            counts[index] += 1
-        x = [(index + 0.5) * bin_width for index in range(n_bins)]
-        ax.plot(x, counts, marker="o", markersize=2.5, linewidth=1.4,
-                label=pretty_arm(arm))
-        plotted = True
-    if not plotted:
-        plt.close(fig)
-        return None
-    ax.set_xlabel("elapsed replay time (s)")
-    ax.set_ylabel(f"removed cached hashes per {bin_width:.1f}s")
-    ax.set_title("Cached-hash removal timeline")
-    ax.grid(True, alpha=0.25)
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    viz = sweep_dir / "visualizations"
-    viz.mkdir(parents=True, exist_ok=True)
-    path = viz / "eviction_timeline.png"
-    fig.savefig(path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    return path
-
-
-def _per_arm_sections(sweep_dir: Path, arms: list[dict[str, Any]]) -> list[str]:
-    lines: list[str] = []
-    for arm in arms:
-        lines.extend([f"### {pretty_arm(arm)}", ""])
-        lines.append(
-            f"- Bundle: `{arm['bundle']}` · mode: `{arm['mode']}` · "
-            f"cache: `{arm['cache_state']}` · repetitions: {arm['reps']}"
-        )
-        lines.extend(["", "**Server config**", ""])
-        lines.extend(["| key | value |", "| --- | --- |"])
-        for key, value in sorted(arm["serving_config"].items()):
-            if key == "kv_cache_size_tokens":
+            data = load_report_data(rep)
+            physical, causal = data.get('physical_trace'), data.get('causal_trace')
+            raw = read_json(summary)
+            config = raw.get('serving_config') or {}
+            offload = config.get('kv_offloading_size', 'unknown')
+            disabled = offload is None or str(offload).lower() in {'none', '0', '0.0'}
+            if not physical or not causal or not disabled:
                 continue
-            lines.append(f"| `{key}` | `{value}` |")
-        lines.extend(["", "**Artifacts**", ""])
-        for index in range(arm["reps"]):
-            base = f"{arm['label']}/rep{index}"
-            lines.append(
-                f"- repetition {index + 1}: [summary]({base}/summary.json) · "
-                f"[requests]({base}/requests.jsonl) · "
-                f"[metrics before]({base}/metrics_before.prom) · "
-                f"[metrics after]({base}/metrics_after.prom)"
-                f" · [metrics window]({base}/metrics_window.json)"
-                f" · [full server config]({base}/server_info.json)"
-            )
-            if index < len(arm.get("kv_events") or []) and arm["kv_events"][index]:
-                events = arm["kv_events"][index]
-                lines.append(
-                    f"  - KV events: {events.get('events', 0)} events · "
-                    f"{(events.get('block_hashes') or {}).get('stored', 0)} stored hashes · "
-                    f"{(events.get('block_hashes') or {}).get('removed', 0)} removed hashes · "
-                    f"[raw events]({base}/kv_events.jsonl) · "
-                    f"[removal ledger]({base}/kv_removals.jsonl)"
-                )
-        lines.extend(["", "---", ""])
-    return lines
-
-
-def _capacity_section(arms: list[dict[str, Any]]) -> list[str]:
-    """Show each distinct physical KV-cache capacity once per report."""
-    capacities = set()
-    for arm in arms:
-        raw = (arm.get("serving_config") or {}).get("kv_cache_size_tokens")
-        try:
-            capacities.add(int(raw))
-        except (TypeError, ValueError):
-            continue
-    if not capacities:
-        return []
-    lines = ["", "**KV-cache capacity used by these experiments**", ""]
-    lines.extend(f"- {capacity:,} tokens" for capacity in sorted(capacities))
-    return lines
+            requests = causal.get('request_paths') or []
+            if len(requests) != raw['requests'] or not all(r.get('token_accounting_matches_prompt') for r in requests):
+                continue
+            points.append({'run': str(rep.relative_to(sweep_dir)), 'gpu_blocks': int(config['num_gpu_blocks']), 'runtime_s': raw['wall_s'], 'completed_prefill_tokens': causal['completed_prefill_tokens'], 'physical_evictions': physical['physical_evictions']})
+    capacities = sorted({p['gpu_blocks'] for p in points})
+    if len(capacities) < 2:
+        return None
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    for ax, key, label in zip(axes, ['runtime_s', 'completed_prefill_tokens', 'physical_evictions'], ['Replay runtime (s)', 'Completed prompt computation (tokens)', 'Physical cached-content evictions']):
+        for capacity in capacities:
+            values = [p[key] for p in points if p['gpu_blocks'] == capacity]
+            ax.scatter([capacity] * len(values), values, facecolors='none', edgecolors='#007c78', s=55)
+            ax.plot(capacity, statistics.median(values), marker='_', color='#172c44', markersize=18, markeredgewidth=2)
+        ax.set_xticks(capacities, [f'{c}\nn={sum(p["gpu_blocks"] == c for p in points)}' for c in capacities])
+        ax.set_xlabel('Configured GPU blocks')
+        ax.set_ylabel(label)
+        ax.set_ylim(0, max(1, max(p[key] for p in points)) * 1.1)
+        ax.grid(alpha=.2)
+    fig.suptitle('CPU offload disabled · circles: individual runs · bars: medians')
+    fig.tight_layout()
+    directory = sweep_dir / 'visualizations'
+    directory.mkdir(exist_ok=True)
+    target = directory / 'physical_capacity.png'
+    fig.savefig(target, dpi=160, bbox_inches='tight')
+    plt.close(fig)
+    target.with_suffix('.json').write_text(json.dumps({'points': points, 'scope': 'Only saved physical traces with complete request token accounting. Prompt computation includes first computation and recomputation. Hardware provenance remains in the experiment receipts.'}, indent=2) + '\n')
+    return target
 
 
 def write_report(sweep_dir: Path, results_dir: Path | None = None) -> Path:
-    import markdown
-
-    arms = load_arms(sweep_dir)
-    if len(arms) < 2:
-        raise ValueError(
-            "a fixed-input comparison report requires at least two arms"
-        )
-    comparison_plot = _write_comparison_plot(sweep_dir, arms)
-    eviction_timeline = _write_eviction_timeline(sweep_dir, arms)
-    lines = [
-        f"# Fixed-input Test — {sweep_dir.name}",
-        "",
-        f"_Generated {_dt.date.today().isoformat()} · {len(arms)} arm(s) · fixed-input replay._",
-        "",
-        "## Summary — tokens",
-        "",
-    ]
-    lines.extend(_token_summary(arms))
-    lines.extend(_capacity_section(arms))
-    lines.extend(["", "## Summary — time and configuration", ""])
-    lines.extend(render(arms))
-    if comparison_plot is not None:
-        lines.extend(["", "![Realized reuse and TTFT by arm](visualizations/sweep_comparison.png)", ""])
-    lines.extend(["", "## Eviction pressure", ""])
-    lines.extend(_eviction_summary(arms))
-    lines.extend(["", "## Eviction by KV group", ""])
-    lines.extend(_eviction_group_summary(arms))
-    if eviction_timeline is not None:
-        lines.extend([
-            "",
-            "![Cached-hash removal timeline](visualizations/eviction_timeline.png)",
-            "",
-        ])
-    paired_impact = _paired_request_impact(arms)
-    if paired_impact:
-        lines.extend(["", "## Per-request capacity impact", ""])
-        lines.extend(paired_impact)
-    lines.extend(["", "## Per arm", ""])
-    lines.extend(_per_arm_sections(sweep_dir, arms))
-    if results_dir is not None:
-        index = results_dir.resolve() / "index.html"
-        lines.extend([f"[Back to experiments index]({os.path.relpath(index, sweep_dir.resolve())})", ""])
-    text = "\n".join(lines) + "\n"
-    body = markdown.markdown(text, extensions=["tables"])
-    html_text = (
-        '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        f"<title>Fixed-input Test — {sweep_dir.name}</title>\n<style>\n{PAGE_CSS}"
-        f"</style>\n</head>\n<body>\n{body}"
-        + "\n</body>\n</html>\n"
-    )
-    path = sweep_dir / "kvcache_report.html"
-    path.write_text(html_text, encoding="utf-8")
-    return path
+    """Refresh the owning task pages after a replay experiment."""
+    from agent_io_tracing.analysis.kvcache.catalog import Catalog, root_for
+    from agent_io_tracing.serving.kv_report_data import prepare_report_data
+    sources = sorted(sweep_dir.glob('*/rep*/summary.json'))
+    if not sources:
+        raise ValueError('a fixed-input report requires at least one run')
+    for source in sources:
+        prepare_report_data(source.parent.resolve())
+    root = results_dir.resolve().parent if results_dir else root_for(sweep_dir)
+    catalog = Catalog(root, sources=None if (root/'replay').is_dir() else sources)
+    from agent_io_tracing.analysis.kvcache.replay_report import publish_catalog
+    index = publish_catalog(catalog)
+    row = catalog.by_rep.get(sources[0].parent.resolve())
+    return catalog.page(row) if row else index
 
 
 def build_parser() -> argparse.ArgumentParser:

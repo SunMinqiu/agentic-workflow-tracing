@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# Pull one agentic run back from the client node, verify it, and open the
-# reports.  One KV report per task is always regenerated locally so its figures match
-# local code rather than whatever version the cluster had deployed.
+# Pull one run back from the client node, verify it, and open its reports.
+# Works for every trace script: GenoMAS, SciLink, 1000 Genomes, Montage.
 #
 # Usage, from the repo root with cloudlab_env.sh already sourced:
-#   bash scripts/pull_agentic_run.sh logs/genomas_A_c2_w1_20260806_101500.log
-#   bash scripts/pull_agentic_run.sh /mnt/lustrefs/.../results/GenoMAS_A_c2_w1_20260806_101500
+#   bash scripts/pull_run.sh logs/genomas_A_c2_w1_20260806_101500.log
+#   bash scripts/pull_run.sh /mnt/lustrefs/.../results/GenoMAS_A_c2_w1_20260806_101500
 #
 # The first form reads "Output dir:" out of $HOME/<log> on the client node.
-# The second form takes the remote run directory directly, for runs that were
-# not tee'd into a log.
+# The second form is what every trace script prints as its last line.
 
 set -uo pipefail
 
@@ -18,7 +16,7 @@ cd "$ROOT_DIR"
 
 arg="${1:-}"
 if [ -z "$arg" ]; then
-    echo "Usage: bash scripts/pull_agentic_run.sh <remote_log|remote_run_dir>" >&2
+    echo "Usage: bash scripts/pull_run.sh <remote_log|remote_run_dir>" >&2
     exit 2
 fi
 if [ -z "${SSH_USER:-}" ] || [ -z "${CLIENT_NODE:-}" ]; then
@@ -59,13 +57,39 @@ rsync -az --progress --checksum --partial --max-size="$PARSED_MAX_SIZE" \
     --include '*/' --include 'parsed.json' --exclude '*' \
     "$SSH_USER@$CLIENT_NODE:$remote_run/" "$local_out/"
 
-echo "Regenerating the KV report locally so figures match local code."
-PYTHONPATH=src python -m agent_io_tracing.analysis.kvcache.report \
-    --results "$local_out" --runs . --dump-prefixes || exit 1
+# manifest.json names the workload.  GenoMAS and SciLink are agentic: they carry
+# LLM call records and a KV-cache report.  1000 Genomes and Montage do not.
+workload=$(python3 - "$local_out" <<'PY'
+import json, sys
+from pathlib import Path
+for m in sorted(Path(sys.argv[1]).glob("*/manifest.json")):
+    print(json.loads(m.read_text()).get("workload", "")); break
+PY
+)
+case "$workload" in
+    GenoMAS|SciLink) agentic=1 ;;
+    *) agentic=0 ;;
+esac
+
+if [ "$agentic" -eq 1 ]; then
+    echo "Regenerating the KV report locally so figures match local code."
+    PYTHONPATH=src python -m agent_io_tracing.analysis.kvcache.report \
+        --results "$local_out" --runs . --dump-prefixes || exit 1
+fi
 
 echo "Rebuilding the results index over every local task."
-PYTHONPATH=src python -m agent_io_tracing.analysis.results_index \
-    --results results || exit 1
+PYTHONPATH=src python tools/build_kvcache_config_summary.py || exit 1
+
+required_common="ebpf_events.log manifest.json phase1_metrics.json
+    parallelism_summary.json trace_quality.json
+    lineage/artifacts.csv lineage/execution_unit_io.csv
+    visualizations/index.html"
+required_agentic="pi_events.jsonl tool_calls.log messages.jsonl
+    kvcache_demand.json kvcache_logical.json kvcache_report.md kvcache_report.html
+    visualizations/file_access_volume.png visualizations/rw_asymmetry.png
+    visualizations/request_size_rw_cdf.png visualizations/byte_normalized_summary.png"
+required="$required_common"
+[ "$agentic" -eq 1 ] && required="$required $required_agentic"
 
 failed=0
 cells=0
@@ -86,17 +110,9 @@ for cell in "$local_out"/*; do
              "Regenerate it from ebpf_events.log, or rsync that one file by hand."
     fi
 
-    for required in \
-        ebpf_events.log manifest.json pi_events.jsonl tool_calls.log \
-        messages.jsonl kvcache_demand.json kvcache_logical.json \
-        kvcache_report.md kvcache_report.html \
-        phase1_metrics.json parallelism_summary.json trace_quality.json \
-        lineage/artifacts.csv lineage/execution_unit_io.csv \
-        visualizations/file_access_volume.png visualizations/rw_asymmetry.png \
-        visualizations/request_size_rw_cdf.png \
-        visualizations/byte_normalized_summary.png visualizations/index.html; do
-        if [ ! -s "$cell/$required" ]; then
-            echo "ERROR: missing or empty: $cell/$required" >&2
+    for rel in $required; do
+        if [ ! -s "$cell/$rel" ]; then
+            echo "ERROR: missing or empty: $cell/$rel" >&2
             failed=1
         fi
     done
@@ -113,8 +129,9 @@ fi
 
 [ "$cells" -gt 0 ] || failed=1
 if [ "$failed" -eq 0 ]; then
+    echo "verified: $cells cells in $local_out"
     open "$local_out"/*/visualizations/index.html
-    open "$local_out"/*/kvcache_report.html
+    [ "$agentic" -eq 1 ] && open "$local_out"/*/kvcache_report.html
     open results/index.html
 else
     echo "Result pull failed integrity checks; not opening incomplete output." >&2

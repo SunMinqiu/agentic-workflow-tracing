@@ -291,7 +291,7 @@ run_kvcache_report() {
         echo "Skipping KV-cache report because no messages.jsonl was captured."
         return 0
     fi
-    echo "Generating run-level KV-cache report..."
+    echo "Generating task KV-cache reports..."
     "$python" -m agent_io_tracing.analysis.kvcache.report \
         --results "$run_root" --runs . --dump-prefixes >"$log_path" 2>&1
 }
@@ -311,6 +311,15 @@ run_postprocess_module() {
         failed_step="${failed_step:+$failed_step,}$step"
     fi
     return "$rc"
+}
+
+# The last two lines of every trace script. pull_run.sh reads "Results in:";
+# the "Pull to Mac:" line is pasted verbatim into a Mac terminal.
+announce_results() {
+    local base_out="$1"
+    echo ""
+    echo "Results in: $base_out"
+    echo "Pull to Mac: source cloudlab_env.sh; bash scripts/pull_run.sh $base_out"
 }
 
 return_results_ownership() {

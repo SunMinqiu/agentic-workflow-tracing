@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Print one cell's quality verdict in plain language; exit 1 if unusable.
 
-pull_agentic_run.sh calls this before its file-existence loop so a degraded
+pull_run.sh calls this before its file-existence loop so a degraded
 cell says *why* it is degraded.  Missing figures are usually a symptom -- an
 agent that could not reach its model makes no tool calls, and the visualizer
 then declines to draw the comparison figures -- and reporting the symptom

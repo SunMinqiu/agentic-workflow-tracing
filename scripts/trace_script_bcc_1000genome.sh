@@ -96,7 +96,7 @@ validate_workload_selection "${WORKLOADS[@]}"
 
 echo "=== Classic 1000genome FS tracer ==="
 echo "Repo:          $WORKFLOW_REPO"
-echo "Output:        $BASE_OUT"
+echo "Output dir: $BASE_OUT"
 echo "Task workers:  $MAX_WORKERS"
 echo "Chunk jobs:    $INDIVIDUAL_JOBS per chromosome"
 echo "Populations:   $POPULATIONS"
@@ -345,5 +345,5 @@ for ws_out in "$BASE_OUT"/*/; do
 done
 
 return_results_ownership "$BASE_OUT"
-echo "Results: $BASE_OUT"
+announce_results "$BASE_OUT"
 [ "$RUN_FAIL_COUNT" -eq 0 ] && [ "$POST_FAIL_COUNT" -eq 0 ]

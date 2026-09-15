@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One page listing every task under results/, with a link to each report.
+"""Full experiment metrics archive with links to each task report.
 
 The two tables are the same ones that open every per-task report — see
 kvcache/summary.py — so a number here and the number on the task's own page
@@ -28,12 +28,12 @@ import markdown
 from agent_io_tracing.analysis.kvcache.summary import (
     PAGE_CSS, token_table, time_table,
 )
-from agent_io_tracing.replay.sweep import load_repetition_summary, pretty_arm
+from agent_io_tracing.replay.sweep import pretty_arm
+from agent_io_tracing.analysis.kvcache.catalog import Catalog, COLORS, LEGEND
 
-INDEX_HTML = "index.html"
+INDEX_HTML = "all-experiments.html"
 IO_REPORT = "visualizations/index.html"
 KV_REPORT = "kvcache_report.html"
-SWEEP_REPORT = "kvcache_report.html"
 
 # Run directories are named <Workflow>_<task>_<timestamp> by run_dir_name.
 RUN_NAME = re.compile(r"^(?P<workflow>[A-Za-z0-9]+)_.*?(?P<stamp>\d{8}_\d{6})$")
@@ -61,6 +61,7 @@ def task_row(cell: Path, results_dir: Path) -> dict[str, Any]:
         "workflow": match.group("workflow") if match else "other",
         "stamp": match.group("stamp") if match else "",
         "rel": cell.relative_to(results_dir).as_posix(),
+        "available_reports": [name for name in (IO_REPORT, KV_REPORT) if (cell / name).is_file()],
         "n_calls": demand.get("n_token_calls") or logical.get("n_calls") or "?",
         "total_input": demand.get("total_input_tokens", 0),
         "median_input": (demand.get("input_tokens") or {}).get("median", 0),
@@ -96,77 +97,38 @@ def discover_tasks(results_dir: Path) -> list[dict[str, Any]]:
     return [task_row(c, results_dir) for c in cells]
 
 
-def _source_case(summary: dict[str, Any]) -> tuple[str, str]:
-    """The bundle's source cell, formatted exactly like a task index row."""
-    bundle_path = Path(str(summary.get("bundle") or ""))
-    bundle = _load(bundle_path)
-    source = Path(str(bundle.get("source_cell") or ""))
-    parts = source.parts
-    try:
-        results_index = len(parts) - 1 - parts[::-1].index("results")
-        run = parts[results_index + 1]
-        cell = parts[results_index + 2]
-    except (ValueError, IndexError):
-        return bundle_path.stem or "unknown source", ""
-    match = RUN_NAME.match(run)
-    stamp = match.group("stamp") if match else ""
-    return f"{cell} · {_pretty_stamp(stamp)}", stamp
-
-
-def discover_sweep_arms(results_dir: Path) -> list[dict[str, Any]]:
-    """Find replay sweep arms and read their saved summaries."""
-    replay_dir = results_dir.parent / "replay"
-    if not replay_dir.is_dir():
-        return []
-    rows: list[dict[str, Any]] = []
-    for report in sorted(replay_dir.rglob(SWEEP_REPORT)):
-        sweep_dir = report.parent
-        for arm_dir in sorted(
-            path for path in sweep_dir.iterdir()
-            if path.is_dir() and not path.is_symlink()
-        ):
-            reps = [
-                load_repetition_summary(path)
-                for path in sorted(arm_dir.glob("rep*/summary.json"))
-            ]
-            reps = [row for row in reps if row]
-            if not reps:
-                continue
-
-            def median(key: str) -> float | None:
-                values = [row.get(key) for row in reps]
-                numbers = [value for value in values if isinstance(value, (int, float))]
-                return statistics.median(numbers) if numbers else None
-
-            hit_rates = [
-                (row.get("prefix_cache") or {}).get("hit_rate") for row in reps
-            ]
-            hit_rates = [value for value in hit_rates if isinstance(value, (int, float))]
-            first = reps[0]
-            source_case, source_stamp = _source_case(first)
-            rows.append({
-                "case": source_case,
-                "case_stamp": source_stamp,
-                "sweep": sweep_dir.relative_to(replay_dir).as_posix(),
-                "arm": arm_dir.name,
-                "report": os.path.relpath(report, results_dir),
-                "reps": len(reps),
-                "bundle": Path(str(first.get("bundle") or "")).name,
-                "mode": first.get("mode"),
-                "cache_state": ",".join(sorted({str(row.get("cache_state")) for row in reps})),
-                "requests": first.get("requests"),
-                "prompt_tokens": first.get("prompt_tokens"),
-                "output_tokens": median("output_tokens"),
-                "hit_rate": statistics.median(hit_rates) if hit_rates else None,
-                "median_ttft_ms": median("median_ttft_ms"),
-                "p95_ttft_ms": median("p95_ttft_ms"),
-                "median_tpot_ms": median("median_tpot_ms"),
-                "median_total_ms": median("median_total_ms"),
-                "wall_s": median("wall_s"),
-                "recorded_at": first.get("started_at_epoch_s") or 0,
-            })
-    rows = sorted(rows, key=lambda row: row["recorded_at"])
-    return sorted(rows, key=lambda row: row["case_stamp"], reverse=True)
+def discover_sweep_arms(results_dir: Path, catalog: Catalog | None = None) -> list[dict[str, Any]]:
+    """Discover replay data and link every configuration to its source task."""
+    catalog = catalog or Catalog(results_dir.parent)
+    groups = {}
+    for row in catalog.records:
+        groups.setdefault((row['rep'].parent, row['source']), []).append(row)
+    rows = []
+    for (arm, source), records in groups.items():
+        valid = [r for r in records if not r['review'].get('exclude_from_comparison')]
+        first = records[0]
+        def median(key):
+            values = [r.get(key) for r in valid if isinstance(r.get(key), (int, float))]
+            return statistics.median(values) if values else None
+        rates = [r['measurement']['rate'] for r in valid if r['measurement']['rate'] is not None]
+        sources = {r['measurement']['source'] for r in valid}
+        stamp_match = RUN_NAME.match(source.parent.name) if source else None
+        stamp = stamp_match.group('stamp') if stamp_match else ''
+        rows.append({
+            'case': f'{source.name} · {_pretty_stamp(stamp)}' if source else first['source_kind'],
+            'case_stamp': stamp, 'sweep': os.path.relpath(arm.parent, catalog.root/'replay'),
+            'arm': arm.name, 'configuration_anchor': first['arm_id'],
+            'report': os.path.relpath(catalog.page(first), results_dir),
+            'block_returns_highlight': any(catalog.blue(r) for r in records),
+            'reps': len(valid), 'recorded_reps': len(records), 'requests': first.get('requests'),
+            'prompt_tokens': first.get('prompt_tokens'), 'output_tokens': median('output_tokens'),
+            'hit_rate': statistics.median(rates) if rates and len(sources)==1 else None,
+            'window_shared': False, 'median_ttft_ms': median('median_ttft_ms'),
+            'p95_ttft_ms': median('p95_ttft_ms'), 'median_tpot_ms': median('median_tpot_ms'),
+            'median_total_ms': median('median_total_ms'), 'wall_s': median('wall_s'),
+            'recorded_at': first.get('started_at_epoch_s') or 0,
+        })
+    return sorted(rows, key=lambda row: (row['case_stamp'], row['sweep'], row['recorded_at']), reverse=True)
 
 
 def group_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -196,7 +158,7 @@ def _lead_cells(r: dict[str, Any]) -> list[str]:
         return ["_no runs yet_", ""]
     return [
         f"{r['cell']} · {_pretty_stamp(r['stamp'])}",
-        f"[IO]({r['rel']}/{IO_REPORT}) · [KV]({r['rel']}/{KV_REPORT})",
+        " · ".join(f"[{label}]({r['rel']}/{name})" for name, label in [(IO_REPORT, "IO"), (KV_REPORT, "KV")] if name in r.get("available_reports", [])) or "Reports not generated",
     ]
 
 
@@ -223,10 +185,12 @@ def _sweep_table(rows: list[dict[str, Any]]) -> list[str]:
         if row["sweep"] != current_sweep:
             current_sweep = row["sweep"]
             lines.append(
-                f"| **{test_name}** | [open comparison]({row['report']}) |"
+                f"| **{test_name}** | [Task KVCache experiments]({row['report']}#replay-experiments) |"
                 + " |" * 9
             )
         hit = f"{row['hit_rate']:.2%}" if isinstance(row.get("hit_rate"), (int, float)) else "n/a"
+        if row.get("window_shared") and hit != "n/a":
+            hit += " †"
         ttft = f"{row['median_ttft_ms'] / 1000:,.2f}s" if isinstance(row.get("median_ttft_ms"), (int, float)) else "n/a"
         p95_ttft = f"{row['p95_ttft_ms'] / 1000:,.2f}s" if isinstance(row.get("p95_ttft_ms"), (int, float)) else "n/a"
         tpot = f"{row['median_tpot_ms']:,.2f}ms/token" if isinstance(row.get("median_tpot_ms"), (int, float)) else "n/a"
@@ -235,10 +199,20 @@ def _sweep_table(rows: list[dict[str, Any]]) -> list[str]:
         prompt = f"{int(row['prompt_tokens']):,}" if isinstance(row.get("prompt_tokens"), (int, float)) else "n/a"
         output = f"{int(row['output_tokens']):,}" if isinstance(row.get("output_tokens"), (int, float)) else "n/a"
         arm = pretty_arm({"label": row["arm"], "recorded_at": row["recorded_at"]})
+        detail = f"[Configuration and {row['reps']} valid run(s)]({row['report']}#{row['configuration_anchor']})"
+        if row.get("block_returns_highlight"):
+            arm = '<span class="kv-swap">' + arm + '</span>'
         lines.append(
-            f"| {arm} |  | {row['requests']} | {prompt} | "
+            f"| {arm} | {detail} | {row['requests']} | {prompt} | "
             f"{output} | {hit} | {ttft} | {p95_ttft} | "
             f"{tpot} | {total} | {wall} |"
+        )
+    if any(row.get("window_shared") for row in rows):
+        lines.append("")
+        lines.append(
+            "† arms replayed concurrently share one Prometheus window, so "
+            "their realized reuse is the per-request cached_tokens sum; the "
+            "window delta is not attributable to a single arm."
         )
     return lines
 
@@ -255,6 +229,7 @@ def build_index(
         f"generated {_dt.date.today().isoformat()}._"
     )
     L.append("")
+    L.append(LEGEND)
     L.append("## Fixed-input tests")
     L.append("")
     if sweep_rows:
@@ -273,19 +248,24 @@ def build_index(
     return "\n".join(L)
 
 
-def write_results_index(results_dir: Path) -> Path:
+def write_results_index(results_dir: Path, catalog: Catalog | None = None) -> Path:
     rows = discover_tasks(results_dir)
-    text = build_index(rows, discover_sweep_arms(results_dir))
+    text = build_index(rows, discover_sweep_arms(results_dir, catalog))
     body = markdown.markdown(text, extensions=["tables"])
     out = results_dir / INDEX_HTML
     out.write_text(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n"
         "<meta charset=\"utf-8\">\n"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-        "<title>Experiments</title>\n<style>\n" + PAGE_CSS + "</style>\n"
+        "<title>Experiments</title>\n<style>\n" + PAGE_CSS + COLORS + "</style>\n"
         "</head>\n<body>\n" + body + "\n</body>\n</html>\n",
         encoding="utf-8",
     )
+    catalog = catalog or Catalog(results_dir.parent)
+    from agent_io_tracing.analysis.kvcache.replay_report import render_replays, CSS
+    if catalog.task_records(None):
+        content = out.read_text().replace('</style>', CSS + '</style>')
+        out.write_text(content.replace('</body>', render_replays(catalog, None, results_dir) + '</body>'))
     return out
 
 

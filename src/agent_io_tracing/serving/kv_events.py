@@ -87,12 +87,13 @@ def _dependencies() -> tuple[Any, Any, type, Any]:
 
 def _event_rows(msgspec: Any, sequence: int, batch: Any) -> list[dict[str, Any]]:
     rows = []
-    for event in batch.events:
+    for event_index, event in enumerate(batch.events):
         payload = msgspec.to_builtins(event)
         if not isinstance(payload, dict):
             payload = {"payload": payload}
         rows.append({
             "sequence": sequence,
+            "event_index": event_index,
             "batch_ts": batch.ts,
             "data_parallel_rank": getattr(batch, "data_parallel_rank", None),
             "event_type": type(event).__name__,
@@ -106,6 +107,8 @@ def fetch_replay(
     *,
     start_sequence: int = 0,
     timeout_ms: int = 5000,
+    on_batch: Any = None,
+    barrier_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Fetch the publisher's buffered event batches from a replay endpoint."""
     zmq, msgspec, _, decoder = _dependencies()
@@ -115,7 +118,9 @@ def fetch_replay(
     socket.connect(endpoint)
     # ROUTER expects [identity, empty delimiter, start sequence]. DEALER owns
     # the identity frame, so the client supplies the remaining two frames.
-    socket.send_multipart((b"", start_sequence.to_bytes(8, "big")))
+    request_payload = json.dumps({"start_sequence": start_sequence, "barrier_id": barrier_id}).encode() if barrier_id else start_sequence.to_bytes(8, "big")
+    socket.send_multipart((b"", request_payload))
+    barrier_ack = None
     rows: list[dict[str, Any]] = []
     sequences: list[int] = []
     try:
@@ -124,11 +129,21 @@ def fetch_replay(
             if len(frames) != 4 or frames[0] != b"":
                 raise RuntimeError(f"unexpected KV replay frame count: {len(frames)}")
             _, _, sequence_bytes, payload = frames
-            if not payload:
+            if sequence_bytes == b"\xff" * 8:
+                barrier_ack = json.loads(payload) if payload else None
                 break
+            if not payload:
+                raise RuntimeError("Unexpected empty replay batch")
             sequence = int.from_bytes(sequence_bytes, "big")
             sequences.append(sequence)
-            rows.extend(_event_rows(msgspec, sequence, decoder.decode(payload)))
+            batch = decoder.decode(payload)
+            batch_rows = _event_rows(msgspec, sequence, batch)
+            if on_batch is not None:
+                on_batch({"sequence": sequence, "batch_ts": batch.ts,
+                          "data_parallel_rank": getattr(batch, "data_parallel_rank", None),
+                          "received_at_epoch_s": time.time(), "events": batch_rows})
+            else:
+                rows.extend(batch_rows)
         else:
             raise RuntimeError(f"KV replay endpoint {endpoint} timed out")
     finally:
@@ -143,6 +158,8 @@ def fetch_replay(
         "buffer_truncated": first is not None and first > start_sequence,
         "batches": len(set(sequences)),
         "events": len(rows),
+        "reply_complete": True,
+        "barrier_ack": barrier_ack,
     }
 
 
@@ -153,17 +170,11 @@ def summarize_events(
     ended_at: float | None = None,
 ) -> dict[str, Any]:
     """Count block events, optionally restricted to a replay time window."""
-    selected = [
-        row for row in rows
-        if (started_at is None or float(row.get("batch_ts", 0)) >= started_at)
-        and (ended_at is None or float(row.get("batch_ts", 0)) <= ended_at)
-    ]
-    # reset_prefix_cache publishes asynchronously. Its clear event can share
-    # the first request's batch timestamp even though the reset completed
-    # before measurement started. Leading clears define the empty initial
-    # state; only a clear after measurement events is contamination.
-    while selected and selected[0].get("event_type") == "AllBlocksCleared":
-        selected.pop(0)
+    selected = [row for row in rows if row.get("event_type") not in {"ObservationGap", "EmptyBatch"}
+                and event_in_window(row, started_at, ended_at)]
+    if not any("phase" in row for row in rows):
+        while selected and selected[0].get("event_type") == "AllBlocksCleared":
+            selected.pop(0)
     kinds: dict[str, int] = {}
     groups: dict[str, dict[str, int]] = {}
     hashes = {"stored": 0, "removed": 0}
@@ -192,22 +203,49 @@ def _hash_key(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _prompt_candidates(
+def event_medium(row: dict[str, Any]) -> str:
+    """Keep unspecified storage media unknown in every analysis."""
+    value = row.get("medium")
+    return str(value).upper() if value else "unknown"
+
+
+def event_scope(row: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(_hash_key(row.get(field)) for field in (
+        "publisher_id", "publisher_epoch", "data_parallel_rank",
+    ))
+
+
+def event_in_window(row: dict[str, Any], started_at: float | None, ended_at: float | None) -> bool:
+    if "phase" in row:
+        return row["phase"] == "measurement"
+    ts = float(row.get("batch_ts", 0) or 0)
+    return (started_at is None or ts >= started_at) and (ended_at is None or ts <= ended_at)
+
+
+def block_identity(row: dict[str, Any], block_hash: Any) -> tuple[str, ...]:
+    """Identify content within one publisher epoch, rank, group and locality."""
+    return event_scope(row) + tuple(_hash_key(row.get(field)) for field in (
+        "group_idx", "locality",
+    )) + (_hash_key(block_hash),)
+
+
+def _content_candidates(
     token_ids: list[int],
-    requests: list[dict[str, Any]],
+    requests: list[tuple[Any, str]],
 ) -> list[dict[str, Any]]:
+    """Find exact token subsequences, including overlapping occurrences."""
     if not token_ids:
         return []
+    pattern = "," + ",".join(map(str, token_ids)) + ","
     candidates = []
-    width = len(token_ids)
-    for request in requests:
-        prompt = request.get("prompt_token_ids") or []
-        for offset in range(0, len(prompt) - width + 1):
-            if prompt[offset] == token_ids[0] and prompt[offset:offset + width] == token_ids:
-                candidates.append({
-                    "request_id": request.get("request_id"),
-                    "token_offset": offset,
-                })
+    for request_id, prompt in requests:
+        cursor = 0
+        while (position := prompt.find(pattern, cursor)) >= 0:
+            candidates.append({
+                "request_id": request_id,
+                "token_offset": prompt.count(",", 0, position),
+            })
+            cursor = position + 1
     return candidates
 
 
@@ -218,15 +256,26 @@ def derive_removals(
     started_at: float | None = None,
     ended_at: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Join in-window removals to stores and possible bundle prefixes."""
-    resident: dict[tuple[str, str], dict[str, Any]] = {}
+    """Join in-window removals to stores and token-content candidates."""
+    resident: dict[tuple[str, ...], dict[str, Any]] = {}
     removals = []
-    request_rows = requests or []
+    request_index = [(request.get("request_id"), "," + ",".join(map(str, request.get("prompt_token_ids") or [])) + ",") for request in requests or []]
+    candidate_cache: dict[tuple[int, ...], list[dict[str, Any]]] = {}
+    last_sequences = {}
     for row in rows:
         kind = row.get("event_type")
-        group = str(row.get("group_idx"))
+        stream = event_scope(row)[:2]
+        sequence = row.get("sequence")
+        previous = last_sequences.get(stream)
+        if kind == "ObservationGap" or isinstance(sequence, int) and previous is not None and sequence > previous + 1:
+            resident = {key: value for key, value in resident.items() if key[:2] != stream}
+        if isinstance(sequence, int):
+            last_sequences[stream] = sequence
+        if kind == "ObservationGap":
+            continue
         if kind == "AllBlocksCleared":
-            resident.clear()
+            scope = event_scope(row)
+            resident = {key: value for key, value in resident.items() if key[:3] != scope}
             continue
         if kind == "BlockStored":
             hashes = row.get("block_hashes") or []
@@ -245,8 +294,11 @@ def derive_removals(
                     tokens[index * block_size:(index + 1) * block_size]
                     if not ambiguous else []
                 )
-                key = (group, _hash_key(block_hash))
+                key = block_identity(row, block_hash) + (event_medium(row),)
                 previous = resident.get(key)
+                token_key = tuple(block_tokens)
+                if token_key not in candidate_cache:
+                    candidate_cache[token_key] = _content_candidates(block_tokens, request_index)
                 resident[key] = {
                     "stored_sequence": (
                         previous or {}
@@ -263,9 +315,7 @@ def derive_removals(
                     "block_size": block_size,
                     "token_ids": block_tokens,
                     "token_mapping_ambiguous": ambiguous,
-                    "possible_request_prefixes": _prompt_candidates(
-                        block_tokens, request_rows
-                    ),
+                    "content_match_candidates": candidate_cache[token_key],
                     "kv_cache_spec_kind": row.get("kv_cache_spec_kind"),
                     "kv_cache_spec_sliding_window": row.get(
                         "kv_cache_spec_sliding_window"
@@ -275,28 +325,30 @@ def derive_removals(
         if kind != "BlockRemoved":
             continue
         removed_at = float(row.get("batch_ts", 0) or 0)
-        in_window = (
-            (started_at is None or removed_at >= started_at)
-            and (ended_at is None or removed_at <= ended_at)
-        )
+        in_window = event_in_window(row, started_at, ended_at)
         for block_hash in row.get("block_hashes") or []:
-            stored = resident.pop((group, _hash_key(block_hash)), None)
+            key = block_identity(row, block_hash) + (event_medium(row),)
+            stored = resident.pop(key, None)
             if not in_window:
                 continue
             first_stored_at = (stored or {}).get("stored_batch_ts")
             last_stored_at = (stored or {}).get("last_stored_batch_ts")
             removals.append({
+                "publisher_id": row.get("publisher_id"),
+                "publisher_epoch": row.get("publisher_epoch"),
                 "removed_sequence": row.get("sequence"),
                 "removed_batch_ts": row.get("batch_ts"),
                 "group_idx": row.get("group_idx"),
-                "medium": row.get("medium"),
+                "data_parallel_rank": row.get("data_parallel_rank"),
+                "locality": row.get("locality"),
+                "medium": event_medium(row),
                 "block_hash": block_hash,
                 "matched_store": stored is not None,
                 "observed_residence_s": (
                     round(removed_at - float(first_stored_at), 6)
                     if first_stored_at is not None else None
                 ),
-                "observed_idle_s": (
+                "time_since_last_store_s": (
                     round(removed_at - float(last_stored_at), 6)
                     if last_stored_at is not None else None
                 ),

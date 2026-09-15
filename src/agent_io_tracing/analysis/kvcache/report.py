@@ -250,6 +250,7 @@ def build_report(
     results_dir: Path,
     *,
     cells_root: Path | None = None,
+    include_replays: bool = True,
 ) -> Path:
     rows = sorted(rows, key=lambda r: r.get("total_input", 0), reverse=True)
     artifact_root = cells_root or run_dir
@@ -493,6 +494,11 @@ def build_report(
 """,
         encoding="utf-8",
     )
+    if include_replays:
+        from agent_io_tracing.analysis.kvcache.catalog import Catalog, root_for
+        from agent_io_tracing.analysis.kvcache.replay_report import integrate_page
+        catalog = Catalog(root_for(run_dir))
+        html_out.write_text(integrate_page(html_out.read_text(), catalog, run_dir.resolve()), encoding="utf-8")
     return out
 
 

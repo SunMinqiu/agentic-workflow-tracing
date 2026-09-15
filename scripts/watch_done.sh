@@ -15,8 +15,8 @@ set -uo pipefail
 
 WHICH="${1:-genomas}"
 case "$WHICH" in
-    genomas) LOG='~/genomas_run.log'; PROC="trace_script_bcc_genomas"; DONE="matrix run complete" ;;
-    scilink) LOG='~/scilink_run.log'; PROC="trace_script_bcc_scilink"; DONE="All done. Results in" ;;
+    genomas) LOG='~/genomas_run.log'; PROC="trace_script_bcc_genomas"; DONE="Results in:" ;;
+    scilink) LOG='~/scilink_run.log'; PROC="trace_script_bcc_scilink"; DONE="Results in:" ;;
     *) echo "usage: watch_done.sh {genomas|scilink}" >&2; exit 2 ;;
 esac
 

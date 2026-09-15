@@ -18,6 +18,23 @@ vllm:prefix_cache_hits_total{model_name="m"} %d.0
 """
 
 
+def test_physical_capacity_plot_handles_disabled_offload_without_imputing_missing(tmp_path, monkeypatch):
+    from agent_io_tracing.serving import kv_report_data
+    arms = []
+    for capacity, offload in [(192, 'None'), (274, None), (548, None)]:
+        label = f'gpu{capacity}'
+        arms.append({'label': label})
+        rep = tmp_path / label / 'rep0'
+        rep.mkdir(parents=True)
+        (rep / 'summary.json').write_text(json.dumps({'requests': 1, 'wall_s': 2, 'serving_config': {'num_gpu_blocks': str(capacity), 'kv_offloading_size': offload}}))
+    measured = {'physical_trace': {'physical_evictions': 0}, 'causal_trace': {'request_paths': [{'token_accounting_matches_prompt': True}], 'completed_prefill_tokens': 10}}
+    monkeypatch.setattr(kv_report_data, 'load_report_data', lambda rep: {} if rep.parent.name == 'gpu548' else measured)
+    image = sweep._write_physical_capacity_plot(tmp_path, arms)
+    points = json.loads(image.with_suffix('.json').read_text())['points']
+    assert [p['gpu_blocks'] for p in points] == [192, 274]
+    assert all(p['physical_evictions'] == 0 for p in points)
+
+
 class FakeEndpoint:
     """Serves one scrape before the replay and one after."""
 
@@ -329,7 +346,7 @@ vllm:num_preemptions_total 0
 """, encoding="utf-8")
     events = [
         {"sequence": 0, "batch_ts": 11.0, "event_type": "AllBlocksCleared"},
-        {"sequence": 0, "batch_ts": 11.0, "event_type": "BlockStored",
+        {"sequence": 0, "batch_ts": 11.0, "event_type": "BlockStored", "medium": "GPU",
          "group_idx": 0, "block_hashes": ["h"], "block_size": 1,
          "token_ids": [1], "kv_cache_spec_kind": "full_attention"},
         {"sequence": 1, "batch_ts": 13.0, "event_type": "BlockRemoved",
@@ -342,7 +359,7 @@ vllm:num_preemptions_total 0
     summary = sweep.load_repetition_summary(rep / "summary.json")
     eviction = summary["eviction"]
 
-    assert eviction["physical_block_evictions"] == 2
+    assert eviction["eviction_histogram_observations"] == 2
     assert eviction["removed_cached_hashes"] == 1
     assert eviction["mean_idle_before_evict_s"] == 3
     assert eviction["clears_during_measurement"] == 0
@@ -380,39 +397,21 @@ def test_strict_config_ignores_restart_ids_but_checks_other_environment() -> Non
     }
 
 
-def test_sweep_report_has_normal_kv_sections_and_artifacts(tmp_path) -> None:
+def test_sweep_report_without_source_keeps_evidence_in_index(tmp_path) -> None:
     _write_arm(tmp_path, "block16", "16", 1000.0, 0.46, at=1)
     _write_arm(tmp_path, "block32", "32", 900.0, 0.52, at=2)
-
     report = sweep.write_report(tmp_path)
-
-    assert report.name == "kvcache_report.html"
-    page = report.read_text(encoding="utf-8")
-    assert "Summary — tokens" in page
-    assert "Summary — time and configuration" in page
-    assert "Fixed-input Test" in page
-    assert "Eviction pressure" in page
-    assert "physical eviction observations" in page
-    assert "Eviction by KV group" in page
-    assert "Per arm" in page
-    assert "metrics before" in page
-    assert not (tmp_path / "sweep.html").exists()
-    assert not (tmp_path / "sweep.md").exists()
-    assert not (tmp_path / "kvcache_report.md").exists()
-    assert (tmp_path / "visualizations" / "sweep_comparison.png").is_file()
-
-
-def test_comparison_report_requires_two_arms(tmp_path) -> None:
-    _write_arm(tmp_path, "block16", "16", 1000.0, 0.46, at=1)
-
-    with pytest.raises(ValueError, match="requires at least two arms"):
-        sweep.write_report(tmp_path)
+    page = report.read_text()
+    assert report.name == 'all-experiments.html'
+    assert 'Fixed-input replay experiments' in page
+    assert 'Not collected' in page
+    assert not (tmp_path / 'kvcache_report.html').exists()
 
 
 def test_a_restarted_engine_counts_as_cold_without_a_reset_endpoint() -> None:
     assert runner._cache_state(False, METRICS % (0, 0)) == "cold_since_restart"
     assert runner._cache_state(False, METRICS % (122473, 37632)) == "warm_inherited"
-    assert runner._cache_state(True, METRICS % (122473, 37632)) == "cold_by_reset"
+    assert runner._cache_state(True, METRICS % (122473, 37632)) == "reset_requested"
 
 
 def test_repetitions_that_warm_each_other_are_not_averaged_silently(tmp_path) -> None:
@@ -504,3 +503,12 @@ def test_report_refuses_to_compare_different_workloads(tmp_path) -> None:
 
     assert "Not comparable" in text
     assert "different call counts" in text
+
+
+def test_excluded_pilot_stays_in_details_but_not_comparison(tmp_path):
+    _write_arm(tmp_path, 'pilot', '784', 695.1, 0.3888, at=1)
+    rep=tmp_path/'pilot'/'rep0'
+    (rep/'kv_report_metadata.json').write_text(json.dumps({'exclude_from_comparison':True,'exclusion_reason':'Cached tokens persisted across reset.'}))
+    assert sweep.load_arms(tmp_path)==[]
+    page = sweep.write_report(tmp_path).read_text()
+    assert 'Excluded from comparison.' in page

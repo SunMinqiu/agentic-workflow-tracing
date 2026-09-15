@@ -249,7 +249,7 @@ for entry in "${WORKLOADS[@]}"; do
         INSTRUMENTATION_LEVEL="ebpf+lustre-counters"
     fi
 
-    # pull_agentic_run.sh treats manifest.json as the marker of a result cell,
+    # pull_run.sh treats manifest.json as the marker of a result cell,
     # so every cell must write one even though SciLink has no replay cache.
     "$POST_PYTHON" -m agent_io_tracing.experiments.run_manifest \
         --output "$OUT/manifest.json" \
@@ -367,7 +367,6 @@ fi
 
 return_results_ownership "$BASE_OUT"
 
-echo "All done. Results in: $BASE_OUT"
 echo "Per-workload outputs now stay under: $BASE_OUT/<workload>/"
 echo "Layout:"
 echo "  $BASE_OUT/<workload>/                    trace root"
@@ -375,3 +374,4 @@ echo "  $BASE_OUT/<workload>/visualizations/     HTML/PNG visualization output"
 echo "  $BASE_OUT/<workload>/scilink_session/    SciLink session state"
 echo "  $BASE_OUT/<workload>/work/               SciLink cwd/generated artifacts"
 echo "Look for: kvcache_report.html, visualizations/index.html, call_dag.html, call_tree.txt, parallelism_summary.json"
+announce_results "$BASE_OUT"

@@ -1,0 +1,92 @@
+{
+  "comparisons": [
+    {
+      "id": "capacity-c8",
+      "title": "C8 \u00b7 cache reuse and capacity",
+      "overview": "capacity",
+      "baseline": "replay/c8_274_no_swap/block784_dtype-auto_prefix-on_gpu0.45_20260908T110128/rep0",
+      "runs": [
+        {
+          "label": "No cross-request reuse",
+          "rep": "replay/c8_274_no_prefix_cache/block784_dtype-auto_prefix-on_gpu0.45_20260908T110939/rep0"
+        },
+        {
+          "label": "Natural reuse",
+          "rep": "replay/c8_274_no_swap/block784_dtype-auto_prefix-on_gpu0.45_20260908T110128/rep0"
+        },
+        {
+          "label": "CPU swap 32 GiB",
+          "rep": "replay/c8w4_capacity_20260820_151924/cpu_offload/rep0"
+        },
+        {
+          "label": "Larger GPU cache",
+          "rep": "replay/c8w4_capacity_20260820_151924/block784_dtype-auto_prefix-on_gpu0.9_20260820T152234/rep0"
+        }
+      ]
+    },
+    {
+      "id": "capacity-c2",
+      "title": "C2-12 \u00b7 cache reuse and capacity",
+      "overview": "capacity",
+      "baseline": "replay/c2_12_274_no_swap/block784_dtype-auto_prefix-on_gpu0.45_20260908T144342/rep0",
+      "runs": [
+        {
+          "label": "No cross-request reuse",
+          "rep": "replay/c2_12_274_no_prefix_cache/block784_dtype-auto_prefix-on_gpu0.45_20260908T144403/rep0"
+        },
+        {
+          "label": "Natural reuse",
+          "rep": "replay/c2_12_274_no_swap/block784_dtype-auto_prefix-on_gpu0.45_20260908T144342/rep0"
+        },
+        {
+          "label": "CPU swap 32 GiB",
+          "rep": "replay/c2_12_274_cpu_swap32/block784_dtype-auto_prefix-on_gpu0.45_20260908T144759/rep0"
+        },
+        {
+          "label": "Larger GPU cache",
+          "rep": "replay/c2_12_274_no_swap/block784_dtype-auto_prefix-on_gpu0.9_20260908T145851/rep0"
+        }
+      ]
+    },
+    {
+      "id": "precision-c8",
+      "title": "C8 \u00b7 KV precision",
+      "overview": "precision",
+      "baseline": "replay/c8_274_no_swap/block784_dtype-auto_prefix-on_gpu0.45_20260908T110128/rep0",
+      "runs": [
+        {
+          "label": "auto \u00b7 274 GPU blocks",
+          "rep": "replay/c8_274_no_swap/block784_dtype-auto_prefix-on_gpu0.45_20260908T110128/rep0"
+        },
+        {
+          "label": "FP8",
+          "rep": "replay/c8_serial_out256/block1568_dtype-fp8_prefix-on_gpu0.45_20260908T100455/rep0"
+        }
+      ]
+    },
+    {
+      "id": "precision-c2",
+      "title": "C2-12 \u00b7 KV precision",
+      "overview": "precision",
+      "baseline": "replay/c2_12_274_no_swap/block784_dtype-auto_prefix-on_gpu0.45_20260908T144342/rep0",
+      "runs": [
+        {
+          "label": "auto \u00b7 274 GPU blocks",
+          "rep": "replay/c2_12_274_no_swap/block784_dtype-auto_prefix-on_gpu0.45_20260908T144342/rep0"
+        },
+        {
+          "label": "auto \u00b7 1760 GPU blocks",
+          "rep": "replay/c2_12_274_no_swap/block784_dtype-auto_prefix-on_gpu0.9_20260908T145851/rep0"
+        },
+        {
+          "label": "FP8 \u00b7 run 1",
+          "rep": "replay/c2_12_packed_out32/block1568_dtype-fp8_prefix-on_gpu0.45_20260908T095906/rep0"
+        },
+        {
+          "label": "FP8 \u00b7 run 2",
+          "rep": "replay/c2_12_packed_out32/block1568_dtype-fp8_prefix-on_gpu0.45_20260908T095722/rep0"
+        }
+      ]
+    }
+  ]
+}

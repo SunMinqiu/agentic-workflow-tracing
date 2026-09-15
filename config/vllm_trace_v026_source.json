@@ -1,0 +1,16 @@
+{
+  "reference": "https://github.com/vllm-project/vllm/tree/v0.26.0",
+  "version": "0.26.0",
+  "deployed_source_verified": true,
+  "files": {
+    "vllm/v1/core/block_pool.py": "202a13cb129174849d798019aaedc04c59775ec2a4b9dfcc7c1e3c563a43a661",
+    "vllm/v1/core/kv_cache_manager.py": "3f4af8d247f3fe9570b0132818b832b66ae6a2ac12942588828f899f6ff77ccf",
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py": "d8f1a45cd01ea97307552c12bb8420dabbb63388fce10bd8b4b77d27bc5f1d35",
+    "vllm/distributed/kv_events.py": "ff56f46a266f9c2a566fa8f103716018ce8e15b3411dd6bcb250ba94022f878b",
+    "vllm/v1/core/sched/scheduler.py": "2ed2a550b6558b2495eda845a97ae38bcf0225027b9e25fbf00fc3880c1d3941",
+    "vllm/v1/kv_offload/cpu/manager.py": "a7a166f7756d76e18a0e571828555d5ec66113425bd09911ecab7cf27f146416",
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py": "89ac26a80fbc29b9bcaa5a0daba88fb6309247f9bb053e48d2d61efa7d9d66f1"
+  },
+  "deployed_image_id": "da9136512c30",
+  "deployed_audit": "output/trace-audit-20260911/source/source_audit.json"
+}

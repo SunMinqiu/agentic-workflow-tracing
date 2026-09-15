@@ -76,7 +76,7 @@ validate_workload_selection "${WORKLOADS[@]}"
 
 echo "=== Montage fixed-input FS tracer ==="
 echo "Input root:    $MONTAGE_INPUT_ROOT"
-echo "Output:        $BASE_OUT"
+echo "Output dir: $BASE_OUT"
 echo "Runtime:       $AGENT_PYTHON"
 echo "Offline:       $MONTAGE_OFFLINE"
 echo "Perf pages:    $BCC_PERF_PAGES per CPU"
@@ -273,5 +273,5 @@ for ws_out in "$BASE_OUT"/*/; do
 done
 
 return_results_ownership "$BASE_OUT"
-echo "Results: $BASE_OUT"
+announce_results "$BASE_OUT"
 [ "$RUN_FAIL_COUNT" -eq 0 ] && [ "$POST_FAIL_COUNT" -eq 0 ]

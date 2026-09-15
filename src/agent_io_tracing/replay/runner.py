@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
+import re
 import math
 import os
 import secrets
@@ -51,6 +53,7 @@ def _completion(
     output_tokens: int = FIXED_OUTPUT_TOKENS,
     cache_salt: str | None = None,
 ) -> dict[str, Any]:
+    sent_request_id = f"replay-{secrets.token_hex(8)}-{item['request_id']}"
     sampling = dict(item.get("sampling_params") or {})
     allowed = {
         "temperature", "top_p", "top_k", "min_p", "seed",
@@ -72,7 +75,8 @@ def _completion(
         "stream_options": {"include_usage": True},
         "add_special_tokens": False,
         "return_token_ids": True,
-        "request_id": f"replay-{item['request_id']}",
+        "request_id": sent_request_id,
+        "vllm_xargs": {"kv_trace_request_id": sent_request_id},
     })
     if cache_salt is not None:
         payload["cache_salt"] = cache_salt
@@ -94,13 +98,19 @@ def _completion(
     usage = None
     server_metrics = None
     response_id = None
+    stream_done = False
     try:
         with urlopen(request, timeout=endpoint.timeout_s) as response:
             for raw in response:
                 line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data: ") or line == "data: [DONE]":
+                if line == "data: [DONE]":
+                    stream_done = True
+                    break
+                if not line.startswith("data: "):
                     continue
                 chunk = json.loads(line[6:])
+                if chunk.get("error"):
+                    raise RuntimeError(f"request {item['request_id']} stream failed: {chunk['error']}")
                 response_id = response_id or chunk.get("id")
                 if chunk.get("usage"):
                     usage = chunk["usage"]
@@ -126,6 +136,8 @@ def _completion(
         raise RuntimeError(
             f"request {item['request_id']} failed: {reason}"
         ) from exc
+    if not stream_done:
+        raise RuntimeError(f"request {item['request_id']} stream ended without [DONE]")
     ended = time.perf_counter()
     ended_at_epoch_s = time.time()
     ttft_ms = (
@@ -151,6 +163,7 @@ def _completion(
         "index": item["index"],
         "request_id": item["request_id"],
         "provider_request_id": response_id,
+        "sent_request_id": sent_request_id,
         "prompt_tokens": len(item["prompt_token_ids"]),
         "output_tokens": generated_output_tokens,
         "ttft_ms": ttft_ms,
@@ -256,16 +269,9 @@ def run_bundle(
 
 
 def _cache_state(reset_before: bool, metrics_before: str) -> str:
-    """What the prefix cache held when this replay started.
-
-    A server without VLLM_SERVER_DEV_MODE=1 has no /reset_prefix_cache, so the
-    only way to get a cold arm there is to restart the engine -- which a knob
-    change requires anyway.  A queries counter still at zero proves the engine
-    has served nothing since it came up, which is a measurement rather than a
-    claim about what the operator did.
-    """
+    """Record reset intent separately from observed cache query history."""
     if reset_before:
-        return "cold_by_reset"
+        return "reset_requested"
     if parse_prefix_cache(metrics_before).get("queries") == 0:
         return "cold_since_restart"
     return "warm_inherited"
@@ -325,38 +331,6 @@ def _replay_root(output_dir: Path) -> Path | None:
     return fallback if fallback.is_dir() else None
 
 
-def _kv_event_sequence_hint(
-    output_dir: Path,
-    endpoint: str,
-    process_started_at: float | None,
-) -> int:
-    """Resume after the newest event captured from this live server process."""
-    root = _replay_root(output_dir)
-    if root is None or process_started_at is None:
-        return 0
-    last_sequence = -1
-    for summary_path in root.glob("**/summary.json"):
-        try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            events = summary.get("kv_events") or {}
-            if events.get("endpoint") != endpoint:
-                continue
-            candidate = events.get("last_sequence")
-            if not isinstance(candidate, int):
-                continue
-            metrics_path = summary_path.with_name("metrics_before.prom")
-            if not metrics_path.is_file():
-                continue
-            previous_start = _process_start_time(
-                metrics_path.read_text(encoding="utf-8")
-            )
-            if previous_start == process_started_at:
-                last_sequence = max(last_sequence, candidate)
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-    return last_sequence + 1
-
-
 def replay_to_dir(
     bundle: dict[str, Any],
     endpoint: VLLMEndpoint,
@@ -384,8 +358,6 @@ def replay_to_dir(
     effective_cache_salt = cache_salt
     if cache_salt_mode != "none" and not effective_cache_salt:
         effective_cache_salt = secrets.token_urlsafe(32)
-    if reset_before:
-        endpoint.reset_prefix_cache()
     server_metadata = _server_metadata(endpoint)
     if kv_events_replay_endpoint:
         server_info = server_metadata.get("server_info") or {}
@@ -396,9 +368,63 @@ def replay_to_dir(
                 "with --kv-events-config before passing "
                 "--kv-events-replay-endpoint"
             )
-    warmup_summaries = []
-    for warmup_index in range(warmup_repetitions):
-        warmup_results = run_bundle(
+    manifest = {
+        "schema_version": 1, "bundle_sha256": hashlib.sha256(json.dumps(bundle, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        "bundle_file_sha256": hashlib.sha256(bundle_path.read_bytes()).hexdigest() if bundle_path and bundle_path.is_file() else None,
+        "served_model": bundle.get("served_model"), "mode": mode,
+        "max_concurrency": max_concurrency, "output_tokens": output_tokens,
+        "reset_before": reset_before, "warmup_repetitions": warmup_repetitions,
+        "cache_salt_mode": cache_salt_mode, "cache_salt": effective_cache_salt,
+        "request_order": [r.get("request_id") for r in bundle.get("requests", [])],
+        "sampling_params": [r.get("sampling_params") for r in bundle.get("requests", [])],
+        "server_metadata": server_metadata,
+    }
+    (output_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    collector = None
+    if kv_events_replay_endpoint:
+        from agent_io_tracing.serving.kv_collector import ReplayCollector
+        monitor = VLLMEndpoint(endpoint.base_url, endpoint.api_key, timeout_s=2.0)
+        def monitor_process():
+            metrics = monitor.metrics()
+            gauges = {}
+            for name, value in re.findall(r"^(vllm:(?:kv_cache_usage_perc|num_requests_running|num_requests_waiting))(?:\{[^\n]*\})?\s+([0-9.eE+-]+)$", metrics, re.M):
+                gauges[name] = gauges.get(name, 0.0) + float(value)
+            with (output_dir / "kv_metrics.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"client_epoch_s": time.time(), "gauges": gauges}) + "\n")
+            return _process_start_time(metrics)
+        (output_dir / "kv_metrics.jsonl").write_text("")
+        collector = ReplayCollector(kv_events_replay_endpoint, output_dir,
+                                    process_identity=monitor_process).start()
+    try:
+        if reset_before:
+            endpoint.reset_prefix_cache()
+        warmup_summaries = []
+        for warmup_index in range(warmup_repetitions):
+            warmup_results = run_bundle(
+                bundle,
+                endpoint,
+                mode,
+                output_tokens=output_tokens,
+                max_concurrency=max_concurrency,
+                cache_salt_mode=cache_salt_mode,
+                cache_salt=effective_cache_salt,
+            )
+            with (output_dir / f"warmup{warmup_index}_requests.jsonl").open(
+                "w", encoding="utf-8"
+            ) as output:
+                for row in warmup_results:
+                    output.write(json.dumps(row, ensure_ascii=False) + "\n")
+            warmup_summaries.append({
+                "requests": len(warmup_results),
+                "prompt_tokens": sum(row["prompt_tokens"] for row in warmup_results),
+                "cached_tokens": sum(row.get("cached_tokens") or 0 for row in warmup_results),
+                "median_total_ms": _median([row["total_ms"] for row in warmup_results]),
+            })
+        if collector:
+            collector.mark("measurement")
+        metrics_before = endpoint.metrics()
+        started = time.time()
+        results = run_bundle(
             bundle,
             endpoint,
             mode,
@@ -407,116 +433,36 @@ def replay_to_dir(
             cache_salt_mode=cache_salt_mode,
             cache_salt=effective_cache_salt,
         )
-        with (output_dir / f"warmup{warmup_index}_requests.jsonl").open(
-            "w", encoding="utf-8"
-        ) as output:
-            for row in warmup_results:
-                output.write(json.dumps(row, ensure_ascii=False) + "\n")
-        warmup_summaries.append({
-            "requests": len(warmup_results),
-            "prompt_tokens": sum(row["prompt_tokens"] for row in warmup_results),
-            "cached_tokens": sum(row.get("cached_tokens") or 0 for row in warmup_results),
-            "median_total_ms": _median([row["total_ms"] for row in warmup_results]),
-        })
-    # Reset and the final warm-up scheduler step publish asynchronously. Drain
-    # them into the pre-measurement boundary before choosing the next sequence.
-    if kv_events_replay_endpoint:
-        time.sleep(0.25)
-    next_event_sequence = 0
-    if kv_events_replay_endpoint:
-        from agent_io_tracing.serving.kv_events import fetch_replay
-        process_started_at = _process_start_time(endpoint.metrics())
-        sequence_hint = _kv_event_sequence_hint(
-            output_dir,
-            kv_events_replay_endpoint,
-            process_started_at,
-        )
-        _, initial_transport = fetch_replay(
-            kv_events_replay_endpoint,
-            start_sequence=sequence_hint,
-        )
-        previous = initial_transport.get("last_sequence")
-        next_event_sequence = (
-            int(previous) + 1 if previous is not None else sequence_hint
-        )
-    metrics_before = endpoint.metrics()
-    started = time.time()
-    results = run_bundle(
-        bundle,
-        endpoint,
-        mode,
-        output_tokens=output_tokens,
-        max_concurrency=max_concurrency,
-        cache_salt_mode=cache_salt_mode,
-        cache_salt=effective_cache_salt,
-    )
-    ended = time.time()
-    metrics_after = endpoint.metrics()
-    metrics_window = prometheus_window(metrics_before, metrics_after)
+        ended = time.time()
+        metrics_after = endpoint.metrics()
+        metrics_window = prometheus_window(metrics_before, metrics_after)
 
-    # Persist the completed inference measurement before optional KV-event
-    # collection. A diagnostic side channel must not discard an expensive run.
-    with (output_dir / "requests.jsonl").open("w", encoding="utf-8") as out:
-        for row in results:
-            out.write(json.dumps(row, ensure_ascii=False) + "\n")
-    (output_dir / "metrics_before.prom").write_text(metrics_before, encoding="utf-8")
-    (output_dir / "metrics_after.prom").write_text(metrics_after, encoding="utf-8")
-    (output_dir / "metrics_window.json").write_text(
-        json.dumps(metrics_window, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    (output_dir / "server_info.json").write_text(
-        json.dumps(server_metadata, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    kv_event_summary = None
-    if kv_events_replay_endpoint:
-        from agent_io_tracing.serving.kv_events import (
-            derive_removals,
-            fetch_replay,
-            summarize_events,
-            write_events,
+        # Persist the completed inference measurement before optional KV-event
+        # collection. A diagnostic side channel must not discard an expensive run.
+        with (output_dir / "requests.jsonl").open("w", encoding="utf-8") as out:
+            for row in results:
+                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+        (output_dir / "metrics_before.prom").write_text(metrics_before, encoding="utf-8")
+        (output_dir / "metrics_after.prom").write_text(metrics_after, encoding="utf-8")
+        (output_dir / "metrics_window.json").write_text(
+            json.dumps(metrics_window, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-        # The publisher drains an asynchronous queue. Give the final scheduler
-        # batch a brief chance to reach its replay buffer.
-        time.sleep(0.25)
-        try:
-            event_rows, event_transport = fetch_replay(
-                kv_events_replay_endpoint,
-                start_sequence=next_event_sequence,
-            )
-            write_events(output_dir / "kv_events.jsonl", event_rows)
-            removal_rows = derive_removals(
-                event_rows,
-                bundle.get("requests") or [],
-                started_at=started,
-                ended_at=ended,
-            )
-            write_events(output_dir / "kv_removals.jsonl", removal_rows)
-            kv_event_summary = {
-                **event_transport,
-                **summarize_events(
-                    event_rows,
-                    started_at=started,
-                    ended_at=ended,
-                ),
-                "removals": len(removal_rows),
-                "removals_matched_to_store": sum(
-                    bool(row.get("matched_store")) for row in removal_rows
-                ),
-                "removals_with_request_candidates": sum(
-                    bool(row.get("possible_request_prefixes")) for row in removal_rows
-                ),
-                "ambiguous_token_mappings": sum(
-                    bool(row.get("token_mapping_ambiguous")) for row in removal_rows
-                ),
-            }
-        except RuntimeError as exc:
-            kv_event_summary = {
-                "endpoint": kv_events_replay_endpoint,
-                "collection_error": str(exc),
-            }
+        (output_dir / "server_info.json").write_text(
+            json.dumps(server_metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        kv_event_summary = None
+        if collector:
+            from agent_io_tracing.serving.kv_events import summarize_events
+            event_rows, event_transport = collector.stop()
+            kv_event_summary = {**event_transport, **summarize_events(event_rows)}
+
+    except BaseException:
+        if collector and not collector._journal.closed:
+            collector.stop()
+        raise
 
     total_output_tokens = sum(row.get("output_tokens") or 0 for row in results)
     client_ttft_ms = [
@@ -601,6 +547,11 @@ def replay_to_dir(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    from agent_io_tracing.serving.kv_report_data import prepare_report_data
+    from agent_io_tracing.analysis.kvcache.replay_report import refresh_for_run
+
+    prepare_report_data(output_dir)
+    refresh_for_run(output_dir)
     return summary
 
 

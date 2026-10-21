@@ -1,60 +1,87 @@
-#!/bin/bash
-#
-# watch_done.sh — poll a detached remote trace run and notify (bell + line)
-# when it finishes.  Run LOCALLY in a spare terminal tab after launching a
-# nohup'd trace_script_bcc_*.sh; it only watches, never touches the run.
-#
-#   bash scripts/watch_done.sh genomas     # watches ~/genomas_run.log
-#   bash scripts/watch_done.sh scilink     # watches ~/scilink_run.log
-#
-# Prints a live progress line each poll so it never looks dead; rings the
-# terminal bell and exits by itself when the run finishes (or crashes).
-# Needs SSH_USER / CLIENT_NODE (source cloudlab_env.sh first).
+#!/usr/bin/env bash
+# Watch the remote log and PID printed by launch_run.sh.
+# Usage: bash scripts/watch_done.sh genomas logs/<run>.log <pid>
 
 set -uo pipefail
 
-WHICH="${1:-genomas}"
-case "$WHICH" in
-    genomas) LOG='~/genomas_run.log'; PROC="trace_script_bcc_genomas"; DONE="Results in:" ;;
-    scilink) LOG='~/scilink_run.log'; PROC="trace_script_bcc_scilink"; DONE="Results in:" ;;
-    *) echo "usage: watch_done.sh {genomas|scilink}" >&2; exit 2 ;;
+if [ "$#" -ne 3 ]; then
+    echo "Usage: bash scripts/watch_done.sh <genomas|scilink> <remote_log> <pid>" >&2
+    exit 2
+fi
+WORKFLOW="$1"
+REMOTE_LOG="$2"
+RUN_PID="$3"
+case "$WORKFLOW" in
+    genomas|scilink) ;;
+    *) echo "Unknown workflow: $WORKFLOW" >&2; exit 2 ;;
 esac
-
+case "$RUN_PID" in
+    ''|*[!0-9]*|0) echo "PID must be a positive integer." >&2; exit 2 ;;
+esac
+INTERVAL="${WATCH_INTERVAL:-30}"
+case "$INTERVAL" in
+    ''|*[!0-9]*|0) echo "WATCH_INTERVAL must be a positive integer." >&2; exit 2 ;;
+esac
 : "${SSH_USER:?source cloudlab_env.sh first}"
 : "${CLIENT_NODE:?source cloudlab_env.sh first}"
-INTERVAL="${WATCH_INTERVAL:-30}"
 START=$(date +%s)
 
-echo "[watch_done] $WHICH on $CLIENT_NODE — poll ${INTERVAL}s (Ctrl-C 只停止盯着看，不影响任务)"
-SEEN_ALIVE=0
-while true; do
-    # One SSH round-trip per poll: alive? done? + last meaningful progress line.
-    STATUS=$(ssh "$SSH_USER@$CLIENT_NODE" "
-        a=no; pgrep -qf '$PROC' && a=yes
-        d=no; grep -q '$DONE' $LOG 2>/dev/null && d=yes
-        l=\$(grep -aE 'Cell [0-9]+/|Processing:|run complete|Exit code' $LOG 2>/dev/null | tail -1)
-        printf '%s|%s|%s' \"\$a\" \"\$d\" \"\$l\"
-    " 2>/dev/null)
-    ALIVE="${STATUS%%|*}"; rest="${STATUS#*|}"; DFLAG="${rest%%|*}"; LAST="${rest#*|}"
-    [ "$ALIVE" = "yes" ] && SEEN_ALIVE=1
-    ELAPSED=$(( ($(date +%s) - START) / 60 ))
+remote_read() {
+    local remote_args
+    printf -v remote_args '%q ' "$REMOTE_LOG" "$RUN_PID" "$1"
+    ssh "$SSH_USER@$CLIENT_NODE" "bash -s -- $remote_args" <<'REMOTE'
+set -uo pipefail
+log="$1"
+pid="$2"
+case "$log" in
+    '~/'*) log="$HOME/${log#\~/}" ;;
+    /*) ;;
+    *) log="$HOME/$log" ;;
+esac
+if [ ! -f "$log" ]; then
+    echo "Log not found: $log" >&2
+    exit 2
+fi
+if [ "$3" = tail ]; then
+    tail -n 5 -- "$log"
+    exit
+fi
+alive=no
+state=$(ps -p "$pid" -o stat= 2>/dev/null || true)
+state="${state#"${state%%[![:space:]]*}"}"
+case "$state" in
+    ''|Z*|X*) ;;
+    *) alive=yes ;;
+esac
+done_flag=no
+if grep -q '^Results in:' "$log"; then done_flag=yes; fi
+last=$(grep -aE 'Cell [0-9]+/|Processing:|run complete|Exit code|Results in:' "$log" | tail -1 || true)
+printf '%s|%s|%s' "$alive" "$done_flag" "$last"
+REMOTE
+}
 
-    if [ "$DFLAG" = "yes" ] && [ "$ALIVE" != "yes" ]; then
-        printf '\a'
-        echo ""
-        echo "🔔 [$WHICH] 跑完了  $(date '+%H:%M:%S')  (盯了 ${ELAPSED} 分钟)"
-        ssh "$SSH_USER@$CLIENT_NODE" "tail -n 5 $LOG" 2>/dev/null
-        exit 0
+printf '[watch_done] %s PID=%s LOG=%s\n' "$WORKFLOW" "$RUN_PID" "$REMOTE_LOG"
+while true; do
+    if ! STATUS=$(remote_read status); then
+        echo "Could not read the remote run status." >&2
+        exit 2
     fi
-    if [ "$SEEN_ALIVE" = "1" ] && [ "$ALIVE" != "yes" ] && [ "$DFLAG" != "yes" ]; then
-        printf '\a'
-        echo ""
-        echo "⚠️  [$WHICH] 进程没了但没有完成标记 —— 可能崩了。看日志:"
-        echo "    ssh \"\$SSH_USER@\$CLIENT_NODE\" \"tail -n 30 $LOG\""
+    ALIVE="${STATUS%%|*}"
+    REST="${STATUS#*|}"
+    DONE="${REST%%|*}"
+    LAST="${REST#*|}"
+    ELAPSED=$(( ($(date +%s) - START) / 60 ))
+    if [ "$ALIVE" = no ]; then
+        printf '\n\a'
+        if [ "$DONE" = yes ]; then
+            printf '[%s] 已结束，监看 %s 分钟。\n' "$WORKFLOW" "$ELAPSED"
+            remote_read tail || exit 2
+            exit 0
+        fi
+        printf '[%s] 进程已退出，日志缺少 Results in: 完成标记。\n' "$WORKFLOW" >&2
+        remote_read tail || exit 2
         exit 1
     fi
-
-    # Live progress line (overwrite in place with \r).
-    printf '\r  [%s] %sm | %s\033[K' "$(date '+%H:%M:%S')" "$ELAPSED" "${LAST:-启动中…}"
+    printf '\r  [%s] %sm | %s\033[K' "$(date '+%H:%M:%S')" "$ELAPSED" "${LAST:-等待日志}"
     sleep "$INTERVAL"
 done

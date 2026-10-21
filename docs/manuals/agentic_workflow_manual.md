@@ -397,6 +397,31 @@ source cloudlab_env.sh; bash scripts/pull_run.sh logs/<日志名>.log
 
 远端日志的最后一行也是一条 `Pull to Mac:` 命令，带绝对路径，同样可以直接粘贴。
 
+### 7.1 监看指定运行
+
+使用 `launch_run.sh` 打印的日志路径和 PID。将两者分别设为 `RUN_LOG`、`RUN_PID` 后执行：
+
+```zsh
+bash scripts/watch_done.sh genomas "$RUN_LOG" "$RUN_PID"
+```
+
+SciLink 使用 `scilink` 参数。日志路径可以是远端绝对路径、`~/` 路径或相对于远端 home 的路径。`WATCH_INTERVAL` 设置轮询秒数，默认 30。脚本只检查指定 PID，退出码 0 表示进程已退出且日志含 `Results in:`，1 表示退出但缺少完成标记，2 表示参数或远端读取失败。应用和后处理是否成功仍以各自状态与输出检查为准。
+
+### 7.2 维护结果页面
+
+`results/index.html` 提供 workflow 的 I/O 和 KVCache 入口，`results/all-experiments.html` 提供完整实验索引。Replay 内容写入来源 task 的 `kvcache_report.html`，位于 “Fixed-input replay experiments”。来源按 `summary.bundle → bundle.source_cell` 解析；无法确认来源的运行显示在完整索引。
+
+修改原始记录后，需要刷新分析和页面时，在仓库根目录执行：
+
+```zsh
+PYTHONPATH=src python3 tools/rebuild_kv_reports.py
+PYTHONPATH=src python3 tools/check_kv_report_links.py
+```
+
+重建会准备派生数据、更新 task 页和索引，并清理被替代的独立页面。迁移动作记录在 `output/kv_report_integration_manifest.json`。只检查链接时运行第二条命令。
+
+容量与精度比较在 `config/kv_report_comparisons.json` 中显式指定运行和基线。完整逐请求缓存数据优先；引擎计数只用于可归属的指标窗口。物理驱逐、CPU swap、采集完整性和原始执行或 replay 身份分别展示。浅蓝色标识带 eviction 数据的 CPU swap 实验，黄色斜纹标识缺少测量。完整采集且零事件显示零，缺失数据显示状态。
+
 ## 8. 出问题时
 
 日志长时间不动时，看三类进程是否还活着。列表为空且日志没有 `Results in:` 表示中途失败，看最后 100 行找原因：
@@ -546,6 +571,61 @@ open "$SWEEP_DIR/kvcache_report.html" results/index.html
 
 每个正式容量与重复组合重新启动服务，先 C2、后 C8。三个容量各重复三轮，保存执行顺序。短控制使用单独服务会话；不要把压力控制留下的 CPU 内容带入正式对照。GPU reset 不保证清空 CPU offload 缓存。
 
+#### 11.1.1 在新的 vLLM 环境安装插桩
+
+在运行 vLLM 的 Python 环境中定位源码根目录，进入本仓库，选择与已审查源码对应的 fingerprint 文件：
+
+```sh
+export KV_VLLM_SOURCE="$(python -c 'import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec("vllm").origin).parent.parent)')"
+export KV_SOURCE_PIN=config/vllm_trace_v026_source.json
+python tools/prepare_vllm_trace_patch.py \
+  --source-root "$KV_VLLM_SOURCE" --pin "$KV_SOURCE_PIN" \
+  --output-dir output/deployed-vllm-trace
+```
+
+vLLM 0.29 的已审查 fingerprint 文件为 `config/vllm_trace_v029_source.json`。工具逐文件核对 SHA-256；不匹配时先审查源码差异。检查生成的 `source_verification.json` 与 `vllm-kv-trace.patch` 后应用：
+
+```sh
+python tools/prepare_vllm_trace_patch.py \
+  --source-root "$KV_VLLM_SOURCE" --pin "$KV_SOURCE_PIN" \
+  --output-dir output/deployed-vllm-trace --apply
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+export KV_TRACE_DIR=/dev/shm/kv-physical-validation
+export KV_TRACE_SESSION="kv-validation-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+使用服务启动脚本将这些变量传入引擎及 worker 进程。`KV_TRACE_DIR` 控制物理日志写入；publisher boundary 插桩在未设置该变量时仍生效。执行环境和模型参数在实验配置中固定。
+
+回滚前停止服务，在同一源码根目录执行：
+
+```sh
+python tools/prepare_vllm_trace_patch.py \
+  --source-root "$KV_VLLM_SOURCE" \
+  --output-dir output/deployed-vllm-trace --restore
+unset KV_TRACE_DIR KV_TRACE_SESSION
+```
+
+工具核对补丁后文件和原始备份的 hash；发现安装后的其他修改时停止恢复。
+
+#### 11.1.2 物理事件与关联口径
+
+| 事件 | 含义 |
+| --- | --- |
+| `PhysicalEviction` | 分配新空间时复用仍缓存内容、引用计数为零的 GPU 槽位 |
+| `CacheInvalidated` | 显式失效等清除路径，与容量驱逐分别统计 |
+| `BlockAllocated`、`BlockAccessed`、`BlockReleased`、`BlockHashAssigned` | 槽位分配、访问、引用释放和内容 hash 关联 |
+| `RequestCacheLookup`、`BlockLookup`、`RequestAllocation` | 缓存查找和调度分配；完成计算另由输出观测确认 |
+| `TransferPlan`、`TransferSubmitted`、`TransferCompleted` | 传输内容及目标、worker 提交和完成通知 |
+| `TransferAllWorkersComplete` | 调度器收齐预期 worker 的完成通知 |
+| `RequestComputeScheduled`、`RequestComputeOutputObserved` | 已调度计算和已收到可用计算输出 |
+| `RequestLoadBlocked`、`RequestLoadCompletionObserved`、`RequestLoadUnblocked` | 调度器观测的缓存加载等待 |
+
+物理槽位身份包括进程 epoch、pool ID、block ID 和 allocation generation。内容按 hash 和 cache group 关联，TP worker 的传输记录分别保留。`RequestRegistered` 中的 `kv_trace_request_id` 将客户端请求标记关联到内部请求。
+
+Publisher boundary 记录已排空队列的 epoch、最后序号和服务端时间，用于确认已发布事件边界。GPU 工作完成由计算或传输完成记录确认。Worker 传输时间、提交到通知的间隔和请求等待分别解释。
+
+在释放 allocation 前复制节点内存文件系统中的日志。导入保留原始 SHA-256，通过显式请求标识归属事件，报告未匹配记录和序号缺口。完整性确认还需覆盖参与进程的起止边界。
+
 ### 11.2 设置参数并连接
 
 所有本地命令在仓库根目录执行。安装依赖：
@@ -616,7 +696,7 @@ export KV_CONTROL="replay/${KV_SESSION}_controls"
 python3 tools/run_kv_causal_controls.py \
   --url http://127.0.0.1:18001 \
   --replay-endpoint tcp://127.0.0.1:15559 \
-  --bundle replay/kv_c2_capacity_20260910/bundles/C2-12.json \
+  --bundle replay/kv_physical_c2-12_20260911/bundles/C2-12.json \
   --output "$KV_CONTROL" --salt "$KV_SESSION"
 ```
 
@@ -634,7 +714,7 @@ python3 tools/run_kv_causal_controls.py \
 python3 tools/run_kv_experiment_cell.py \
   --url http://127.0.0.1:18001 \
   --replay-endpoint tcp://127.0.0.1:15559 \
-  --bundle replay/kv_c2_capacity_20260910/bundles/C2-12.json \
+  --bundle replay/kv_physical_c2-12_20260911/bundles/C2-12.json \
   --sweep-dir "$KV_SWEEP_C2" --label "$KV_ARM" --workload C2-12 \
   --gpu-blocks "$KV_GPU" --cpu-offload-gib "$KV_CPU" \
   --mode packed --output-tokens 32 --repetitions 1
@@ -642,7 +722,7 @@ python3 tools/run_kv_experiment_cell.py \
 python3 tools/run_kv_experiment_cell.py \
   --url http://127.0.0.1:18001 \
   --replay-endpoint tcp://127.0.0.1:15559 \
-  --bundle replay/kv_c8_capacity_20260910/bundles/C8.json \
+  --bundle replay/kv_physical_c8_20260911/bundles/C8.json \
   --sweep-dir "$KV_SWEEP_C8" --label "$KV_ARM" --workload C8 \
   --gpu-blocks "$KV_GPU" --cpu-offload-gib "$KV_CPU" \
   --mode serial --output-tokens 256 --repetitions 1

@@ -14,7 +14,7 @@ from agent_io_tracing.serving.vllm_endpoint import VLLMEndpoint
 
 def main():
     endpoint=VLLMEndpoint('http://127.0.0.1:18000',timeout_s=300)
-    source=ROOT/'replay/kv_c2_capacity_20260910/bundles/C2-12.json'
+    source=ROOT/'replay/kv_physical_c2-12_20260911/bundles/C2-12.json'
     bundle=json.loads(source.read_text())
     sweep=ROOT/'replay/kv_collector_overhead_20260910'
     pairs=[]

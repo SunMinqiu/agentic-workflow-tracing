@@ -100,7 +100,7 @@ def main():
             if ready:break
             time.sleep(2)
         if not ready:raise RuntimeError(f'Server startup timed out: {log}')
-        for workload,mode,limit,source in [('C2-12','packed','32','replay/kv_c2_capacity_20260910/bundles/C2-12.json'),('C8','serial','256','replay/kv_c8_capacity_20260910/bundles/C8.json')]:
+        for workload,mode,limit,source in [('C2-12','packed','32','replay/kv_physical_c2-12_20260911/bundles/C2-12.json'),('C8','serial','256','replay/kv_physical_c8_20260911/bundles/C8.json')]:
             sweep=ROOT/f'replay/kv_capacity_physical_{workload.lower()}_20260911'
             command=[sys.executable,str(ROOT/'tools/run_kv_experiment_cell.py'),'--url',args.url,'--replay-endpoint',args.replay_endpoint,'--gpu-blocks',str(capacity),'--cpu-offload-gib','0','--label',f'gpu{capacity}_cpu0','--repetitions','3','--only-rep',str(index),'--bundle',str(ROOT/source),'--sweep-dir',str(sweep),'--workload',workload,'--mode',mode,'--output-tokens',limit]
             subprocess.run(command,check=True,cwd=ROOT)

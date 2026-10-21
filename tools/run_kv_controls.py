@@ -17,7 +17,7 @@ def main():
     config=endpoint.server_info()['vllm_config']['cache_config']
     if int(config['num_gpu_blocks'])!=274 or float(config.get('kv_offloading_size') or 0)!=32:
         raise RuntimeError('Controls require the recorded GPU 274 / CPU 32 GiB configuration')
-    source=ROOT/'replay/kv_c2_capacity_20260910/bundles/C2-12.json'
+    source=ROOT/'replay/kv_physical_c2-12_20260911/bundles/C2-12.json'
     bundle=json.loads(source.read_text())
     sweep=ROOT/'replay/kv_controls_20260910'
     snapshots=sweep/'bundles';snapshots.mkdir(parents=True,exist_ok=True)

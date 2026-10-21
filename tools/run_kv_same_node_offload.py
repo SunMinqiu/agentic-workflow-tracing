@@ -51,7 +51,7 @@ def main():
             if ready:break
             time.sleep(2)
         if not ready:raise RuntimeError(f'Server startup timed out: {log}')
-        for workload,mode,limit,source in [('C2-12','packed','32','replay/kv_c2_capacity_20260910/bundles/C2-12.json'),('C8','serial','256','replay/kv_c8_capacity_20260910/bundles/C8.json')]:
+        for workload,mode,limit,source in [('C2-12','packed','32','replay/kv_physical_c2-12_20260911/bundles/C2-12.json'),('C8','serial','256','replay/kv_physical_c8_20260911/bundles/C8.json')]:
             subprocess.run([sys.executable,str(ROOT/'tools/run_kv_experiment_cell.py'),'--url',args.url,'--replay-endpoint',args.replay_endpoint,'--gpu-blocks','274','--cpu-offload-gib','32','--label','gpu274_cpu32','--repetitions',str(args.repetitions),'--only-rep',str(index),'--bundle',str(ROOT/source),'--sweep-dir',str(ROOT/f'replay/kv_same_node_physical_{workload.lower()}_20260911'),'--workload',workload,'--mode',mode,'--output-tokens',limit],check=True,cwd=ROOT)
         snapshot=args.output/(session+'-snapshot')
         subprocess.run([sys.executable,str(ROOT/'tools/pull_kv_physical_snapshot.py'),'--ssh-host',args.ssh_host,'--control-path',args.control_path,'--job-id',args.job_id,'--trace-dir','/dev/shm/kv-physical-'+session,'--remote-output',args.remote_root+'/trace-snapshots/'+session,'--output',str(snapshot)],check=True)

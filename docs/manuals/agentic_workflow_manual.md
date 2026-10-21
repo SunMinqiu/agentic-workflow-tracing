@@ -1,6 +1,6 @@
 # Agentic workflow 运行手册
 
-GenoMAS 和 SciLink 的部署、运行、拉回和固定输入重放。SWE-bench / SWE-bench Pro 的 Claude Code + vLLM 运行步骤见[第 12 节](#12-swe-bench--swe-bench-proclaude-code--vllm)。KVCache eviction 与 swap 的实测步骤见[第 11 节](#11-实测-kvcache-eviction-与-swap)。传统 workflow 见 `traditional_workflow_manual.md`，研究设计见 `Design.md`。
+GenoMAS 和 SciLink 的部署、运行、拉回和固定输入重放。SWE-bench / SWE-bench Pro 的 Claude Code + vLLM 运行步骤见[第 12 节](#12-swe-bench--swe-bench-proclaude-code--vllm)。KVCache eviction 与 swap 的实测步骤见[第 11 节](#11-实测-kvcache-eviction-与-swap)。传统 workflow 见 `traditional_workflow_manual.md`，工具范围和能力见 [README](../../README.md)。
 
 ## 0. 机器与执行路径
 
@@ -393,7 +393,7 @@ source cloudlab_env.sh; ssh "$SSH_USER@$WORKFLOW_NODE" 'tail -f ~/logs/<日志�
 source cloudlab_env.sh; bash scripts/pull_run.sh logs/<日志名>.log
 ```
 
-脚本把结果拉到 `results/<run 名>`，在本地重算 KV 报告，刷新 `results/index.html`，检查 `Design.md` 第 8 节列出的必需文件和 `lost_events=0`，然后打开报告。输出 `verified: <数量> cells in results/<run 名>` 表示通过。`results/<run 名>` 就是后面各节的 `RUN_NAME`。
+脚本把结果拉到 `results/<run 名>`，在本地重算 KV 报告，刷新 `results/index.html`，检查脚本要求的必需文件和 `lost_events=0`，然后打开报告。输出 `verified: <数量> cells in results/<run 名>` 表示通过。`results/<run 名>` 就是后面各节的 `RUN_NAME`。
 
 远端日志的最后一行也是一条 `Pull to Mac:` 命令，带绝对路径，同样可以直接粘贴。
 
@@ -432,7 +432,7 @@ test -s results/index.html && echo kvcache-report-ready
 
 ## 10. 固定输入重放
 
-术语和机制见 `Design.md` 第 7 节。步骤是：做一次 bundle，给 Perlmutter 的 vLLM 加观测参数，逐个记录 arm，出报告。所有命令在 Mac 仓库目录执行，第 3 节的 Perlmutter 隧道必须在运行。
+固定输入重放的范围见 [README 下篇](../../README.md#part-ii-vllm-kv-cache-behavior)。步骤是：做一次 bundle，给 Perlmutter 的 vLLM 加观测参数，逐个记录 arm，出报告。所有命令在 Mac 仓库目录执行，第 3 节的 Perlmutter 隧道必须在运行。
 
 ### 10.1 创建 bundle
 
@@ -533,7 +533,7 @@ open "$SWEEP_DIR/kvcache_report.html" results/index.html
 
 ### 11.1 环境与实验选择
 
-本节的启动命令适用于已部署的 Perlmutter 环境：Qwen3.6-27B、四张 A100、TP=4、vLLM 0.26.0 镜像 `da9136512c30`。远端部署目录为 `$SCRATCH/vllm/kv-trace-deploy-20260911`，包含七个源码覆盖文件、hook 模块和 `launch.sh`。新环境先按 [物理 trace 部署](Plans/VLLM-Physical-Trace-Deployment.md) 核对源码并安装；仅加载普通 observability 参数不能得到物理槽位和传输完成记录。
+本节的启动命令适用于已部署的 Perlmutter 环境：Qwen3.6-27B、四张 A100、TP=4、vLLM 0.26.0 镜像 `da9136512c30`。远端部署目录为 `$SCRATCH/vllm/kv-trace-deploy-20260911`，包含七个源码覆盖文件、hook 模块和 `launch.sh`。新环境使用 `tools/prepare_vllm_trace_patch.py` 核对 `config/vllm_trace_v026_source.json` 中的源码指纹并安装插桩。物理槽位和传输完成记录需要服务端 hook。
 
 先选择实验，再固定 bundle、输出长度和运行顺序：
 
@@ -703,8 +703,6 @@ Mac 使用 `open`；其他平台用浏览器打开对应 HTML。配置页列出�
 验收时检查请求数量是否齐全、物理日志序号是否有缺口、传输任务是否收齐预期 worker、请求 token 核算是否匹配输入。`PhysicalEviction` 才是本节的 GPU 容量驱逐；histogram 观测数、逻辑 hash 移除和 CPU 写出量分别解释。worker CUDA 时间之和与请求等待时间分开阅读。
 
 已有样例中，C8 的 148 个 CPU 副本候选分为 127 次确认搬回和 21 次确认重算。新运行若不同，应检查配置、缓存初始状态及逐条证据，不能为了匹配样例修改分类。没有观察到 swap 是允许的结果，不应生成空的 swap 明细表。采集缺口保持缺失状态；请求核算通过也不代表已覆盖进程的整个生命周期。
-
-最新说明见 [结果与例子](Plans/KVCache-Causal-Validation-20260911.md)，历史实验专用的汇总脚本 `tools/summarize_kv_causal_validation.py` 不会自动把任意新 sweep 纳入 2026-09-11 的文字结论。
 
 ### 11.8 停止服务与中断恢复
 

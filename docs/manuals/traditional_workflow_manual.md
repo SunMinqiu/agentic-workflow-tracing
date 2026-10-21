@@ -1,6 +1,6 @@
 # Traditional workflow 运行手册
 
-1000 Genomes 和 Montage 的部署、运行和拉回。两者由固定脚本驱动，不含 LLM，不需要推理后端。Agentic workflow 见 `agentic_workflow_manual.md`，研究设计见 `Design.md`。
+1000 Genomes 和 Montage 的部署、运行和拉回。两者由固定脚本驱动，不含 LLM，不需要推理后端。Agentic workflow 见 `agentic_workflow_manual.md`，工具范围和能力见 [README](../../README.md)。
 
 ## 0. 机器与执行路径
 
@@ -221,7 +221,7 @@ source cloudlab_env.sh; ssh "$SSH_USER@$WORKFLOW_NODE" 'tail -f ~/logs/<日志�
 source cloudlab_env.sh; bash scripts/pull_run.sh logs/<日志名>.log
 ```
 
-脚本把结果拉到 `results/<run 名>`，刷新 `results/index.html`，检查 `Design.md` 第 8 节列出的必需文件和 `lost_events=0`，然后打开报告。输出 `verified: <数量> cells in results/<run 名>` 表示通过。
+脚本把结果拉到 `results/<run 名>`，刷新 `results/index.html`，检查脚本要求的必需文件和 `lost_events=0`，然后打开报告。输出 `verified: <数量> cells in results/<run 名>` 表示通过。
 
 远端日志的最后一行也是一条 `Pull to Mac:` 命令，带绝对路径，同样可以直接粘贴。
 

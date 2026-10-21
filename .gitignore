@@ -10,6 +10,11 @@ cloudlab_env.sh
 /bundles/
 /output/*
 !/output/genomas_references/
+/output/genomas_references/*
+!/output/genomas_references/corpus_manifest.json
+!/output/genomas_references/txt/
+/output/genomas_references/txt/*
+!/output/genomas_references/txt/*.txt
 results/
 runs/
 artifacts/
@@ -24,7 +29,8 @@ summarize_pi/
 phase*_out/
 lustre_setup_*.log
 
-# ---- Private notes ----
+# ---- Local archive / private notes ----
+/.local-archive/
 0513.md
 
 # ---- Python ----

@@ -56,6 +56,7 @@ echo "==> [1b/5] rsync harness -> $CLIENT_NODE:~/$REMOTE_HARNESS_NAME/"
 rsync -av \
     --exclude '.git/' \
     --exclude '.DS_Store' \
+    --exclude '.local-archive/' \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude 'traces/' \

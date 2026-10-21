@@ -716,14 +716,9 @@ def create_io_autocorrelation_matplotlib(trace_dir: Path, output_path: Path) -> 
 
 
 def create_reread_attribution_matplotlib(trace_dir: Path, output_path: Path) -> None:
-    """Reread attribution (Overview.md §5 three-bucket scheme) — how much of
-    the observed file rereading is agent-induced vs. residual (a different
-    tool_call_id, not proven to be a different pipeline stage).
+    """Show agent-induced rereads and residual rereads by tool_call_id.
 
-    Source: phase1_metrics.json['reread_attribution'], joined on the specific
-    tool_call_id (not the coarser phase:role label — see
-    compute_reread_attribution's docstring in phase1_metrics.py for why that
-    distinction matters).
+    Read phase1_metrics.json['reread_attribution'] and associate rereads with the specific tool_call_id.
     """
     try:
         p1 = json.loads((trace_dir / "phase1_metrics.json").read_text())
@@ -2327,7 +2322,7 @@ def create_index_html(output_dir: Path) -> None:
             + "".join(latency_rows) + "</tbody></table>"
         )
 
-    # --- Attribution summary tables (Overview.md §5/§6 rollups) -----------
+    # --- Attribution summary tables ------------------------------------
 
     def kv_table(headers: list[str], rows: list[list]) -> str:
         if not rows:

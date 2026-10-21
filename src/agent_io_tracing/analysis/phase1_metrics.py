@@ -2232,7 +2232,7 @@ def write_markdown(trace_dir: Path, metrics: dict[str, Any]) -> None:
     for row in metrics["comparison_verdicts"]:
         lines.append(f"- **{row['metric']}** vs {row['target']}: {row['verdict']}")
 
-    lines.extend(["", "## Attribution (Design.md §4)", ""])
+    lines.extend(["", "## Attribution", ""])
 
     iface = metrics.get("interface_mix") or {}
     lines.append(f"- **I/O interface mix**: `{json.dumps(iface, ensure_ascii=False)}`")
@@ -2251,13 +2251,13 @@ def write_markdown(trace_dir: Path, metrics: dict[str, Any]) -> None:
         f"`{json.dumps(reread.get('different_tool_call_id'), ensure_ascii=False)}`"
     )
 
-    lines.extend(["", "## Agent-Induced I/O (Overview.md §6.2 rollups)", ""])
+    lines.extend(["", "## Agent-Induced I/O", ""])
     lines.append(f"- **Bytes/ops by phase**: `{json.dumps(metrics.get('bytes_ops_by_phase'), ensure_ascii=False)}`")
     lines.append(f"- **Directory scans**: `{json.dumps(metrics.get('directory_scan'), ensure_ascii=False)}`")
     lines.append(f"- **Failed open/stat**: `{json.dumps(metrics.get('failed_open_stat'), ensure_ascii=False)}`")
     lines.append(f"- **Error-log reads**: `{json.dumps(metrics.get('error_log_reads'), ensure_ascii=False)}`")
 
-    lines.extend(["", "## Task-Misconfigured I/O (Overview.md §6.3 rollups)", ""])
+    lines.extend(["", "## Task-Misconfigured I/O", ""])
     lines.append(
         f"- **State file rewrite frequency**: "
         f"`{json.dumps(metrics.get('state_file_rewrite_frequency'), ensure_ascii=False)}`"

@@ -115,6 +115,7 @@ REMOTE_DNF
 # ----------------------------------------------------------------
 echo "==> [3/6] rsync $LOCAL_HARNESS/ → $CLIENT_NODE:~/$REMOTE_HARNESS_NAME/"
 rsync -av --delete \
+    --exclude '.local-archive/' \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude 'traces/' \

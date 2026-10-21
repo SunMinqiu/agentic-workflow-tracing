@@ -125,6 +125,7 @@ ssh "$SSH_USER@$CLIENT_NODE" \
 # ----------------------------------------------------------------
 echo "==> [1b] rsync $LOCAL_HARNESS/ → $CLIENT_NODE:~/$REMOTE_HARNESS_NAME/"
 rsync -av \
+    --exclude '.local-archive/' \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude 'traces/' \

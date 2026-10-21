@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "agent-io-tracing"
 version = "0.1.0"
 description = "Agent-aware workflow I/O tracing and characterization toolkit."
-readme = "Overview.md"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "Markdown",

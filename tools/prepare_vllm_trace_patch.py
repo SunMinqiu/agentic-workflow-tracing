@@ -18,8 +18,8 @@ TARGETS={
 }
 
 
-def prepare(source_root, output_dir, apply=False):
-    pins=json.loads(PIN.read_text())
+def prepare(source_root, output_dir, apply=False, pin=None):
+    pins=json.loads((pin or PIN).read_text())
     changes=[]
     for name,hook in TARGETS.items():
         path=source_root/name
@@ -72,9 +72,10 @@ def restore(source_root, output_dir):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source-root',type=Path,required=True)
+    p.add_argument('--pin',type=Path,default=PIN)
     p.add_argument('--output-dir',type=Path,required=True)
     mode=p.add_mutually_exclusive_group()
     mode.add_argument('--apply',action='store_true')
     mode.add_argument('--restore',action='store_true')
     args=p.parse_args()
-    print(restore(args.source_root,args.output_dir) if args.restore else prepare(args.source_root,args.output_dir,args.apply))
+    print(restore(args.source_root,args.output_dir) if args.restore else prepare(args.source_root,args.output_dir,args.apply,args.pin))

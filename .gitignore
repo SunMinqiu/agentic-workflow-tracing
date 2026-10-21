@@ -5,6 +5,11 @@ cloudlab_env.sh
 .env.*
 
 # ---- Trace data / generated outputs ----
+/out/
+/replay/
+/bundles/
+/output/*
+!/output/genomas_references/
 results/
 runs/
 artifacts/
@@ -37,12 +42,3 @@ venv/
 .claude/
 .idea/
 .vscode/
-replay/bundles/
-replay/sweeps/
-
-/replay/
-
-# ---- KV cache experiment outputs / replay bundles (keep genomas reference corpus) ----
-output/*
-!output/genomas_references/
-bundles/

@@ -60,3 +60,18 @@ def test_compute_output_is_separate_from_schedule_and_excludes_failure(monkeypat
     owner.update_from_output(output,NS(req_id_to_index={'r':0},kv_connector_output=NS(invalid_block_ids={3})))
     assert sink.rows[-1]['usable'] is False
     assert sink.rows[-1]['completed_prompt_tokens'] is None
+
+
+def test_v029_transfer_uses_cow_source_and_partial_boundary(monkeypatch):
+    monkeypatch.setattr(causal, 'content', lambda k: {'offload_key': k.hex()})
+    key = b'b' + (1).to_bytes(4, 'big')
+    owner = NS(config=NS(tokens_per_hash=16, blocks_per_chunk=1,
+                        kv_group_configs=[NS(tokens_per_chunk=64), NS(tokens_per_chunk=64)]),
+               manager=NS(_agent_cpu_keys={key: {'cpu_block_id': 7}}))
+    state = NS(req=NS(block_hashes=[b'a', b'b']),
+               group_states=[NS(block_ids=[10]), NS(block_ids=[20])])
+    job = NS(src_spec=NS(block_ids=[99], group_sizes=[0, 1]))
+    rows = causal.transfer_contents_v029(owner, state, NS(keys={key}), job, 'store')
+    assert rows[0]['gpu_block_ids'] == [99]
+    assert (rows[0]['token_start'], rows[0]['token_end']) == (0, 32)
+    assert rows[0]['cpu']['cpu_block_id'] == 7

@@ -26,7 +26,6 @@ Usage:  python plot_fanout.py <run_dir>
 from __future__ import annotations
 
 import csv
-import json
 import sys
 from pathlib import Path
 

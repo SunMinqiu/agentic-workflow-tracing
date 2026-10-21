@@ -25,7 +25,7 @@ def run(args):
     if snapshot.exists() and snapshot.read_text()!=payload:
         raise RuntimeError('Existing bundle snapshot differs; choose a new experiment directory')
     snapshot.write_text(payload)
-    manifest={'source_bundle':str(args.bundle.resolve()),'source_sha256':hashlib.sha256(args.bundle.read_bytes()).hexdigest(),'snapshot_sha256':hashlib.sha256(payload.encode()).hexdigest(),'workload':args.workload,'mode':args.mode,'output_tokens':args.output_tokens,'expected_gpu_blocks':args.gpu_blocks,'expected_cpu_offload_gib':args.cpu_offload_gib,'repetitions':args.repetitions}
+    manifest={'source_bundle':str(args.bundle.resolve()),'source_sha256':hashlib.sha256(args.bundle.read_bytes()).hexdigest(),'snapshot_sha256':hashlib.sha256(payload.encode()).hexdigest(),'workload':args.workload,'mode':args.mode,'output_tokens':args.output_tokens,'expected_gpu_blocks':args.gpu_blocks,'expected_cpu_offload_gib':args.cpu_offload_gib,'expected_block_size':args.block_size,'repetitions':args.repetitions}
     arm=args.sweep_dir/args.label
     arm.mkdir(parents=True,exist_ok=True)
     manifest_path=arm/'cell_manifest.json'
@@ -39,8 +39,8 @@ def run(args):
         actual_offload=float(cfg.get('kv_offloading_size') or 0)
         if int(cfg['num_gpu_blocks'])!=args.gpu_blocks or actual_offload!=args.cpu_offload_gib:
             raise RuntimeError(f'Live capacity mismatch: GPU={cfg["num_gpu_blocks"]}, offload={actual_offload}')
-        if cfg['cache_dtype']!='auto' or int(cfg['block_size'])!=784:
-            raise RuntimeError('This matrix requires auto dtype and 784-token block configuration')
+        if cfg['cache_dtype']!='auto' or int(cfg['block_size'])!=args.block_size:
+            raise RuntimeError(f'Expected auto dtype and {args.block_size}-token blocks')
         if (info.get('observability_config') or {}).get('kv_cache_metrics_sample')!=1.0:
             raise RuntimeError('This matrix requires full histogram observation sampling')
         rep=arm/f'rep{index}'
@@ -58,8 +58,8 @@ if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--bundle',type=Path,required=True);p.add_argument('--sweep-dir',type=Path,required=True)
     p.add_argument('--label',required=True);p.add_argument('--workload',required=True)
-    p.add_argument('--gpu-blocks',type=int,required=True);p.add_argument('--cpu-offload-gib',type=float,required=True)
-    p.add_argument('--mode',choices=['serial','packed'],required=True);p.add_argument('--output-tokens',type=int,required=True)
+    p.add_argument('--block-size',type=int,default=784);p.add_argument('--gpu-blocks',type=int,required=True);p.add_argument('--cpu-offload-gib',type=float,required=True)
+    p.add_argument('--mode',choices=['serial','packed'],required=True);p.add_argument('--output-tokens',type=int,required=True,help='0 preserves each recorded output length')
     p.add_argument('--only-rep',type=int);p.add_argument('--repetitions',type=int,default=3);p.add_argument('--url',default='http://127.0.0.1:18000')
     p.add_argument('--replay-endpoint',default='tcp://127.0.0.1:15558')
     run(p.parse_args())

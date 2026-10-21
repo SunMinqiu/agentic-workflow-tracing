@@ -1,0 +1,8 @@
+You are working inside a checked-out clone of a Python repository — it is your current working directory. Resolve the GitHub issue below by editing the repository's source code. Do NOT edit test files. Make the smallest change that fixes the issue. Your file edits will be collected as a git diff, so just edit the files in place and stop when done.
+
+# Issue
+RenameModel with db_table should be a noop.
+Description
+	
+A RenameModel operation that already has db_table defined must be a noop.
+In Postgres, it drops and recreates foreign key constraints. In sqlite it recreates the table (as expected for a table renaming).

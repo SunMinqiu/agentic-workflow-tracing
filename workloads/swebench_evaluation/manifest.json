@@ -1,0 +1,32 @@
+[
+  {
+    "task": "django",
+    "instance_id": "django__django-14999",
+    "source": {
+      "dataset": "SWE-bench/SWE-bench_Verified",
+      "split": "test",
+      "revision": "78f471bf655a3137b2e8a75af1501690ec009ec3"
+    },
+    "test_patch_sha256": "aaca9f9c4b4d68b7be758b7e6557aa2776ec06505c5f944593fa927a1f0a69ab"
+  },
+  {
+    "task": "sphinx",
+    "instance_id": "sphinx-doc__sphinx-8548",
+    "source": {
+      "dataset": "SWE-bench/SWE-bench_Verified",
+      "split": "test",
+      "revision": "78f471bf655a3137b2e8a75af1501690ec009ec3"
+    },
+    "test_patch_sha256": "a697bd0ee0ca6d137d4b550390ec376bfc68686c89f565d2c9276806e51a665f"
+  },
+  {
+    "task": "nodebb",
+    "instance_id": "instance_NodeBB__NodeBB-70b4a0e2aebebe8f2f559de6680093d96a697b2f-vnan",
+    "source": {
+      "dataset": "ScaleAI/SWE-bench_Pro",
+      "split": "test",
+      "revision": "7ab5114912baf22bb098818e604c02fe7ad2c11f"
+    },
+    "test_patch_sha256": "ca035f5fd3123a8ebbb5ac7bffac689517f246c360fe7ef00572b7d913d4e512"
+  }
+]

@@ -325,40 +325,49 @@ def plot_context_growth(
     ax1.legend(fontsize=8, ncol=min(len(roles), 4), loc="upper left")
     ax1.grid(True, alpha=0.25)
 
-    logical_by_run = {
-        call["run_id"]: call
-        for call in (logical_summary or {}).get("per_call", [])
-    }
-    realized = [min(max(c["cacheRead"], 0), c["input"]) for c in calls]
-    logical_reuse: list[float] = []
-    for call, reused in zip(calls, realized):
-        logical_call = logical_by_run.get(call.get("run_id"))
-        estimate = (
-            float(logical_call.get("logical_aligned", 0))
-            if logical_call is not None else float(reused)
-        )
-        logical_reuse.append(max(float(reused), min(estimate, float(call["input"]))))
-    intrinsically_new = [
-        max(call["input"] - reusable, 0.0)
-        for call, reusable in zip(calls, logical_reuse)
-    ]
-    if logical_summary is not None:
+    reuse_unavailable = bool((logical_summary or {}).get("token_reuse_unmeasured"))
+    if reuse_unavailable:
+        ax2.bar(x, [c["input"] for c in calls], color="#B0B0B0",
+                label="input tokens; reuse split unavailable")
+        ax1.plot(x, [c["output"] for c in calls], color="#E69F00",
+                 label="output tokens", marker="x", lw=1)
+        ax1.set_ylabel("tokens")
+        ax1.legend(fontsize=8, loc="upper left")
+    else:
+        logical_by_run = {
+            call["run_id"]: call
+            for call in (logical_summary or {}).get("per_call", [])
+        }
+        realized = [min(max(c["cacheRead"], 0), c["input"]) for c in calls]
+        logical_reuse: list[float] = []
+        for call, reused in zip(calls, realized):
+            logical_call = logical_by_run.get(call.get("run_id"))
+            estimate = (
+                float(logical_call.get("logical_aligned", 0))
+                if logical_call is not None else float(reused)
+            )
+            logical_reuse.append(max(float(reused), min(estimate, float(call["input"]))))
+        intrinsically_new = [
+            max(call["input"] - reusable, 0.0)
+            for call, reusable in zip(calls, logical_reuse)
+        ]
+        if logical_summary is not None:
+            ax2.bar(
+                x, logical_reuse,
+                color="#56B4E9", label="logical reuse",
+            )
         ax2.bar(
-            x, logical_reuse,
-            color="#56B4E9", label="logical reuse",
+            x, realized,
+            color="#E69F00", label="realized reuse (cacheRead)", zorder=3,
         )
-    ax2.bar(
-        x, realized,
-        color="#E69F00", label="realized reuse (cacheRead)", zorder=3,
-    )
-    ax2.bar(
-        x, intrinsically_new, bottom=logical_reuse,
-        color="#B0B0B0", label="intrinsically new",
-    )
+        ax2.bar(
+            x, intrinsically_new, bottom=logical_reuse,
+            color="#B0B0B0", label="intrinsically new",
+        )
     ax2.set_ylabel("tokens")
     ax2.set_xlabel("LLM call index (chronological)")
     ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
-    ax2.set_title("Input reuse composition")
+    ax2.set_title("Input reuse composition — unavailable" if reuse_unavailable else "Input reuse composition")
     ax2.legend(fontsize=8, loc="upper left")
     ax2.grid(True, alpha=0.25)
 

@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from agent_io_tracing.adapters.llm_trace import format_system_prompt, format_tool_log
 from agent_io_tracing.adapters.trace_writer import TraceFileWriter, normalize_tool_name
 
 try:
@@ -77,68 +78,6 @@ except ImportError:
 
             def __init_subclass__(cls, **kwargs: Any) -> None:
                 super().__init_subclass__(**kwargs)
-
-
-# ----- formatting helpers (mirror tool_call_logger.ts) -----------------------
-
-
-def _format_time(dt: datetime) -> str:
-    return dt.strftime("%H:%M:%S.%f")  # 6-digit microseconds
-
-
-def _python_literal(value: Any) -> str:
-    """
-    Produce a Python literal that ast.literal_eval can round-trip.  Matches
-    tool_call_logger.ts toPythonLiteral semantics closely enough that
-    parse_ebpf.py's regex + literal_eval accepts the result.
-    """
-    if value is None:
-        return "None"
-    if isinstance(value, bool):
-        return "True" if value else "False"
-    if isinstance(value, (int, float)):
-        return repr(value) if value == value and value not in (float("inf"), float("-inf")) else "None"
-    if isinstance(value, str):
-        # repr() emits a Python string literal with proper escaping.
-        return repr(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_python_literal(v) for v in value) + "]"
-    if isinstance(value, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"{_python_literal(str(k))}: {_python_literal(v)}"
-                for k, v in value.items()
-            )
-            + "}"
-        )
-    # Fallback: stringify and quote.
-    return _python_literal(str(value))
-
-
-def _format_log_line(
-    started_at: datetime,
-    ended_at: datetime,
-    tool_name: str,
-    tool_id: str,
-    tool_input: Any,
-) -> str:
-    duration_ms = (ended_at - started_at).total_seconds() * 1000.0
-    return (
-        f"[{_format_time(started_at)} -> {_format_time(ended_at)}] "
-        f"({duration_ms:.1f}ms) {tool_name} (id={tool_id}) "
-        f"input={_python_literal(tool_input)}\n"
-    )
-
-
-def _format_system_prompt_entry(captured_at: datetime, prompt: str) -> str:
-    return (
-        f"[{captured_at.isoformat()}] length={len(prompt)}\n"
-        "--- SYSTEM PROMPT START ---\n"
-        f"{prompt}\n"
-        "--- SYSTEM PROMPT END ---\n"
-        "\n"
-    )
 
 
 # ----- usage normalization ---------------------------------------------------
@@ -336,7 +275,7 @@ class LangChainToolLogger(TraceFileWriter, BaseCallbackHandler):
         if not self._system_prompt_captured:
             sys_text = self._extract_system_prompt(messages)
             if sys_text is not None:
-                self._append_system_prompt(_format_system_prompt_entry(datetime.now(), sys_text))
+                self._append_system_prompt(format_system_prompt(datetime.now(), sys_text))
                 self._system_prompt_captured = True
 
         # Parent tree + ancestor mark + subagent attribution.
@@ -499,7 +438,7 @@ class LangChainToolLogger(TraceFileWriter, BaseCallbackHandler):
         #    Line format is byte-identical with the legacy regex so
         #    parse_ebpf.py continues to work on
         #    tool_calls.log without changes.
-        line = _format_log_line(
+        line = format_tool_log(
             started_at=started_at,
             ended_at=ended_at,
             tool_name=tool_name,
@@ -542,7 +481,7 @@ class LangChainToolLogger(TraceFileWriter, BaseCallbackHandler):
         now = datetime.now()
         with self._lock:
             for run_key, pending in list(self._pending.items()):
-                line = _format_log_line(
+                line = format_tool_log(
                     started_at=pending.started_at,
                     ended_at=now,
                     tool_name=pending.tool_name,

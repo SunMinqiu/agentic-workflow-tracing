@@ -1810,10 +1810,6 @@ def _point_in_intervals_ms(t: float, intervals: list[tuple[float, float]]) -> bo
     return any(s <= t <= e for s, e in intervals)
 
 
-def _interval_overlap_ms(a: tuple[float, float], b: tuple[float, float]) -> float:
-    return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
-
-
 def _io_bytes(entry: dict[str, Any]) -> int:
     value = entry.get("bytes_transferred") or entry.get("actual_size") or 0
     return int(value) if isinstance(value, (int, float)) and value > 0 else 0
@@ -1828,19 +1824,6 @@ def _fs_entry_bounds_ms(parsed: dict[str, Any]) -> tuple[float, float] | None:
     if not bounds:
         return None
     return min(bounds), max(bounds)
-
-
-def _llm_intervals_ms(trace_dir: Path) -> list[tuple[float, float]]:
-    events_path = trace_dir / "pi_events.jsonl"
-    if not events_path.is_file():
-        return []
-    try:
-        from agent_io_tracing.analysis.parallelism import _load_llm_events
-
-        llms, _, _ = _load_llm_events(events_path)
-    except Exception:
-        return []
-    return [(ev.start_ms, ev.end_ms) for ev in llms if ev.end_ms > ev.start_ms]
 
 
 def _run_timeline_ms(

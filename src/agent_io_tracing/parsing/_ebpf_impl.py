@@ -109,9 +109,6 @@ CODE_EXEC_TOOL_NAMES = {
     "ShellExec",
 }
 
-PURE_IO_TOOL_NAMES = {"Read", "Write", "Edit", "Glob", "Grep"}
-
-
 def classify_syscall(syscall: str) -> str:
     for category, syscalls in SYSCALL_CATEGORIES.items():
         if syscall in syscalls:

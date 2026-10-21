@@ -933,7 +933,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional result name; defaults to live config plus New York time.",
     )
     arm.add_argument("--mode", choices=("packed", "paced", "serial"), default="packed")
-    arm.add_argument("--output-tokens", type=int, default=32)
+    arm.add_argument("--output-tokens", type=int, default=32, help="Fixed output length; 0 preserves each recorded output length")
     arm.add_argument("--max-concurrency", type=int)
     arm.add_argument("--warmup-repetitions", type=int, default=0)
     arm.add_argument(

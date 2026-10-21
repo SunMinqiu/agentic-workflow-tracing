@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import html
 import json
-import os
 import statistics
 import sys
 from pathlib import Path
@@ -12,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 
 from agent_io_tracing.analysis.kvcache.catalog import Catalog, COLORS
-from agent_io_tracing.analysis.kvcache.replay_report import comparison_table, fmt, pct, refresh_task_pages, table
+from agent_io_tracing.analysis.kvcache.replay_report import comparison_table, fmt, pct, refresh_task_pages, table, output_length_description
 from agent_io_tracing.analysis.results_index import write_results_index, discover_tasks, IO_REPORT, KV_REPORT
 
 CSS = '''
@@ -46,6 +45,44 @@ def workflow_reports(results: Path) -> str:
     return ''.join(parts) + '</section>'
 
 
+def physical_section(catalog, results):
+    parts = ['<section id="continuous-validation"><h2>Eviction and CPU swap</h2>']
+    groups = {}
+    for label, family in [('C2-12', 'kv_physical_c2-12_20260911'), ('C8', 'kv_physical_c8_20260911')]:
+        for row in catalog.records:
+            if row['family'] == family and not row['review'].get('exclude_from_comparison'):
+                groups.setdefault(row['rep'].parent, (label, []))[1].append(row)
+    for comparison in catalog.comparisons:
+        for _, row in comparison['entries']:
+            arm = row['rep'].parent
+            if arm in groups or not catalog.data(row).get('physical_trace'):
+                continue
+            runs = [r for r in catalog.records if r['rep'].parent == arm
+                    and not r['review'].get('exclude_from_comparison') and catalog.data(r).get('physical_trace')]
+            groups[arm] = (comparison['title'], runs)
+    physical = []
+    for label, runs in groups.values():
+        config = runs[0].get('serving_config') or {}
+        cpu = config.get('kv_offloading_size')
+        cpu = 0 if cpu in (None, 'None', '0', '0.0', 0) else cpu
+        def median_value(get):
+            values=[get(catalog.data(r)) for r in runs]
+            return statistics.median(values) if all(isinstance(v,(int,float)) for v in values) else None
+        def transfer_median(direction, field, scale=1):
+            value = median_value(lambda data: ((data.get('aggregate_transfers') or {}).get('directions',{}).get(direction) or {}).get(field))
+            return fmt(value / scale,3) if value is not None else None
+        physical.append([html.escape(label),config.get('num_gpu_blocks'),cpu,len(runs),fmt(statistics.median(r['wall_s'] for r in runs),3),
+                         fmt(median_value(lambda d:(d.get('physical_trace') or {}).get('physical_evictions')),0),
+                         fmt(median_value(lambda d:((d.get('causal_trace') or {}).get('cpu_cache') or {}).get('eviction_events')),0),
+                         transfer_median('GPU_to_CPU','bytes',1e9), transfer_median('GPU_to_CPU','worker_time_s'),
+                         transfer_median('CPU_to_GPU','bytes',1e9), transfer_median('CPU_to_GPU','worker_time_s'),
+                         catalog.link(runs[0],results,'config','KVCache')])
+    parts.append('<p>Rows group repetitions of the same experiment configuration. Values are medians; Runs shows the number of measurements.</p>')
+    parts.append(table(['Workload / experiment','GPU blocks','CPU GiB','Runs','Replay runtime s','GPU block evictions','CPU content evictions','GPU → CPU GB','Store worker time s','CPU → GPU GB','Load worker time s','Report'],physical))
+    parts.append('<p class="note">Transfer bytes and worker times measure CPU swap. Physical eviction byte size and operation duration were not recorded. Independent restore controls remain in All experiment records.</p></section>')
+    return ''.join(parts)
+
+
 def build(root: Path = ROOT) -> Path:
     catalog = Catalog(root)
     refresh_task_pages(catalog)
@@ -62,9 +99,9 @@ def build(root: Path = ROOT) -> Path:
         source=row['source']
         timing=json.loads((source/'parallelism_summary.json').read_text()) if (source/'parallelism_summary.json').is_file() else {}
         label=comparison['title'].split(' · ')[0]
-        workloads.append([label,row.get('requests'),fmt(row.get('prompt_tokens'),0),html.escape(str(row.get('mode'))),row.get('fixed_output_tokens_per_request'),fmt(timing.get('wall_clock_s'),1)])
+        workloads.append([label,row.get('requests'),fmt(row.get('prompt_tokens'),0),html.escape(str(row.get('mode'))),html.escape(output_length_description(row)),fmt(timing.get('wall_clock_s'),1)])
     parts.append(table(['Workload','Requests','Input tokens','Replay mode','Output tokens / request','Original workflow span s'],workloads))
-    parts.append('<p class="note">C2 and C8 use 2 and 8 cohorts. Replay limits each output to the token count shown above.</p></section>')
+    parts.append('<p class="note">C2 and C8 use 2 and 8 cohorts. Output lengths follow the per-workload setting shown above.</p></section>')
     for key,title in [('capacity','Cache reuse and capacity'),('precision','KV precision')]:
         parts.append(f'<section id="{key}"><h2>{title}</h2>')
         parts.append('<p class="legend"><span class="swap-key">Light blue: CPU swap with eviction data</span> · <span class="missing-key">Yellow: missing measurement</span></p>')
@@ -79,37 +116,16 @@ def build(root: Path = ROOT) -> Path:
                 if swap:
                     saved=(1-swap['wall_s']/baseline['wall_s'])*100
                     gain=(swap['measurement']['rate']-baseline['measurement']['rate'])*100 if swap['measurement']['rate'] is not None and baseline['measurement']['rate'] is not None else None
-                    finding=f'CPU swap: {saved:.1f}% shorter replay runtime'
+                    finding=f'CPU swap: {abs(saved):.1f}% {"shorter" if saved >= 0 else "longer"} replay runtime'
                     if gain is not None:
-                        finding+=f'; cache hit ratio +{gain:.1f} percentage points'
+                        finding+=f'; cache hit ratio {gain:+.1f} percentage points'
                     parts.append('<p class="finding">'+finding+'.</p>')
             parts.append(comparison_table(catalog,comparison,results))
-        parts.append('<p class="note">Relative runtime uses the same workload’s auto, 274-block, no-swap baseline. Each historical configuration has one run; the initial cold-cache state was not verified.</p>')
+        parts.append('<p class="note">Relative runtime uses the baseline named in each workload’s comparison. These comparisons have one run per configuration.</p>')
         if key=='precision':
             parts.append('<p class="note">FP8 also changes block geometry, so these results reflect the combined configuration change.</p>')
         parts.append('</section>')
-    # Present the completed physical experiment, without its collection directory.
-    parts.append('<section id="continuous-validation"><h2>Eviction and CPU swap</h2>')
-    physical=[]
-    for label,family in [('C2-12','kv_physical_c2-12_20260911'),('C8','kv_physical_c8_20260911')]:
-        runs=[r for r in catalog.records if r['family']==family and not r['review'].get('exclude_from_comparison')]
-        if not runs:
-            continue
-        def median_value(get):
-            values=[get(catalog.data(r)) for r in runs]
-            return statistics.median(values) if all(isinstance(v,(int,float)) for v in values) else None
-        def transfer_median(direction, field, scale=1):
-            value = median_value(lambda data: ((data.get('aggregate_transfers') or {}).get('directions',{}).get(direction) or {}).get(field))
-            return fmt(value / scale,3) if value is not None else None
-        physical.append([label,len(runs),fmt(statistics.median(r['wall_s'] for r in runs),3),
-                         fmt(median_value(lambda d:(d.get('physical_trace') or {}).get('physical_evictions')),0),
-                         fmt(median_value(lambda d:((d.get('causal_trace') or {}).get('cpu_cache') or {}).get('eviction_events')),0),
-                         transfer_median('GPU_to_CPU','bytes',1e9), transfer_median('GPU_to_CPU','worker_time_s'),
-                         transfer_median('CPU_to_GPU','bytes',1e9), transfer_median('CPU_to_GPU','worker_time_s'),
-                         catalog.link(runs[0],results,'config','KVCache')])
-    parts.append('<p>GPU cache: 274 blocks · CPU swap: 32 GiB · medians of three runs.</p>')
-    parts.append(table(['Workload','Runs','Replay runtime s','GPU block evictions','CPU content evictions','GPU → CPU GB','Store worker time s','CPU → GPU GB','Load worker time s','Report'],physical))
-    parts.append('<p class="note">Transfer bytes and worker times measure CPU swap. Physical eviction byte size and operation duration were not recorded.</p></section>')
+    parts.append(physical_section(catalog, results))
     parts.append('<footer id="reports"><a href="all-experiments.html">All experiment records</a></footer></main></body></html>')
     path=results/'index.html'
     path.write_text(''.join(parts),encoding='utf-8')

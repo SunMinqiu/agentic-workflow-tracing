@@ -37,7 +37,7 @@ from agent_io_tracing.analysis.kvcache.logical import (
 PREFIX_LINEAGE_PNG, PREFIX_DUMP,
 )
 from agent_io_tracing.analysis.kvcache.summary import (
-    PAGE_CSS, token_table, time_table,
+    PAGE_CSS, fmt, pct, token_table, time_table,
 )
 from agent_io_tracing.analysis.results_index import write_results_index
 from agent_io_tracing.serving.vllm_endpoint import prometheus_window
@@ -56,17 +56,6 @@ import json
 
 
 LINEAGE_NOTES = "kvcache_lineage_notes.md"
-
-
-def _fmt(n: Any) -> str:
-    try:
-        return f"{int(n):,}"
-    except (TypeError, ValueError):
-        return str(n)
-
-
-def _pct(x: Any) -> str:
-    return f"{x:.2%}" if isinstance(x, (int, float)) else "n/a"
 
 
 def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
@@ -92,7 +81,16 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
             "out_in": round(s["total_output_tokens"] / max(s["total_input_tokens"], 1), 3),
         })
 
-    lg = analyze_cell_logical(cell, dump_prefixes=dump_prefixes)
+    from agent_io_tracing.analysis.kvcache.audited import load_audited_logical
+    lg = load_audited_logical(cell)
+    if lg is None:
+        lg = analyze_cell_logical(cell, dump_prefixes=dump_prefixes)
+    token_reuse_unmeasured = bool(lg and lg.get("token_reuse_unmeasured"))
+    row["token_reuse_unmeasured"] = token_reuse_unmeasured
+    if token_reuse_unmeasured:
+        for stale in ("kvcache_segments.json", "kvcache_segments.csv", PREFIX_DUMP,
+                      "visualizations/" + CACHE_WARMING_PNG):
+            (cell/stale).unlink(missing_ok=True)
     if lg is not None:
         latency = analyze_latency(lg)
         lg["latency"] = latency
@@ -136,7 +134,8 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
         (cell / LOGICAL_JSON).write_text(json.dumps(lg, indent=1), encoding="utf-8")
         viz = cell / "visualizations"
         viz.mkdir(parents=True, exist_ok=True)
-        plot_cache_warming(lg, viz / CACHE_WARMING_PNG)
+        if not token_reuse_unmeasured:
+            plot_cache_warming(lg, viz / CACHE_WARMING_PNG)
         plot_prefix_lineage(lg, viz / PREFIX_LINEAGE_PNG)
         plot_inference_latency_timeline(lg, viz / LATENCY_TIMELINE_PNG)
         plot_output_vs_latency(lg, viz / OUTPUT_LATENCY_PNG)
@@ -167,7 +166,7 @@ def analyze_run(cell: Path, dump_prefixes: bool) -> dict[str, Any]:
             viz / CTX_GROWTH_PNG,
             logical_summary=lg,
         )
-    seg = analyze_cell_segments(cell)
+    seg = {"n_calls": 0} if token_reuse_unmeasured else analyze_cell_segments(cell)
     if seg["n_calls"]:
         write_segments_tables(seg, cell)
         row["segments"] = {
@@ -201,7 +200,7 @@ def _content_examples(examples: dict[str, list], tags: list[str]) -> list[str]:
         for rank, s in enumerate(rows, 1):
             section = html.escape(s.get("section") or "?")
             L.append(
-                f"<p><b>{rank}. {section} — served {_fmt(s['tag_tokens'])} "
+                f"<p><b>{rank}. {section} — served {fmt(s['tag_tokens'])} "
                 f"{tag} tokens</b> · to {s['realized_hits']} call(s) · first sent "
                 f"by call {s['first_call']} · in {s['n_calls']} calls' prompts</p>"
             )
@@ -227,11 +226,11 @@ def _segment_section(r: dict[str, Any]) -> list[str]:
     for tag in ranked:
         e = cb["by_tag"][tag]
         L.append(
-            f"| {tag} | {_fmt(e['realized_tokens'])} | {e['realized_share']:.2%} | "
+            f"| {tag} | {fmt(e['realized_tokens'])} | {e['realized_share']:.2%} | "
             f"{e['n_segments']} | {e['segment_share']:.2%} |"
         )
     L.append(
-        f"| **all** | **{_fmt(cb['realized_tokens_total'])}** | **100.00%** | "
+        f"| **all** | **{fmt(cb['realized_tokens_total'])}** | **100.00%** | "
         f"**{served}** | — |"
     )
     L.append("")
@@ -339,6 +338,8 @@ def build_report(
                 if residual else ")" if detail else ""
             )
             L.append(f"- **Token counts**: from the engine's own `/tokenize`{detail}{shortfall}.")
+        elif r.get("token_reuse_unmeasured"):
+            L.append("- **Token counts**: provider-reported usage. Exact model-token prefix reuse is unmeasured.")
         elif r.get("tokenizer"):
             L.append(
                 f"- **Token counts**: re-tokenized locally with "
@@ -353,8 +354,8 @@ def build_report(
                 L.append(
                     f"- **Realized reuse**: {server['hit_rate']:.2%} read from "
                     f"the engine's counters, but **not attributable** — "
-                    f"{_fmt(server['queries'])} queried tokens against this "
-                    f"cell's {_fmt(r.get('total_input', 0))} input tokens means "
+                    f"{fmt(server['queries'])} queried tokens against this "
+                    f"cell's {fmt(r.get('total_input', 0))} input tokens means "
                     f"another client shared the server."
                 )
             L.append("")
@@ -380,11 +381,11 @@ def build_report(
             L.append("| --- | ---: |")
             L.append(
                 f"| KV usage after cell | "
-                f"{_pct(metric_value('kv_cache_usage_perc', 'after'))} |"
+                f"{pct(metric_value('kv_cache_usage_perc', 'after'))} |"
             )
             L.append(
                 f"| preemptions during cell | "
-                f"{_fmt(metric_value('num_preemptions', 'delta'))} |"
+                f"{fmt(metric_value('num_preemptions', 'delta'))} |"
             )
             for name, label in (
                 ("vllm:kv_block_lifetime_seconds", "sampled block lifetime mean"),
@@ -395,7 +396,7 @@ def build_report(
                 rendered = f"{value:.3f}s" if isinstance(value, (int, float)) else "n/a"
                 L.append(f"| {label} | {rendered} |")
             L.append("")
-        if r.get("has_logical"):
+        if r.get("has_logical") and not r.get("token_reuse_unmeasured"):
             L.append("**Possible sources per call**")
             L.append("")
             L.append("| possible sources | calls | share of calls |")
@@ -404,7 +405,7 @@ def build_report(
                 L.append(
                     f"| {candidate_row['possible_sources']} | "
                     f"{candidate_row['calls']} | "
-                    f"{_pct(candidate_row['call_fraction'])} |"
+                    f"{pct(candidate_row['call_fraction'])} |"
                 )
             L.append("")
             temporal = r.get("temporal_metrics") or {}
@@ -419,14 +420,14 @@ def build_report(
             for age_bin in temporal.get("age_bins", []):
                 L.append(
                     f"| {age_bin['age']} | {age_bin['n']} | "
-                    f"{_fmt(age_bin['logical_reusable_tokens'])} | "
-                    f"{_fmt(age_bin['realized_cache_read_tokens'])} | "
+                    f"{fmt(age_bin['logical_reusable_tokens'])} | "
+                    f"{fmt(age_bin['realized_cache_read_tokens'])} | "
                 )
             L.append("")
             if r.get("has_prefix_dump"):
                 L.append(embedded_prefix_details(r["cell"]))
                 L.append("")
-        else:
+        elif not r.get("has_logical"):
             L.append(
                 "realized **n/a** · logical **n/a** because this workload has "
                 "no successful token-bearing LLM calls"
@@ -437,9 +438,11 @@ def build_report(
         L.append(embedded_image("context growth", r["cell"], CTX_GROWTH_PNG))
         L.append("")
         if r.get("has_logical"):
-            L.append(embedded_image("per-call prefix reuse", r["cell"], CACHE_WARMING_PNG))
+            if not r.get("token_reuse_unmeasured"):
+                L.append(embedded_image("per-call prefix reuse", r["cell"], CACHE_WARMING_PNG))
             L.append("")
             L.append(
+                "Verified text-prefix lineage. KV-token reuse is unmeasured; see the measurement notes below." if r.get("token_reuse_unmeasured") else
                 "Logical KV-cache lineage: every call with a reusable exact prompt "
                 "prefix is connected to the latest prior call sharing its longest "
                 "prefix. These edges describe logical reuse opportunities, not the "
@@ -465,6 +468,8 @@ def build_report(
                     ("TTFT and TPOT vs fresh input", TTFT_FRESH_INPUT_PNG),
                     ("latency breakdown", LATENCY_BREAKDOWN_PNG),
                 ]:
+                    if r.get("token_reuse_unmeasured") and filename == TTFT_FRESH_INPUT_PNG:
+                        alt = "TTFT and TPOT vs total input"
                     L.append(embedded_image(alt, r["cell"], filename))
                     L.append("")
 
@@ -520,9 +525,9 @@ def main() -> int:
     for cell in cells:
         row = analyze_run(cell, dump_prefixes=args.dump_prefixes)
         by_run[cell.parent].append(row)
-        print(f"  {cell.name}: realized={_pct(row.get('realized_frac'))} "
-              f"logical={_pct(row.get('logical_aligned_frac'))} "
-              f"gap={_pct(row.get('gap_frac'))}")
+        print(f"  {cell.name}: realized={pct(row.get('realized_frac'))} "
+              f"logical={pct(row.get('logical_aligned_frac'))} "
+              f"gap={pct(row.get('gap_frac'))}")
 
     # one report per task: a run holding three tasks is three experiments, and
     # the results index is what puts them side by side

@@ -28,6 +28,7 @@ import markdown
 from agent_io_tracing.analysis.kvcache.summary import (
     PAGE_CSS, token_table, time_table,
 )
+from agent_io_tracing.viz.format_utils import jload
 from agent_io_tracing.replay.sweep import pretty_arm
 from agent_io_tracing.analysis.kvcache.catalog import Catalog, COLORS, LEGEND
 
@@ -41,18 +42,11 @@ WORKFLOWS = ["GenoMAS", "SciLink", "SRAgent", "ChemGraph", "Montage",
              "1000Genome", "Pi"]
 
 
-def _load(path: Path) -> dict[str, Any]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
 def task_row(cell: Path, results_dir: Path) -> dict[str, Any]:
     """The shape report.analyze_run returns, read back instead of recomputed."""
-    demand = _load(cell / "kvcache_demand.json")
-    logical = _load(cell / "kvcache_logical.json")
-    seg = _load(cell / "kvcache_segments.json")
+    demand = jload(cell / "kvcache_demand.json")
+    logical = jload(cell / "kvcache_logical.json")
+    seg = jload(cell / "kvcache_segments.json")
     run = cell.parent
     match = RUN_NAME.match(run.name)
     return {

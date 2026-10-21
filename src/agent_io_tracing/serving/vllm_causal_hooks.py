@@ -62,6 +62,30 @@ def install_cpu_manager(namespace):
         wrap(cls, name, operation)
 
 
+def transfer_contents_v029(owner, req_state, status, job, direction):
+    """Map actual transfer slots, including recurrent copy-on-write tails."""
+    spec = job.dst_spec if direction == 'load' else job.src_spec
+    ends = {bytes(h): (i + 1) * owner.config.tokens_per_hash
+            for i, h in enumerate(req_state.req.block_hashes)}
+    records = []
+    offset = 0
+    for group_idx, config in enumerate(owner.config.kv_group_configs):
+        size = spec.group_sizes[group_idx]
+        ids = list(spec.block_ids[offset:offset + size])
+        offset += size
+        keys = sorted((key for key in status.keys if int.from_bytes(key[-4:], 'big') == group_idx),
+                      key=lambda key: ends[bytes(key[:-4])])
+        if owner.config.blocks_per_chunk != 1 or len(keys) != len(ids):
+            raise ValueError('Transfer mapping requires one GPU block per offload key')
+        for key, block_id in zip(keys, ids):
+            end = ends[bytes(key[:-4])]
+            start = ((end - 1) // config.tokens_per_chunk) * config.tokens_per_chunk
+            records.append(dict(**content(key), token_start=start, token_end=end,
+                                gpu_block_ids=[int(block_id)],
+                                cpu=getattr(owner.manager, '_agent_cpu_keys', {}).get(key)))
+    return records
+
+
 def install_offload_scheduler(namespace):
     cls = namespace['OffloadingConnectorScheduler']
     if getattr(cls, '_agent_causal_installed', False):
@@ -98,6 +122,8 @@ def install_offload_scheduler(namespace):
                                              cpu=getattr(owner.manager, '_agent_cpu_keys', {}).get(key)))
                     if direction == 'load':
                         gpu_offset += job.dst_spec.group_sizes[group_index]
+                if hasattr(owner.config, 'supports_partial_tail'):
+                    contents = transfer_contents_v029(owner, req_state, status, job, direction)
                 emit_request(sink, 'TransferPlan', job.req_id, connector_id=owner._agent_connector_id,
                              job_id=job_id, direction=direction, expected_workers=status.pending_count,
                              source=transfer_spec(job.src_spec), destination=transfer_spec(job.dst_spec),

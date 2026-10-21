@@ -1164,8 +1164,9 @@ def main() -> int:
 
         lost_events = [0]
 
-        def handle_lost(_cpu, count):
-            lost_events[0] += int(count)
+        def handle_lost(cpu_or_count, count=None):
+            # BCC releases call lost_cb(count) or lost_cb(cpu, count).
+            lost_events[0] += int(cpu_or_count if count is None else count)
 
         bpf["events"].open_perf_buffer(
             handle_event, page_cnt=args.perf_pages, lost_cb=handle_lost

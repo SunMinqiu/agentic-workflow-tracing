@@ -261,6 +261,9 @@ def has_stream_timing(summary: dict[str, Any]) -> bool:
 
 
 def plot_ttft_vs_fresh_input(summary: dict[str, Any], out_png: Path) -> None:
+    total_input = bool(summary.get("token_reuse_unmeasured"))
+    input_key = "input" if total_input else "fresh_input"
+    input_label = "total input" if total_input else "fresh input"
     calls = [call for call in summary["per_call"] if call.get("first_token_ms") is not None]
     fig, (left, right) = plt.subplots(1, 2, figsize=(12, 5.2))
     colors = _role_colors(calls)
@@ -268,7 +271,7 @@ def plot_ttft_vs_fresh_input(summary: dict[str, Any], out_png: Path) -> None:
         group = [call for call in calls if call["role"] == role]
         marker_sizes = [25 + min(call["input"] / 250, 100) for call in group]
         left.scatter(
-            [call["fresh_input"] for call in group],
+            [call[input_key] for call in group],
             [(call["first_token_ms"] - call["start_ms"]) / 1000.0 for call in group],
             s=marker_sizes,
             color=color,
@@ -277,7 +280,7 @@ def plot_ttft_vs_fresh_input(summary: dict[str, Any], out_png: Path) -> None:
         )
         decode_group = [call for call in group if call["output"] > 1]
         right.scatter(
-            [call["fresh_input"] for call in decode_group],
+            [call[input_key] for call in decode_group],
             [
                 ((call.get("last_token_ms") or call["end_ms"]) - call["first_token_ms"])
                 / 1000.0
@@ -293,10 +296,10 @@ def plot_ttft_vs_fresh_input(summary: dict[str, Any], out_png: Path) -> None:
     right.set_ylabel("TPOT (s/token)")
     right.set_title("decode TPOT")
     for ax in (left, right):
-        ax.set_xlabel("fresh input tokens")
+        ax.set_xlabel(f"{input_label} tokens")
         ax.grid(True, alpha=0.25)
     left.legend(fontsize=8)
-    fig.suptitle("TTFT and TPOT vs. fresh input")
+    fig.suptitle(f"TTFT and TPOT vs. {input_label}")
     fig.tight_layout()
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)

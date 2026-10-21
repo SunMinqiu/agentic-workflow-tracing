@@ -1,6 +1,5 @@
 """Write a source-linked Chinese explanation of the completed causal validation."""
 import json
-import statistics
 import sys
 from pathlib import Path
 

@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import html
-import json
 from pathlib import Path
 from agent_io_tracing.viz.format_utils import esc, fmt_bytes, jload
 

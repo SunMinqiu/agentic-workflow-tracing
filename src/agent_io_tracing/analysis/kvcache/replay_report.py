@@ -5,7 +5,6 @@ import html
 import json
 import os
 import re
-import statistics
 from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
@@ -108,11 +107,21 @@ def comparison_table(catalog, comparison, base):
     return table(['Configuration', 'GPU blocks', 'Hit ratio', 'Server TTFT p50 ms', 'Server TTFT p90 ms', 'Replay runtime s', 'Relative runtime', 'KVCache details'], rows)
 
 
+def output_length_description(row):
+    if row.get('output_length_mode') == 'recorded':
+        return 'recorded output length for each request'
+    count = row.get('fixed_output_tokens_per_request')
+    return f'{count} output tokens per request' if count is not None else 'output length not recorded'
+
+
 def comparison_section(catalog, comparison, base):
     baseline = comparison['baseline_record']
-    identity = 'auto · 274 GPU blocks · no CPU swap'
+    cfg = baseline.get('serving_config') or {}
+    cpu = cfg.get('kv_offloading_size')
+    cpu_label = f'CPU offload {cpu} GiB' if cpu and str(cpu) not in ('None', '0', '0.0') else 'no CPU offload'
+    identity = html.escape(f"{cfg.get('cache_dtype')} · {cfg.get('num_gpu_blocks')} GPU blocks · {cpu_label}")
     mode = html.escape(str(baseline.get('mode')))
-    output = html.escape(str(baseline.get('fixed_output_tokens_per_request')))
+    output = html.escape(output_length_description(baseline))
     rows = comparison['entries']
     evidence = []
     for label, row in rows:
@@ -122,11 +131,12 @@ def comparison_section(catalog, comparison, base):
         evidence.append(f'{html.escape(label)}: {abs(change):.2f}% {"longer" if change > 0 else "shorter"} runtime')
     conclusion = '<p>' + '; '.join(evidence) + '. These are the recorded single-run comparisons.</p>' if evidence else ''
     note = 'FP8 also changes block geometry; these rows compare the combined configuration.' if comparison['overview'] == 'precision' else 'Unique cache salts prevent reuse across requests; engine prefix caching remains enabled.'
+    note = html.escape(comparison.get('note', note))
     geometry = ''
     if comparison['overview'] == 'precision':
         geometry = '<details><summary>KV precision and block geometry</summary>' + table(['Configuration','KV dtype','Block tokens','GPU blocks','GPU utilization','TPOT ms/token'], [[html.escape(label),html.escape(str((row.get('serving_config') or {}).get('cache_dtype'))),(row.get('serving_config') or {}).get('block_size'),(row.get('serving_config') or {}).get('num_gpu_blocks'),(row.get('serving_config') or {}).get('gpu_memory_utilization'),fmt(row.get('median_tpot_ms'))] for label,row in rows]) + '</details>'
     return (f'<section id="{comparison["id"]}"><h3>{html.escape(comparison["title"])}</h3>'
-            f'<p>{mode} replay · {output} output tokens per request · baseline: {identity}.</p>'
+            f'<p>{mode} replay · {output} · baseline: {identity}.</p>'
             + conclusion + comparison_table(catalog, comparison, base) + geometry
             + f'<p>{note} Reset-only records do not confirm an empty initial cache. Hit ratio uses complete per-request measurements when available; evidence retains engine counters separately.</p></section>')
 
@@ -155,6 +165,8 @@ def run_section(catalog, row, base):
     data = catalog.data(row)
     status = STATUS.get(data.get('collection_status'), 'Analysis not built')
     config = row.get('serving_config') or {}
+    cpu_size = config.get('kv_offloading_size')
+    cpu_label = 'Off' if cpu_size in (None, 'None', '0', '0.0', 0) else cpu_size
     title = row['rep'].parent.name + ' / ' + row['rep'].name
     source = row['source'].relative_to(catalog.root / 'results').as_posix() if row['source'] else row['source_raw'] or 'Source unresolved'
     rid = row['id']
@@ -163,7 +175,7 @@ def run_section(catalog, row, base):
              '<p><a href="' + os.path.relpath(catalog.root / 'results/index.html', base) + '">Back to summary</a></p>']
     if row['review'].get('exclude_from_comparison'):
         parts.append('<p><strong>Excluded from comparison.</strong> ' + html.escape(row['review'].get('exclusion_reason', '')) + '</p>')
-    parts.append(table(['Requests','GPU blocks','CPU swap GiB','Hit ratio','Client TTFT p50 ms','Replay runtime s','Collection'], [[row.get('requests'),config.get('num_gpu_blocks'),config.get('kv_offloading_size') or 'Off',pct(row['measurement']['rate']),fmt(row.get('median_ttft_ms'),3),fmt(row.get('wall_s'),3),html.escape(status)]]))
+    parts.append(table(['Requests','GPU blocks','CPU swap GiB','Hit ratio','Client TTFT p50 ms','Replay runtime s','Collection'], [[row.get('requests'),config.get('num_gpu_blocks'),cpu_label,pct(row['measurement']['rate']),fmt(row.get('median_ttft_ms'),3),fmt(row.get('wall_s'),3),html.escape(status)]]))
     parts.append('<p>Hit ratio source: ' + html.escape(row['measurement']['source']) + '. Initial cache: ' + html.escape(cold_state(row)) + '.</p>')
     for comparison in catalog.comparisons:
         if any(r['rep'] == row['rep'] for _, r in comparison['entries']):
@@ -220,7 +232,7 @@ def render_replays(catalog, source, base):
     for arm, runs in groups.items():
         first = runs[0]
         parts.append(f'<details id="{first["arm_id"]}"><summary>{html.escape(arm.parent.name)} · {html.escape(arm.name)} · {len(runs)} run(s)</summary>')
-        parts.append('<p>Mode: ' + html.escape(str(first.get('mode'))) + '; output limit: ' + html.escape(str(first.get('fixed_output_tokens_per_request'))) + ' tokens/request.</p>')
+        parts.append('<p>Mode: ' + html.escape(str(first.get('mode'))) + '; ' + html.escape(output_length_description(first)) + '.</p>')
         if len(runs) > 1:
             result_rows = []
             for row in runs:

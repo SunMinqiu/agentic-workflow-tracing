@@ -1,6 +1,6 @@
 # Agentic workflow 运行手册
 
-GenoMAS 和 SciLink 的部署、运行、拉回和固定输入重放。KVCache eviction 与 swap 的实测步骤见[第 11 节](#11-实测-kvcache-eviction-与-swap)。传统 workflow 见 `traditional_workflow_manual.md`，研究设计见 `Design.md`。
+GenoMAS 和 SciLink 的部署、运行、拉回和固定输入重放。SWE-bench / SWE-bench Pro 的 Claude Code + vLLM 运行步骤见[第 12 节](#12-swe-bench--swe-bench-proclaude-code--vllm)。KVCache eviction 与 swap 的实测步骤见[第 11 节](#11-实测-kvcache-eviction-与-swap)。传统 workflow 见 `traditional_workflow_manual.md`，研究设计见 `Design.md`。
 
 ## 0. 机器与执行路径
 
@@ -25,6 +25,7 @@ GenoMAS 和 SciLink 的部署、运行、拉回和固定输入重放。KVCache e
 | 只换 key、后端或模型 | 4 → 6 → 7 |
 | 只换 vLLM cluster | 3 → 4.3 → 6 → 7 |
 | 实验正在运行或已完成 | 7 |
+| SWE-bench / Pro + vLLM | 1 → 2.1 → 3 → 12 |
 
 ## 1. 更换 CloudLab allocation
 
@@ -729,3 +730,148 @@ ssh -S "$KV_SOCKET" -O exit "$KV_REMOTE"
 3. 保留部分运行目录和采集错误。仅有 `summary.json` 不等于物理日志已经完整保存。
 4. 无法恢复同一会话日志时，给该运行保留缺失状态，使用新会话及新目录重跑。不要拼接旧请求与新进程日志。
 5. SSH 隧道恢复后重新核对实际节点和 `/server_info`。Mac 长时间实验可用 `caffeinate -i python3 ...` 防止本地休眠。
+
+## 12. SWE-bench / SWE-bench Pro：Claude Code + vLLM
+
+三个固定任务为 Django `14999`、Sphinx `8548` 和 SWE-bench Pro 的 NodeBB `70b4a0e2`。Claude Code 在 CloudLab 上实际读写仓库、运行命令并生成补丁。每次回答自然结束；不固定输出长度。任务与 base commit 见 `workloads/swebench/manifest.json`。
+
+### 12.1 安装
+
+先完成第 2.1 节的 Lustre、BCC 和第 3 节的 vLLM 隧道。在 Mac 执行：
+
+```zsh
+source cloudlab_env.sh
+bash scripts/deploy_swebench_to_client.sh
+```
+
+部署脚本安装 Node.js 22.16.0、Claude Code 2.1.197、CCR 1.0.72、Python 环境和三个任务的依赖。代码仓库放在 `/mnt/lustrefs/$USER/pi-ebpf-tracing-handoff/swebench/work`。NodeBB 使用独立 Redis 端口 `16379`，数据库 `0` 和测试数据库 `1`。
+
+该步骤用于首次准备干净任务。已经运行并修改过的仓库会被保留，脚本会拒绝覆盖；只更新 harness 代码时用第 5 节同步，重跑任务用 12.4 的新目录。
+
+在 CloudLab 的 `~/pi-ebpf-tracing-handoff/.env.swebench` 中设置实际 `VLLM_URL` 和 `VLLM_SERVED_MODEL`。本次验证使用：
+
+```bash
+export VLLM_URL=http://127.0.0.1:18080
+export VLLM_SERVED_MODEL=Qwen3.6-27B
+```
+
+`18080` 是 CloudLab 的 reverse tunnel 端口。更换模型后，在 CloudLab 执行 `bash scripts/configure_swebench_ccr.sh`。该命令备份原 CCR 配置并重启 CCR。
+
+### 12.2 执行并测量
+
+在 CloudLab 执行：
+
+```bash
+cd ~/pi-ebpf-tracing-handoff
+source .env.swebench
+curl -fsS "$VLLM_URL/v1/models"
+for task in django sphinx nodebb; do
+  bash scripts/run_swebench_measured.sh "$task" || break
+done
+```
+
+请求路径是 `Claude Code → CCR:3456 → 测量代理:18081 → vLLM:18080`。测量脚本自动启动和停止代理，暂停 agent 等待 BCC 就绪，完成后停止 tracer 并解析文件访问事件。它使用 `bypassPermissions` 在任务环境中执行命令和修改代码。
+
+测量代理串行发送模型请求，每次运行使用独立 cache salt，同一任务内部共享前缀缓存。固定会话名称避免自动生成标题；禁用子 agent 委派和后台调度。代理拒绝图像、音频和视频输入。CCR transformer 处理工具调用之间的多余文本 delta。vLLM 需启用对应模型的工具调用解析器。
+
+结果位于 `results/swebench-measured/<task>-<UTC时间>/`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `timing_summary.json` | 请求数、TTFT、TPOT、服务端 prefill / inference 时间比例 |
+| `per_request.json` | 每次请求的时间、usage 和可用的服务端时间字段 |
+| `http/` | 实际请求、原始流式响应和请求计时 |
+| `metrics-before.txt`、`metrics-after.txt` | vLLM 指标快照 |
+| `server-info.json` | 测量时的服务端配置 |
+| `agent/*/` | agent 事件、带时间戳事件、补丁、stderr 和运行状态 |
+| `ebpf_events.log`、`parsed.json`、`tool_calls.log` | 文件访问追踪、解析结果和工具执行区间 |
+| `exit_code.txt` | 执行状态；补丁是否修复问题由 12.3 验证 |
+
+`client_ttft_fraction` 为 `Σ首 token 等待时间 / Σ请求耗时`。`server_prefill_fraction` 为服务端 `Σprefill 时间 / Σinference 时间`。运行时应独占该 vLLM 服务，并确认 `server_requests_match=true`；请求数量一致是检查项，不替代独占运行条件。服务端 prefill 指标描述阶段耗时。正式比较策略时保持模型、追踪开关和请求负载一致。
+
+查看 `bcc.err` 和 `trace_stats.json` 中的丢事件统计。丢事件影响文件访问分析的完整性，HTTP 请求计时另行保存。只测 LLM 时间可设置 `SWE_TRACE=0`。
+
+### 12.3 验证补丁
+
+在 CloudLab 将 `RUN` 设置为实际结果目录：
+
+```bash
+RUN=results/swebench-measured/django-实际时间
+PATCH=$(find "$RUN/agent" -name patch.diff -print -quit)
+bash scripts/evaluate_swebench_local.sh django "$PATCH" baseline
+bash scripts/evaluate_swebench_local.sh django "$PATCH" patched
+```
+
+`baseline` 在原始代码上运行数据集的测试补丁，预期目标回归测试失败；`patched` 在独立 checkout 上应用 agent 补丁后再测试。将任务名和 `RUN` 换成 `sphinx` 或 `nodebb` 即可。测试日志放在 `$SWE_STORAGE/evaluation/`，不修改 agent 工作目录。
+
+Django 运行 migration operations 测试；Sphinx 运行 autodoc autoclass 测试；NodeBB 运行数据集指定的两个数据库测试文件，使用 Redis 后端。这是固定数据集测试的本地验证，不代表完整官方容器评测或 NodeBB 所有数据库后端验证。
+
+### 12.4 重跑与拉回
+
+使用新目录保留已有补丁。在 CloudLab 执行，以 Django 为例：
+
+```bash
+source .env.swebench
+export SWE_WORK_ROOT="$SWE_STORAGE/repeat-$(date -u +%Y%m%dT%H%M%S)"
+python scripts/swebench_local.py prepare --task django --work-root "$SWE_WORK_ROOT"
+bash scripts/run_swebench_measured.sh django
+```
+
+Django 和 Sphinx 复用各自的 Python 依赖，通过 `PYTHONPATH` 加载新 checkout。NodeBB 的新 checkout 还需复用依赖。在运行前执行：
+
+```bash
+cp "$SWE_STORAGE/work/nodebb/package.json" "$SWE_STORAGE/work/nodebb/config.json" "$SWE_WORK_ROOT/nodebb/"
+ln -s "$SWE_STORAGE/work/nodebb/node_modules" "$SWE_WORK_ROOT/nodebb/node_modules"
+printf '/node_modules\n' >> "$SWE_WORK_ROOT/nodebb/.git/info/exclude"
+```
+
+
+在 Mac 拉回结果和验证日志：
+
+```zsh
+source cloudlab_env.sh
+rsync -az "$SSH_USER@$WORKFLOW_NODE:pi-ebpf-tracing-handoff/results/swebench-measured/" results/swebench-measured/
+rsync -az --include='*.test.log' --include='*.exit_code' --exclude='*' \
+  "$SSH_USER@$WORKFLOW_NODE:/mnt/lustrefs/$SSH_USER/pi-ebpf-tracing-handoff/swebench/evaluation/" \
+  results/swebench-evaluation/
+```
+
+### 12.5 重放 SWE 请求并测量 eviction / CPU offload
+
+2026-09-16 的实验在 Perlmutter 停机期间临时使用 `ai-l40s-01`、两张 L40S、vLLM 0.29.0 和 `Qwen/Qwen3.6-27B`。远端部署目录为 `~/swe-kv-experiment`，启动脚本为 `scripts/launch_swe_kv_riken.sh`。七个 vLLM 源文件经 `config/vllm_trace_v029_source.json` 的哈希检查后插桩。物理日志同时记录 scheduler 和两个 GPU worker。
+
+本节重放第 12.2 节保存的纯文本请求，测量跨请求 KV 保留、淘汰和恢复。输入按新服务的 tokenizer 重新核对，输出长度逐请求采用原轨迹记录。重放不执行工具，生成内容也不改变下一条已保存的输入，因此耗时表示 LLM 请求重放时间。每个任务串行运行，每组开始清空 GPU cache 并使用独立 cache salt。
+
+实验固定 TP=2、最大上下文 65,536、`max_num_seqs=1`、同步调度和每个 chunk 最多 2,048 tokens。三组依次为 `gpu200_cpu0`、`gpu96_cpu0`、`gpu96_cpu32`。CPU 容量单位为 GiB；关闭 offload 时省略 `--kv-offloading-size`，不要传 `0`。这三组使用 vLLM 原生淘汰与 CPU offload 策略。
+
+Mac 的 API 隧道为 `127.0.0.1:18000 → GPU节点:8000`，KV event 隧道为 `127.0.0.1:15558 → GPU节点:5558`。通过 `/v1/models` 获取实际模型别名。新 allocation 需要更新节点名与 job ID，并先启动第一组服务。在临时集群的登录节点执行，替换实际 job ID 和节点：
+
+```bash
+SWE_JOB=384217
+SWE_NODE=ai-l40s-01
+SWE_SESSION=swe-g200-c0-新的唯一名称
+nohup srun --jobid="$SWE_JOB" --overlap -N1 -n1 -c16 -w "$SWE_NODE" \
+  bash "$HOME/swe-kv-experiment/launch_swe_kv_riken.sh" "$SWE_SESSION" 200 0 \
+  > "$HOME/swe-kv-experiment/output/$SWE_SESSION.log" 2>&1 < /dev/null &
+echo $!
+```
+
+记下 srun PID。在 Mac 仓库中执行，填写相同 session、PID 和 allocation。使用新的输出目录保留已有实验：
+
+```bash
+python tools/run_swe_kv_matrix.py \
+  --output replay/swe-riken-新的唯一名称 \
+  --host u0001609@login.cloud.r-ccs.riken.jp \
+  --job 384217 --node ai-l40s-01 \
+  --remote-root /home/users/u0001609/swe-kv-experiment \
+  --initial-launch-pid 实际PID --initial-session 实际SESSION
+python tools/validate_swe_kv_matrix.py replay/swe-riken-新的唯一名称
+```
+
+驱动从 `results/swebench-measured/selected_results.json` 选择三个任务，使用现有 bundle、replay、KV event collector、物理日志导入和报告代码。`--output-tokens 0` 表示原轨迹逐请求长度。每组完成后，驱动拉取带 SHA-256 校验的物理日志快照，再导入报告；切换配置时停止自己启动的服务。最后一组服务保持运行。
+
+本次结果目录为 `replay/swe-riken-20260916/`。`validation.json` 检查九个实验的请求数、输入输出长度、逐请求 token 计算账目、日志序号和传输完成状态。报告写回三个原任务目录的 `kvcache_report.html`，并更新 `results/index.html` 与 `results/all-experiments.html`。本次三组比较已登记在 `config/kv_report_comparisons.json`；更换输出目录后，应同步登记对应比较路径。
+
+判断 CPU 恢复要同时检查 `confirmed_load_jobs`、实际 load 字节数和 worker 完成记录。CPU store 表示写出，不能计为恢复。`ΣTTFT / Σ请求耗时` 是首 token 等待比例；服务端 prefill 指标与实际计算 token 另列。正式轨迹和显式清空 GPU 后的短恢复检查分别保存。
+
+本次九组通过 `validation.json` 的全部检查。三个任务在 96 blocks 下分别发生 13、60、27 次物理 eviction，逐请求命中量与 200-block 基线相同；开启 CPU offload 后均无 load。独立短检查保存在 `controls/validation.json`：清空 GPU 后，从 CPU 恢复 9,408 tokens，计算 380 tokens，确认一个 load 任务和两个 worker 的完成记录。该短检查验证恢复路径，不计入任务性能比较。

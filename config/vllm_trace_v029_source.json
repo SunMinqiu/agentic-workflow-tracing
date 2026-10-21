@@ -1,0 +1,19 @@
+{
+  "version": "0.29.0",
+  "reference": "RIKEN installed vLLM 0.29.0",
+  "files": {
+    "vllm/v1/core/block_pool.py": "daf37f8c3e85d6debac02df2ac2356f5500555b613a369e8efdc66a0db94286b",
+    "vllm/v1/core/kv_cache_manager.py": "2213a68ea1a2f05b1d99de25a3f1daf4040d8d7fdd0e271d80b7ba9e1977a08d",
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py": "d8b010831e5422c6c1e56f679b72acc6771660afd68f4eb802c0f4e633763727",
+    "vllm/distributed/kv_events.py": "b1b0e99292790b39e05b27a2800294cd00821bbc1cc8bec8e05279fab72ad6c2",
+    "vllm/v1/core/sched/scheduler.py": "abca7134821e2fb5cc8572df5c4a0b570ecf702646254327bc786fc452074983",
+    "vllm/v1/kv_offload/cpu/manager.py": "27bf4b0892f519a4edb7b0da750f21712c7fcc20ea805ad4b2022e46662de935",
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py": "0a66105e9cb9f537981247aac1e59164dba4410d03a93cf28eae3347f7abb35d"
+  },
+  "audit": {
+    "wrapped_method_signatures": "unchanged",
+    "block_pool": "free queue behavior changed; identity and eviction hooks unchanged",
+    "offload": "partial tail keys require explicit mapping; preserve raw transfer specifications",
+    "scheduler": "run synchronous scheduling without speculative decoding to exclude stale async outputs"
+  }
+}

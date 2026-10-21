@@ -198,8 +198,10 @@ def run_bundle(
     requests = bundle.get("requests") or []
     if mode not in {"packed", "paced", "serial"}:
         raise ValueError("mode must be packed, paced, or serial")
-    if output_tokens < 1:
-        raise ValueError("output_tokens must be positive")
+    if output_tokens < 0:
+        raise ValueError("output_tokens must be nonnegative; 0 uses recorded output lengths")
+    if output_tokens == 0 and any(int((item.get("recorded_usage") or {}).get("output", 0)) < 1 for item in requests):
+        raise ValueError("Recorded output lengths must be positive for every request")
     if max_concurrency is not None and max_concurrency < 1:
         raise ValueError("max_concurrency must be positive")
     if cache_salt_mode not in CACHE_SALT_MODES:
@@ -220,7 +222,7 @@ def run_bundle(
             endpoint,
             bundle["served_model"],
             item,
-            output_tokens,
+            output_tokens or int(item["recorded_usage"]["output"]),
             item_salt(item),
         )
 
@@ -321,14 +323,6 @@ def _process_start_time(metrics: str) -> float | None:
             except ValueError:
                 return None
     return None
-
-
-def _replay_root(output_dir: Path) -> Path | None:
-    for candidate in (output_dir.resolve(), *output_dir.resolve().parents):
-        if candidate.name == "replay":
-            return candidate
-    fallback = Path.cwd() / "replay"
-    return fallback if fallback.is_dir() else None
 
 
 def replay_to_dir(
@@ -511,7 +505,8 @@ def replay_to_dir(
         "requests": len(results),
         "prompt_tokens": sum(row["prompt_tokens"] for row in results),
         "output_tokens": total_output_tokens,
-        "fixed_output_tokens_per_request": output_tokens,
+        "fixed_output_tokens_per_request": output_tokens or None,
+        "output_length_mode": "fixed" if output_tokens else "recorded",
         "per_request_cache": {
             "reported_requests": len(cached_values),
             "coverage": round(len(cached_values) / len(results), 4) if results else None,
@@ -560,7 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("bundle", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--mode", choices=("packed", "paced", "serial"), default="packed")
-    parser.add_argument("--output-tokens", type=int, default=FIXED_OUTPUT_TOKENS)
+    parser.add_argument("--output-tokens", type=int, default=FIXED_OUTPUT_TOKENS, help="Fixed output length; 0 preserves each recorded output length")
     parser.add_argument("--max-concurrency", type=int)
     parser.add_argument("--warmup-repetitions", type=int, default=0)
     parser.add_argument(

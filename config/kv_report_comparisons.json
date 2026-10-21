@@ -87,6 +87,69 @@
           "rep": "replay/c2_12_packed_out32/block1568_dtype-fp8_prefix-on_gpu0.45_20260908T095722/rep0"
         }
       ]
+    },
+    {
+      "id": "swe-riken-20260916-django",
+      "title": "SWE django \u00b7 cache capacity and CPU offload",
+      "overview": "capacity",
+      "baseline": "replay/swe-riken-20260916/django/gpu200_cpu0/rep0",
+      "note": "Sequential replay with original per-request output lengths. Fresh service for each configuration; one isolated shared cache namespace per task. One repetition per configuration. Tool execution time is excluded.",
+      "runs": [
+        {
+          "label": "200 GPU blocks, CPU offload disabled",
+          "rep": "replay/swe-riken-20260916/django/gpu200_cpu0/rep0"
+        },
+        {
+          "label": "96 GPU blocks, CPU offload disabled",
+          "rep": "replay/swe-riken-20260916/django/gpu96_cpu0/rep0"
+        },
+        {
+          "label": "96 GPU blocks, CPU offload 32 GiB",
+          "rep": "replay/swe-riken-20260916/django/gpu96_cpu32/rep0"
+        }
+      ]
+    },
+    {
+      "id": "swe-riken-20260916-sphinx",
+      "title": "SWE sphinx \u00b7 cache capacity and CPU offload",
+      "overview": "capacity",
+      "baseline": "replay/swe-riken-20260916/sphinx/gpu200_cpu0/rep0",
+      "note": "Sequential replay with original per-request output lengths. Fresh service for each configuration; one isolated shared cache namespace per task. One repetition per configuration. Tool execution time is excluded.",
+      "runs": [
+        {
+          "label": "200 GPU blocks, CPU offload disabled",
+          "rep": "replay/swe-riken-20260916/sphinx/gpu200_cpu0/rep0"
+        },
+        {
+          "label": "96 GPU blocks, CPU offload disabled",
+          "rep": "replay/swe-riken-20260916/sphinx/gpu96_cpu0/rep0"
+        },
+        {
+          "label": "96 GPU blocks, CPU offload 32 GiB",
+          "rep": "replay/swe-riken-20260916/sphinx/gpu96_cpu32/rep0"
+        }
+      ]
+    },
+    {
+      "id": "swe-riken-20260916-nodebb",
+      "title": "SWE nodebb \u00b7 cache capacity and CPU offload",
+      "overview": "capacity",
+      "baseline": "replay/swe-riken-20260916/nodebb/gpu200_cpu0/rep0",
+      "note": "Sequential replay with original per-request output lengths. Fresh service for each configuration; one isolated shared cache namespace per task. One repetition per configuration. Tool execution time is excluded.",
+      "runs": [
+        {
+          "label": "200 GPU blocks, CPU offload disabled",
+          "rep": "replay/swe-riken-20260916/nodebb/gpu200_cpu0/rep0"
+        },
+        {
+          "label": "96 GPU blocks, CPU offload disabled",
+          "rep": "replay/swe-riken-20260916/nodebb/gpu96_cpu0/rep0"
+        },
+        {
+          "label": "96 GPU blocks, CPU offload 32 GiB",
+          "rep": "replay/swe-riken-20260916/nodebb/gpu96_cpu32/rep0"
+        }
+      ]
     }
   ]
 }

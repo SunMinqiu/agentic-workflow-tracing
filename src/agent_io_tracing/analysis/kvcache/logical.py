@@ -969,7 +969,13 @@ def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
     from matplotlib.ticker import MaxNLocator
     from matplotlib.lines import Line2D
 
+    text_mode = "text_lineage" in summary
     pc = summary["per_call"]
+    if text_mode:
+        pc = [dict(c, logical_aligned=v['best_shared_text_characters'] if v['best_shared_text_characters']>=256 else 0,
+                   logical_source_candidates=[v['best_source']] if v['best_source'] is not None else [],
+                   exact_hash_source_indices=v['exact_request_sources'])
+              for c, v in zip(pc, summary['text_lineage'])]
     parents = {}
     for i, call in enumerate(pc):
         parent = _lineage_parent_index(call)
@@ -1016,7 +1022,7 @@ def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
     if visible:
         ordered = sorted(visible)
         sizes = {
-            i: _lineage_marker_size(_logical_reuse_fraction(pc[i]))
+            i: 180.0 if text_mode else _lineage_marker_size(_logical_reuse_fraction(pc[i]))
             for i in ordered
         }
         ax.scatter(
@@ -1072,29 +1078,30 @@ def plot_prefix_lineage(summary: dict, out_png: Path) -> None:
             bbox_to_anchor=(1.01, 1.0), borderaxespad=0,
         )
         ax.add_artist(role_artist)
-    size_legend = [
-        Line2D(
-            [0], [0], marker="o", color="none", label=f"{fraction:.2%}",
-            markerfacecolor="#A7A7A7", markeredgecolor="#555555",
-            markersize=_lineage_marker_size(fraction) ** 0.5,
+    if not text_mode:
+        size_legend = [
+            Line2D(
+                [0], [0], marker="o", color="none", label=f"{fraction:.2%}",
+                markerfacecolor="#A7A7A7", markeredgecolor="#555555",
+                markersize=_lineage_marker_size(fraction) ** 0.5,
+            )
+            for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)
+        ]
+        ax.legend(
+            handles=size_legend,
+            title="logical reuse / input",
+            fontsize=8,
+            loc="lower left",
+            bbox_to_anchor=(1.01, 0.0),
+            borderaxespad=0,
         )
-        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)
-    ]
-    ax.legend(
-        handles=size_legend,
-        title="logical reuse / input",
-        fontsize=8,
-        loc="lower left",
-        bbox_to_anchor=(1.01, 0.0),
-        borderaxespad=0,
-    )
     ax.set_xlim(-1, max(len(pc), 1))
     ax.set_yticks([])
     ax.set_xlabel("global LLM call index")
     # a call index is a count, so fractional ticks are meaningless
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.set_ylabel("logical prefix branches")
-    ax.set_title("Logical KV-cache lineage")
+    ax.set_title("Verified text-prefix lineage" if text_mode else "Logical KV-cache lineage")
     ax.grid(True, axis="x", alpha=0.18)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150, bbox_inches="tight")

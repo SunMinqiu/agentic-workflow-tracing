@@ -67,7 +67,7 @@ for m in sorted(Path(sys.argv[1]).glob("*/manifest.json")):
 PY
 )
 case "$workload" in
-    GenoMAS|SciLink) agentic=1 ;;
+    GenoMAS|SciLink|SWEbench) agentic=1 ;;
     *) agentic=0 ;;
 esac
 

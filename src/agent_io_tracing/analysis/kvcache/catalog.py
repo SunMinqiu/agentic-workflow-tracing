@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import html
-import json
 import os
 import re
-import statistics
 from pathlib import Path
 from urllib.parse import quote
 

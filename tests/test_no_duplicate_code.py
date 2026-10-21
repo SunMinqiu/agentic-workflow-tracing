@@ -1,8 +1,6 @@
-"""Fail the build when a new copy-paste or a new orphan lands in src/.
+"""Detect duplicate implementations and definitions without callers.
 
-Two guards, both with an explicit allowlist. Adding a workflow should mean
-importing the shared helper, not pasting it — and if pasting is genuinely the
-right call, the allowlist entry makes that a deliberate, reviewable line.
+Structural duplicates require an explicit allowance. Caller discovery includes source code, tests, scripts and patch tools.
 """
 from __future__ import annotations
 
@@ -15,6 +13,7 @@ from collections import defaultdict
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 TESTS = pathlib.Path(__file__).resolve().parent
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
+TOOLS = pathlib.Path(__file__).resolve().parents[1] / "tools"
 
 MIN_NODES = 18
 
@@ -30,13 +29,6 @@ ALLOWED_DUPLICATES = {
         "agent_io_tracing/analysis/parallelism.py:duration_ms",
         "agent_io_tracing/analysis/summary.py:duration_ms",
     }),
-}
-
-# Definitions kept on purpose despite having no caller yet.
-ALLOWED_UNUSED = {
-    "agent_io_tracing/analysis/phase1_metrics.py:_interval_overlap_ms",
-    "agent_io_tracing/analysis/phase1_metrics.py:_llm_intervals_ms",
-    "agent_io_tracing/parsing/_ebpf_impl.py:PURE_IO_TOOL_NAMES",
 }
 
 
@@ -110,7 +102,7 @@ def test_no_new_structurally_identical_functions():
 def test_no_new_definitions_without_a_caller():
     text = "\n".join(
         p.read_text(errors="replace")
-        for root in (SRC, TESTS, SCRIPTS)
+        for root in (SRC, TESTS, SCRIPTS, TOOLS)
         if root.exists()
         for p in root.rglob("*")
         if p.is_file() and p.suffix in {".py", ".sh", ""}
@@ -135,12 +127,9 @@ def test_no_new_definitions_without_a_caller():
                 if name.startswith("__") or name == "main":
                     continue
                 qualified = f"{_rel(path)}:{name}"
-                if qualified in ALLOWED_UNUSED:
-                    continue
                 if len(re.findall(rf"\b{re.escape(name)}\b", text)) <= 1:
                     orphans.append(qualified)
 
     assert not orphans, (
-        "defined but never referenced — delete it, or add it to ALLOWED_UNUSED "
-        "with a reason:\n" + "\n".join(sorted(orphans))
+        "defined but never referenced:\n" + "\n".join(sorted(orphans))
     )

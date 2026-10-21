@@ -154,3 +154,22 @@ def test_incomplete_sse_stream_is_rejected(monkeypatch):
     monkeypatch.setattr(runner,'urlopen',lambda *a,**kw:BytesIO(b'data: {"choices":[{"text":"partial","token_ids":[1]}]}\n\n'))
     with pytest.raises(RuntimeError,match='without \\[DONE\\]'):
         runner._completion(SimpleNamespace(base_url='http://example.test',api_key=None,timeout_s=1),'m',{'request_id':'a','index':0,'prompt_token_ids':[1]})
+
+
+def test_recorded_output_lengths_and_missing_usage(monkeypatch):
+    import pytest
+    observed = []
+    def completion(endpoint, model, item, output_tokens, cache_salt):
+        observed.append(output_tokens)
+        return {"index": item["index"]}
+    monkeypatch.setattr(runner, "_completion", completion)
+    bundle = {"served_model": "model", "requests": [
+        {"index": 0, "request_id": "a", "recorded_usage": {"output": 17}},
+        {"index": 1, "request_id": "b", "recorded_usage": {"output": 431}},
+    ]}
+    runner.run_bundle(bundle, object(), "serial", output_tokens=0)
+    assert observed == [17, 431]
+    del bundle["requests"][1]["recorded_usage"]
+    with pytest.raises(ValueError, match="Recorded output lengths"):
+        runner.run_bundle(bundle, object(), "serial", output_tokens=0)
+    assert observed == [17, 431]

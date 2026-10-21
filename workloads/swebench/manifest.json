@@ -1,0 +1,56 @@
+[
+  {
+    "alias": "django",
+    "instance_id": "django__django-14999",
+    "repo": "django/django",
+    "base_commit": "a754b82dac511475b6276039471ccd17cc64aeb8",
+    "source_directory": "/Users/minqiu/Desktop/Provenance/runs/swebench_pick55_20260907_104401/cases/django__django-14999",
+    "source_sha256": {
+      "transcript.jsonl": "b6f78d9307b76dc914911dbffaae3c4afe59e792f1a70de04dade57c46b417ba",
+      "result.json": "7935b0d1f4e6d730e00e3eaaad7b3107afc596fd0e163975a643add7fb013d89",
+      "capture_meta.json": "2214abb0a8ecdc67cd8400a7eec8711634acc54cf07286630c2e767ee7b395e5",
+      "case_status.json": "4b909c155a046029d36d81f4be2fd7504cfd8295377423649cb20e1936b49480",
+      "patch.diff": "ea58c2b0e82b67daef621e7e4b110a910c73aba2de0155ec3967dbf6a7f9c7ad",
+      "task_context.json": "a8aecb2c9938211bfb64a79e7d67798d5e5bd2fdf2c8563bcd5e4a2f5f1917a5"
+    },
+    "original_inferences": 29,
+    "original_input_tokens": 1046209,
+    "original_output_tokens": 2840
+  },
+  {
+    "alias": "sphinx",
+    "instance_id": "sphinx-doc__sphinx-8548",
+    "repo": "sphinx-doc/sphinx",
+    "base_commit": "dd1615c59dc6fff633e27dbb3861f2d27e1fb976",
+    "source_directory": "/Users/minqiu/Desktop/Provenance/runs/swebench_slice0-55_20260830_092855/cases/sphinx-doc__sphinx-8548",
+    "source_sha256": {
+      "transcript.jsonl": "b5c962cc4ab299178f03ce6fb735f6c1e23fe7dd5f862adf81117546fd277334",
+      "result.json": "cda592d7294e4dde120026f4d6a25e7ad465ed85b89005b7fb5028b5e315baaf",
+      "capture_meta.json": "34ef0bdc5cd36226fb91e2f9906e1bb0df57c17ecd334108300dde036b4a8845",
+      "case_status.json": "6423fe20e33e20226809f04a4e00a6096d37e25635f9ea9180b881f1613d0fa4",
+      "patch.diff": "84ed94c6fdc0f3fdae133070009f78e18186413be4a789f01e8e785dd143c526",
+      "task_context.json": "659de616049983e36323c369892a10a86b9ef9fc547c2c49bcb2dd138c7ccaa9"
+    },
+    "original_inferences": 43,
+    "original_input_tokens": 2747111,
+    "original_output_tokens": 7969
+  },
+  {
+    "alias": "nodebb",
+    "instance_id": "instance_NodeBB__NodeBB-70b4a0e2aebebe8f2f559de6680093d96a697b2f-vnan",
+    "repo": "NodeBB/NodeBB",
+    "base_commit": "6bbe3d1c4cefe56f81629dfa3343fd0a875d9cf1",
+    "source_directory": "/Users/minqiu/Desktop/Provenance/runs/swebench_pro_slice0-50_20260829_231312/cases/instance_NodeBB__NodeBB-70b4a0e2aebebe8f2f559de6680093d96a697b2f-vnan",
+    "source_sha256": {
+      "transcript.jsonl": "92fafe74bcd5e282a7a69e9e60ab623fd3a449a77e2cb2fab0f6faf641ef8dee",
+      "result.json": "8e72ed3a3bc7931c212b1425dd2e11760b89de3f6eee6e1aceb220664ba320de",
+      "capture_meta.json": "99c7f9cfa2aa0f374ff380a3c34f0be6aea8073a34764844b979b01d7f61efb3",
+      "case_status.json": "2efd26920105265d875d60c206b7a0033bc0e1a0485a4fb37aaf3e184c76fd20",
+      "patch.diff": "629b8819920539275ef1e77042cfbfc624f15a96f021cb187c9841d8c68e938d",
+      "task_context.json": "2bf2305383142da2791ac0110738feebc5459be203a6fa57cff14a67e3bdbf88"
+    },
+    "original_inferences": 42,
+    "original_input_tokens": 2806857,
+    "original_output_tokens": 5232
+  }
+]

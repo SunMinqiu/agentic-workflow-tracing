@@ -157,3 +157,29 @@ def test_swap_size_time_does_not_claim_eviction_bytes(tmp_path):
     physical = physical_section(tmp_path, data)
     assert '<td>Evicted size in bytes</td><td>Not recorded</td>' in physical
     assert '<td>Eviction operation duration</td><td>Not recorded</td>' in physical
+
+
+def test_summary_physical_table_includes_registered_new_configurations(tmp_path):
+    from tools.build_kvcache_config_summary import physical_section
+    from bs4 import BeautifulSoup
+
+    specs = []
+    for name, blocks, cpu, evictions in [('large', 200, 0, 0), ('small', 96, 0, 13), ('offload', 96, 32, 13)]:
+        rep, _ = make_run(tmp_path, experiment=name, swap=cpu)
+        summary = json.loads((rep/'summary.json').read_text())
+        summary['serving_config']['num_gpu_blocks'] = blocks
+        (rep/'summary.json').write_text(json.dumps(summary))
+        specs.append((name, rep, evictions))
+    catalog = Catalog(tmp_path)
+    entries = [(name, catalog.by_rep[rep]) for name, rep, _ in specs]
+    catalog.comparisons = [{'title': 'New SWE experiment', 'entries': entries}]
+    for _, rep, evictions in specs:
+        catalog._data[rep] = {'physical_trace': {'physical_evictions': evictions}}
+    soup = BeautifulSoup(physical_section(catalog, tmp_path/'results'), 'html.parser')
+    rows = [[cell.get_text() for cell in row.select('td')] for row in soup.select('tbody tr')]
+    assert len(rows) == 3
+    assert [row[1:4] for row in rows] == [['200', '0', '1'], ['96', '0', '1'], ['96', '32', '1']]
+    assert [row[5] for row in rows] == ['0', '13', '13']
+    assert all('New SWE experiment' == row[0] for row in rows)
+    assert len(soup.select('tbody a[href]')) == 3
+    assert 'medians of three runs' not in soup.get_text()
